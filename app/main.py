@@ -492,11 +492,15 @@ async def run(cfg: JarvisConfig | None = None) -> None:
     bus = EventBus(queue_size=cfg.event_bus.subscriber_queue_size)
     bus.subscribe(SpeechEvent, _console_handler)
 
-    # 2. Attention + Reasoning pipeline (Phase 2 + 3)
+    # 2. Visual context ring (must exist before reasoning handler references it)
+    visual_context_ring: deque[tuple[float, str]] = deque(maxlen=cfg.perception.max_visual_events)
+
+    # 3. Attention + Reasoning pipeline (Phase 2 + 3)
     attention: AttentionEngine | None = None
     model_cleanup = None
     tts_cleanup = None
     player_cleanup = None
+    vision_analyzer_cleanup = None
 
     if cfg.attention.enabled:
         working_mem = WorkingMemory(max_size=cfg.attention.working_memory_size)
@@ -524,7 +528,7 @@ async def run(cfg: JarvisConfig | None = None) -> None:
         logger.info("Attention engine active — names=%s threshold=%.2f",
                      cfg.attention.assistant_names, cfg.attention.reason_threshold)
 
-    # 3. TTS pipeline (Phase 4)
+    # 4. TTS pipeline (Phase 4)
     if cfg.tts.enabled and cfg.playback.enabled:
         tts_handler, tts_cleanup, player_cleanup = _build_tts_handler(cfg)
         bus.subscribe(ResponseEvent, tts_handler)
@@ -533,9 +537,8 @@ async def run(cfg: JarvisConfig | None = None) -> None:
             cfg.tts.model, cfg.tts.voice, cfg.tts.sample_rate,
         )
 
-    # 4. Visual perception pipeline (Phase 6)
+    # 5. Visual perception pipeline (Phase 6)
     perception_pipeline = None
-    visual_context_ring: deque[tuple[float, str]] = deque(maxlen=cfg.perception.max_visual_events)
 
     if cfg.perception.enabled and cfg.perception.camera.enabled and attention is not None:
         from app.perception.camera import CameraError, OpenCVCamera
@@ -558,6 +561,11 @@ async def run(cfg: JarvisConfig | None = None) -> None:
 
         vis_cfg = cfg.perception.vision
         if vis_cfg.enabled:
+            if vis_cfg.provider != "ollama":
+                raise ValueError(
+                    f"Unsupported vision provider: {vis_cfg.provider!r} (only 'ollama' is supported)"
+                )
+
             from app.perception.local_vision import LocalVisionAnalyzer, OllamaVisionBackend
 
             vision_backend = OllamaVisionBackend(
@@ -568,10 +576,11 @@ async def run(cfg: JarvisConfig | None = None) -> None:
             )
             analyzer = LocalVisionAnalyzer(
                 backend=vision_backend,
-                prompt=vis_cfg.prompt or "",
+                prompt=vis_cfg.prompt,
                 timeout_seconds=vis_cfg.timeout_seconds,
                 max_image_size=vis_cfg.max_image_size,
             )
+            vision_analyzer_cleanup = analyzer
             logger.info("Vision analyzer: LocalVisionAnalyzer (model=%s)", vis_cfg.model)
         else:
             analyzer = MockVisualAnalyzer()
@@ -603,26 +612,26 @@ async def run(cfg: JarvisConfig | None = None) -> None:
 
     await bus.start()
 
-    # 4a. Start perception pipeline if configured
+    # 5a. Start perception pipeline if configured
     if perception_pipeline is not None:
         await perception_pipeline.start()
 
-    # 5. VAD
+    # 6. VAD
     vad = VoiceActivityDetector(threshold=cfg.vad.threshold)
     vad.load()
 
-    # 6. ASR
+    # 7. ASR
     asr = SpeechRecognizer(cfg.asr)
     asr.load()
 
-    # 7. Segmenter
+    # 8. Segmenter
     segmenter = SpeechSegmenter(
         config=cfg.vad,
         sample_rate=cfg.audio.sample_rate,
         chunk_samples=cfg.audio.chunk_samples,
     )
 
-    # 8. Microphone
+    # 9. Microphone
     mic = MicrophoneCapture(cfg.audio)
     loop = asyncio.get_running_loop()
 
@@ -632,7 +641,7 @@ async def run(cfg: JarvisConfig | None = None) -> None:
 
     mic.start(loop)
 
-    # 9. Run audio pipeline
+    # 10. Run audio pipeline
     pipeline_task = asyncio.create_task(
         _audio_pipeline(mic, vad, segmenter, asr, bus, session_id)
     )
@@ -641,7 +650,7 @@ async def run(cfg: JarvisConfig | None = None) -> None:
 
     await shutdown.wait()
 
-    # 10. Graceful shutdown
+    # 11. Graceful shutdown
     logger.info("Shutting down…")
 
     # Stop perception before audio (reverse startup order)
@@ -656,6 +665,8 @@ async def run(cfg: JarvisConfig | None = None) -> None:
         pass
     await bus.shutdown()
 
+    if vision_analyzer_cleanup is not None:
+        vision_analyzer_cleanup.close()
     if player_cleanup is not None:
         player_cleanup.close()
     if tts_cleanup is not None:

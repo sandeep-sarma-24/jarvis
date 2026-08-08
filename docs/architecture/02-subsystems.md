@@ -395,25 +395,29 @@ ring_buffer_seconds = 30  # tunable: longer for debugging, shorter to reduce mem
 
 **Latency budget (initial target):** VAD detection (1ms) + end-of-speech wait (300ms silence threshold) + ASR (500ms) = ~800ms from speech end to event. This is an empirical performance target and must be benchmarked during Phase 1 implementation.
 
-## Camera Pipeline
+## Camera Pipeline (Phase 6 + 7 ? implemented)
 
 ```
-Camera (built-in MacBook)
-  -> Adaptive frame sampling (1-5 FPS based on change rate)
-  -> Frame differencing (pixel-level, ~1ms)
+Camera (OpenCV, built-in or USB)
+  -> FrameSampler (bounded queue, latest-frame policy, configurable analysis interval)
+  -> ChangeDetector (pixel-level diff, ~1ms)
   -> If significant change:
-    -> Lightweight description (or LLM vision, depending on change magnitude)
-    -> VisualEvent {description, objects_detected, scene_change_magnitude, correlation_id}
+    -> LocalVisionAnalyzer (Ollama vision model) or MockVisualAnalyzer (testing)
+      -> Preprocess (resize, JPEG encode) -> VisionBackend -> Parse JSON
+    -> EventDeduplicator (suppress repeated identical events within window)
+    -> VisualEvent {event_type, description, confidence, metadata}
     -> Event Bus
   -> If no change:
     -> Discard frame
 ```
 
 **Key decisions:**
-- **Adaptive FPS:** When the scene is static (user sitting at desk), sample at 1 FPS. When motion detected, ramp to 5 FPS. Never higher.
-- **Change detection:** Simple pixel delta thresholding between consecutive frames. If < 5% of pixels changed by > threshold, discard.
-- **Two-stage analysis:** Small changes get lightweight processing. Large changes get LLM vision analysis.
-- **Privacy:** Camera is explicitly opt-in. Clear visual indicator when active. Frames are NEVER stored to disk by default.
+- **Decoupled capture + analysis:** Two independent asyncio tasks. Capture runs at 10 FPS, analysis at 1 FPS. A slow vision model never blocks capture.
+- **Latest-frame policy:** FrameSampler keeps only the newest fresh frame. Stale and superseded frames are discarded with separate metrics.
+- **Change detection:** Simple pixel delta thresholding between consecutive frames. If difference < threshold, skip analysis.
+- **Local vision model:** Frames are sent to Ollama's `/api/chat` with `images` field. The model returns structured JSON (event_type, description, confidence, detections).
+- **Privacy:** Camera is explicitly opt-in (disabled by default). Frames are NEVER stored to disk. Raw frame data never appears in logs, SQLite, or events. Only structured text descriptions enter the reasoning pipeline.
+- **Graceful degradation:** If Ollama is unavailable, analysis returns None and audio continues. If the camera fails, the perception pipeline is disabled without crashing the application.
 
 ## Screen Perception Pipeline
 
@@ -489,11 +493,10 @@ class SpeechEvent(Event):
 
 @dataclass
 class VisualEvent(Event):
-    """Phase 7+ ? camera perception."""
-    description: str
-    objects: list[str]
-    scene_change_magnitude: float
-    frame_available: bool       # Can we retrieve the frame from buffer?
+    """Phase 6+ ? camera perception produced a structured observation."""
+    event_type: str             # "SCENE_CHANGE", "PERSON_DETECTED", etc.
+    description: str            # 1-2 sentence factual description
+    metadata: dict              # analysis_latency_ms, detections, frame_age
 
 @dataclass
 class ScreenEvent(Event):
@@ -510,7 +513,7 @@ class SystemEvent(Event):
     detail: str
 ```
 
-For Phase 1, only `SpeechEvent` needs to be implemented. `VisualEvent`, `ScreenEvent`, and `SystemEvent` are defined for forward compatibility but are not implemented until their respective phases.
+`SpeechEvent` (Phase 1) and `VisualEvent` (Phase 6) are implemented. `ScreenEvent` and `SystemEvent` are defined for forward compatibility but are not implemented until their respective phases.
 
 ---
 
@@ -545,6 +548,11 @@ EmbeddingModel (interface)
     |-- Current: nomic-embed-text
     |-- Alternative: all-MiniLM-L6-v2, mxbai-embed-large
     |-- Future: any model matching the interface
+
+VisionBackend (interface)
+    |-- Current: OllamaVisionBackend (Gemma 4 12B via Ollama)
+    |-- Testing: FakeVisionBackend (canned responses)
+    |-- Future: any model matching the interface
 ```
 
 ## Current Implementation: Model Hierarchy
@@ -553,6 +561,7 @@ EmbeddingModel (interface)
 |------|------|---------------|------|---------|----------------|--------|
 | **Perception** | VAD | Silero VAD v5 | 2MB (JIT) | ONNX/CPU | <1ms/chunk | ~50MB |
 | **Perception** | ASR | Qwen3-ASR 0.6B | 1.2GB (fp16) | MLX | ~500ms/utterance | ~1.5GB |
+| **Perception** | Vision | Gemma 4 12B (same as reasoning) | 7.6GB | Ollama (shared) | ~39s/frame (M4 Air) | shared |
 | **Perception** | OCR | Apple Vision | System | CoreML | ~100ms | 0 (system) |
 | **Attention** | Classifier | Weighted scoring (initial) | <10MB | CPU | ~5ms | ~50MB |
 | **Reasoning** | Primary LLM | Gemma 4 12B Unified (Q4) | 7.6GB | Ollama (llama.cpp Metal) | ~1.5-2s per response | ~9GB |

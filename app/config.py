@@ -109,7 +109,7 @@ class VisionConfig:
     provider: str = "ollama"
     model: str = "gemma4:12b"
     ollama_url: str = "http://localhost:11434"
-    timeout_seconds: float = 30.0
+    timeout_seconds: float = 120.0
     max_image_size: int = 1024
     temperature: float = 0.1
     prompt: str = ""  # empty = use default prompt

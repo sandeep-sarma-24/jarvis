@@ -20,6 +20,8 @@ import time
 from typing import Protocol, runtime_checkable
 
 import httpx
+import numpy as np
+from PIL import Image
 
 from app.perception.types import Detection, Frame, VisualAnalysis, VisualEventType
 
@@ -58,7 +60,7 @@ class OllamaVisionBackend:
     def __init__(
         self,
         *,
-        model: str = "gemma4:12b",
+        model: str,
         base_url: str = "http://localhost:11434",
         timeout_seconds: float = 30.0,
         temperature: float = 0.1,
@@ -96,7 +98,7 @@ class OllamaVisionBackend:
 class LocalVisionAnalyzer:
     """VisualAnalyzer backed by a local vision model.
 
-    Frame → preprocess (resize, encode JPEG) → VisionBackend → parse JSON → VisualAnalysis.
+    Frame -> preprocess (resize, encode JPEG) -> VisionBackend -> parse JSON -> VisualAnalysis.
 
     Handles timeouts, malformed output, and backend failures without crashing.
     """
@@ -105,12 +107,12 @@ class LocalVisionAnalyzer:
         self,
         *,
         backend: VisionBackend,
-        prompt: str = _DEFAULT_PROMPT,
+        prompt: str = "",
         timeout_seconds: float = 30.0,
         max_image_size: int = 1024,
     ) -> None:
         self._backend = backend
-        self._prompt = prompt
+        self._prompt = prompt if prompt else _DEFAULT_PROMPT
         self._timeout = timeout_seconds
         self._max_size = max_image_size
 
@@ -118,6 +120,8 @@ class LocalVisionAnalyzer:
         self.inference_success = 0
         self.inference_failure = 0
         self.inference_timeout = 0
+        self.parse_failure = 0
+        self.backend_failure = 0
         self.preprocessing_latency_ms = 0.0
         self.inference_latency_ms = 0.0
 
@@ -127,6 +131,11 @@ class LocalVisionAnalyzer:
         t_pre = time.perf_counter()
         image_b64 = self._preprocess(frame)
         self.preprocessing_latency_ms = (time.perf_counter() - t_pre) * 1000
+
+        if image_b64 is None:
+            self.inference_failure += 1
+            self.backend_failure += 1
+            return None
 
         t_infer = time.perf_counter()
         try:
@@ -140,6 +149,7 @@ class LocalVisionAnalyzer:
             logger.warning("Vision inference timed out after %.1fs", self._timeout)
             return None
         except Exception:
+            self.backend_failure += 1
             self.inference_failure += 1
             logger.exception("Vision inference failed")
             return None
@@ -150,23 +160,25 @@ class LocalVisionAnalyzer:
         if result is not None:
             self.inference_success += 1
         else:
+            self.parse_failure += 1
             self.inference_failure += 1
         return result
 
-    def _preprocess(self, frame: Frame) -> str:
-        """Resize and JPEG-encode a frame, return base64 string."""
-        try:
-            import numpy as np
-        except ImportError:
-            return base64.b64encode(frame.data).decode()
+    def _preprocess(self, frame: Frame) -> str | None:
+        """Resize and JPEG-encode a frame, return base64 string.
 
+        Returns None if encoding fails — caller treats as preprocessing error.
+        """
         if frame.format in ("jpeg", "jpg"):
             return base64.b64encode(frame.data).decode()
 
         channels = 3
         expected = frame.width * frame.height * channels
         if len(frame.data) < expected:
-            return base64.b64encode(frame.data).decode()
+            logger.warning(
+                "Frame data too short: got %d bytes, expected %d", len(frame.data), expected,
+            )
+            return None
 
         arr = np.frombuffer(frame.data[:expected], dtype=np.uint8).reshape(
             frame.height, frame.width, channels,
@@ -178,29 +190,19 @@ class LocalVisionAnalyzer:
         h, w = arr.shape[:2]
         if max(h, w) > self._max_size:
             scale = self._max_size / max(h, w)
-            new_h, new_w = int(h * scale), int(w * scale)
-            # ponytail: nearest-neighbor resize via numpy slicing, no cv2/PIL.
-            # Upgrade path: use cv2.resize for quality if needed.
-            row_idx = np.linspace(0, h - 1, new_h, dtype=int)
-            col_idx = np.linspace(0, w - 1, new_w, dtype=int)
-            arr = arr[np.ix_(row_idx, col_idx)]
+            new_w, new_h = max(1, int(w * scale)), max(1, int(h * scale))
+            img = Image.fromarray(arr)
+            img = img.resize((new_w, new_h), Image.LANCZOS)
+            arr = np.asarray(img)
 
         buf = io.BytesIO()
-        try:
-            from PIL import Image
-            Image.fromarray(arr).save(buf, format="JPEG", quality=80)
-        except ImportError:
-            # ponytail: fallback — raw RGB bytes if PIL not available.
-            # Ollama may not handle raw bytes, but this avoids a hard dependency.
-            buf.write(arr.tobytes())
-
+        Image.fromarray(arr).save(buf, format="JPEG", quality=80)
         return base64.b64encode(buf.getvalue()).decode()
 
     def _parse(self, raw: str, timestamp: float) -> VisualAnalysis | None:
         """Parse model output into VisualAnalysis. Tolerant of messy JSON."""
         text = raw.strip()
 
-        # Strip markdown code fences
         if text.startswith("```"):
             lines = text.split("\n")
             lines = [l for l in lines if not l.strip().startswith("```")]
@@ -259,6 +261,11 @@ class LocalVisionAnalyzer:
             confidence=confidence,
         )
 
+    def close(self) -> None:
+        """Propagate shutdown to the backend."""
+        if hasattr(self._backend, "close"):
+            self._backend.close()
+
     @property
     def metrics(self) -> dict[str, int | float]:
         return {
@@ -266,6 +273,8 @@ class LocalVisionAnalyzer:
             "vision_inference_success": self.inference_success,
             "vision_inference_failure": self.inference_failure,
             "vision_inference_timeout": self.inference_timeout,
+            "vision_parse_failure": self.parse_failure,
+            "vision_backend_failure": self.backend_failure,
             "vision_inference_latency_ms": round(self.inference_latency_ms, 1),
             "vision_preprocessing_latency_ms": round(self.preprocessing_latency_ms, 1),
         }

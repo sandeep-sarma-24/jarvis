@@ -81,7 +81,7 @@ enabled = false  # enable to use real local vision model instead of mock
 provider = "ollama"
 model = "gemma4:12b"
 ollama_url = "http://localhost:11434"
-timeout_seconds = 30.0
+timeout_seconds = 120.0
 max_image_size = 1024
 temperature = 0.1
 prompt = ""  # empty = use default prompt

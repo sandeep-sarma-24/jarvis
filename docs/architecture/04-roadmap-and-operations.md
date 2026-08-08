@@ -348,13 +348,52 @@ AttentionDecision {should_reason = true}
 
 ---
 
-## Phase 7: Camera
+## Phase 6: Visual Perception
 
-**Objective:** Add camera perception with adaptive frame sampling and change detection.
+**Status:** Complete.
 
-**Primary deliverable:** Camera captures frames, detects changes, and emits VisualEvents.
+**Objective:** Add camera capture, frame sampling, change detection, and visual event emission. The system sees.
 
-**Hard dependencies:** Phase 2 (attention engine must handle visual events).
+**Implementation notes:**
+- `Camera` protocol with `OpenCVCamera` (production) and `FakeCamera` (testing).
+- `FrameSampler` enforces bounded queue with latest-frame policy. At most one frame reaches analysis per interval.
+- `ChangeDetector` uses cheap pixel-diff to skip unchanged frames.
+- `EventDeduplicator` suppresses repeated identical visual events within a time window.
+- `PerceptionPipeline` runs two independent asyncio tasks (capture + analysis). A slow analyzer never blocks capture.
+- `MockVisualAnalyzer` provides deterministic results for testing and when vision model is disabled.
+- Camera is disabled by default (privacy). Explicit opt-in via config.
+
+**Hard dependencies:** Phase 2 (attention engine handles visual events).
+
+---
+
+## Phase 7: Local Vision Model
+
+**Status:** Complete.
+
+**Objective:** Send camera frames to a local vision model for structured image understanding. The system interprets what it sees.
+
+**Implementation notes:**
+- `LocalVisionAnalyzer` backed by `VisionBackend` protocol (decoupled from Ollama).
+- `OllamaVisionBackend` sends base64 JPEG to Ollama `/api/chat` with `images` field.
+- Preprocessing: numpy reshape → BGR→RGB swap if needed → PIL LANCZOS resize → JPEG encode. No raw RGB bytes sent.
+- Structured JSON output: event_type (enum), description, confidence [0,1], detections list. Parser validates all fields.
+- Tolerant JSON parsing (strips markdown fences, extracts embedded JSON) but does not fabricate fake events on parse failure.
+- Separate metrics: `vision_inference_count`, `vision_inference_success`, `vision_inference_failure`, `vision_inference_timeout`, `vision_parse_failure`, `vision_backend_failure`.
+- Lifecycle: `LocalVisionAnalyzer.close()` propagates to backend. `main.py` calls close on shutdown.
+- Provider validation: only `"ollama"` accepted; unsupported providers rejected with clear error.
+- Default prompt: used when `VisionConfig.prompt` is empty; custom prompt forwarded as-is when set.
+- Default timeout: 120s (gemma4:12b p95 is ~49s on M4 Air).
+- Vision is optional — disabled by default. When disabled, `MockVisualAnalyzer` is used. When Ollama is unavailable, analysis returns None and audio continues.
+- No cloud APIs, no raw frame persistence, no frame data in logs or events.
+
+**Benchmark (MacBook Air M4, gemma4:12b):**
+- Preprocessing: 1.8ms min, 2.8ms avg, 4.2ms max
+- Inference: 25.8s min, 38.8s avg, 50.3s max
+- Success rate: 10/10
+- Model confirmed vision-capable (`"vision"` in Ollama capabilities)
+
+**Hard dependencies:** Phase 2 (attention engine), Phase 6 (camera + perception pipeline).
 
 ---
 
@@ -671,4 +710,4 @@ Phase 0 is complete when:
 9. Phase 1 audio/event contracts are defined.
 10. Phase 1 can begin without architectural redesign.
 
-**Status: PHASE 0 APPROVED. Phase 1 and Phase 2 complete.**
+**Status: PHASE 0 APPROVED. Phases 1–7 complete.**

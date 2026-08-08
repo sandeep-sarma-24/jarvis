@@ -1,42 +1,79 @@
-# JARVIS — Audio Perception + Attention + Local LLM Reasoning + Voice Output
+# JARVIS — Multimodal Perception + Attention + Local LLM Reasoning + Voice Output
 
-Continuous microphone capture → VAD → speech segmentation → ASR → SpeechEvent → Attention → Context → Local LLM → ResponseDecision → TTS → Speaker.
+Audio and visual perception → Attention → Context → Local LLM → ResponseDecision → TTS → Speaker.
 
-**Target hardware:** MacBook Air M4, 16 GB RAM, macOS.
+**Target hardware:** MacBook Air M4, 16 GB RAM, macOS. Also tested on HP Omen (Ryzen 5 4600H, 8 GB RAM, GTX 1650 Ti).
 
 ## Current Pipeline
 
 ```
-Microphone (16kHz mono)
- → PortAudio callback → bounded ring buffer
- → asyncio consumer
- → Silero VAD (512-sample chunks)
- → speech segmentation (silence-based boundary detection)
- → Qwen3-ASR 0.6B (MLX)
- → SpeechEvent on EventBus
- → Attention Engine
-   → Tier 1: deterministic rules (<0.01ms)
-   → Tier 2: weighted scorer (<0.03ms)
- → AttentionDecision {should_reason, salience, reason, tier}
- → if should_reason = false: STOP (no LLM call)
- → if should_reason = true:
-     → Context Builder (working memory + system prompt + current event)
-     → Reasoning Model (Gemma 4 12B via Ollama)
-     → ReasoningResult
-     → Response Decision
-     → if respond = false: STOP
-     → if respond = true:
-         → ResponseEvent on EventBus
-         → Kokoro TTS (82M, MLX, 24kHz)
-         → Audio Playback (sounddevice)
+Audio Pipeline:
+  Microphone (16kHz mono)
+   → PortAudio callback → bounded ring buffer
+   → asyncio consumer
+   → Silero VAD (512-sample chunks)
+   → speech segmentation (silence-based boundary detection)
+   → Qwen3-ASR 0.6B (MLX)
+   → SpeechEvent on EventBus
+
+Visual Pipeline (opt-in):
+  Camera (OpenCV)
+   → FrameSampler (bounded queue, latest-frame policy)
+   → ChangeDetector (pixel diff)
+   → LocalVisionAnalyzer (Gemma 4 12B via Ollama)
+     or MockVisualAnalyzer (when vision model disabled)
+   → VisualAnalysis → EventDeduplicator
+   → VisualEvent on EventBus
+
+Both pipelines feed into:
+  → Attention Engine
+    → Tier 1: deterministic rules (<0.01ms)
+    → Tier 2: weighted scorer (<0.03ms)
+  → AttentionDecision {should_reason, salience, reason, tier}
+  → if should_reason = false: STOP (no LLM call)
+  → if should_reason = true:
+      → Context Builder (working memory + conversation + visual context)
+      → Reasoning Model (Gemma 4 12B via Ollama)
+      → ReasoningResult
+      → Response Decision
+      → if respond = false: STOP
+      → if respond = true:
+          → ResponseEvent on EventBus
+          → Kokoro TTS (82M, MLX, 24kHz)
+          → Audio Playback (sounddevice)
 ```
 
 **Phase 1** (audio perception) captures and transcribes speech.
 **Phase 2** (attention) gates which transcripts deserve reasoning.
 **Phase 3** (reasoning) sends attention-positive events through a local LLM and decides whether to respond.
 **Phase 4** (voice output) synthesizes and speaks the response via local TTS.
+**Phase 5** (working memory) maintains conversation context within a session.
+**Phase 6** (visual perception) captures camera frames, detects scene changes, and emits VisualEvents.
+**Phase 7** (local vision) sends frames to a local vision model for structured observation.
 
-Phase 4 does not implement camera, tools, persistent memory, or autonomous behavior.
+## Vision Details
+
+```
+Vision model:  Gemma 4 12B (via Ollama, same model as reasoning)
+Backend:       OllamaVisionBackend (sync httpx + asyncio.to_thread)
+Preprocessing: PIL JPEG encode, LANCZOS resize to max 1024px
+Output:        Structured JSON → VisualAnalysis (event_type, description, detections)
+Privacy:       Frames sent only to localhost Ollama, never persisted
+```
+
+Vision is disabled by default. Enable in `configs/default.toml`:
+```toml
+[perception]
+enabled = true
+
+[perception.camera]
+enabled = true
+
+[perception.vision]
+enabled = true
+```
+
+Measured latency: run `python -m scripts.benchmark_vision` with Ollama running.
 
 ## TTS Details
 
@@ -58,12 +95,13 @@ python3 -m venv .venv
 source .venv/bin/activate
 pip install -e ".[dev]"
 
-# Install and start Ollama, then pull the reasoning model (~7.6 GB)
+# Install and start Ollama, then pull the model (~7.6 GB)
+# gemma4:12b is used for both reasoning and vision
 brew install ollama
 brew services start ollama
 ollama pull gemma4:12b
 
-# Run JARVIS (live microphone)
+# Run JARVIS (live microphone, camera off by default)
 python -m app.main
 # Speak into the microphone. Ctrl+C to stop.
 ```
@@ -94,20 +132,35 @@ Measured on MacBook Air M4, 16 GB RAM, Ollama v0.32.6, gemma4:12b (7.6 GB Q4).
 | TTS warm P95 | — | 518 ms |
 | TTS real-time factor | <1.0x | 0.095x |
 | TTS model memory | — | ~370 MB |
+| Vision preprocessing | <10 ms | 2.8 ms avg |
+| Vision inference (mean) | — | 38,808 ms |
+| Vision inference (min) | — | 25,774 ms |
+| Vision inference (p95) | — | 48,625 ms |
+| Vision inference (max) | — | 50,339 ms |
+| Vision success rate | 100% | 10/10 |
 
 Gemma 4 12B is a thinking model — inference includes an internal `<think>` phase before producing visible output. The 2s target is not met; typical warm responses take 5–9s. A smaller model or non-thinking variant would be needed to hit the target. Python RSS stays low (~29 MB); Ollama holds the model in its own process.
 
 Kokoro-82M warm synthesis is ~10x faster than real-time on M4. Cold synthesis includes pipeline initialization and voice loading.
 
+Vision inference is 26–50s per frame with gemma4:12b. This is acceptable for ambient perception (the analysis loop uses latest-frame policy, not queued inference), but a smaller model would improve responsiveness. Vision preprocessing (resize + JPEG encode) is negligible at <5ms.
+
 Run `python -m scripts.benchmark_audio` for audio pipeline measurements.
 Run `python -m scripts.benchmark_attention` for attention latency measurements.
 Run `python -m scripts.benchmark_reasoning` for reasoning pipeline measurements.
+Run `python -m scripts.benchmark_vision` for vision pipeline measurements (requires Ollama + gemma4:12b).
 
 ## Tests
 
 ```bash
 # Unit tests (no model download required, no Ollama required)
 python -m pytest tests/ -v
+
+# Perception tests only (camera, sampler, vision, lifecycle)
+python -m pytest tests/test_perception/ -v
+
+# Local vision tests only (47 tests, fake backend, no Ollama)
+python -m pytest tests/test_perception/test_local_vision.py -v
 
 # All tests including model integration
 python -m pytest tests/ -m "integration or not integration" -v
@@ -120,7 +173,7 @@ python -m pytest tests/test_tts/test_pipeline.py -m model -v
 ```
 
 Test categories:
-- **Unit tests** — no external dependencies, fast
+- **Unit tests** — no external dependencies, fast (502 tests)
 - **Integration tests** (`-m integration`) — require Silero VAD + Qwen3-ASR model downloads
 - **Model tests** (`-m model`) — require running Ollama instance or Kokoro TTS model
 - **Hardware tests** (`-m hardware`) — require real microphone/speaker access
@@ -133,6 +186,7 @@ python -m scripts.benchmark_audio
 python -m scripts.benchmark_attention
 python -m scripts.benchmark_reasoning
 python -m scripts.benchmark_tts
+python -m scripts.benchmark_vision   # requires Ollama + gemma4:12b
 ```
 
 ## Stability Test
@@ -175,6 +229,24 @@ max_text_length = 2000
 [playback]
 enabled = true
 volume = 1.0
+
+[perception]
+enabled = false          # camera requires explicit opt-in
+max_visual_events = 5
+
+[perception.camera]
+enabled = false
+device_index = 0
+capture_fps = 10.0
+analysis_fps = 1.0
+
+[perception.vision]
+enabled = false          # enable to use local vision model
+provider = "ollama"      # only "ollama" is supported
+model = "gemma4:12b"
+timeout_seconds = 120.0
+max_image_size = 1024
+prompt = ""              # empty = use default structured prompt
 ```
 
 System prompt: `configs/system_prompt.txt` (versioned, editable).
@@ -183,28 +255,36 @@ System prompt: `configs/system_prompt.txt` (versioned, editable).
 
 See `docs/architecture/` for the full system design.
 
-### Phase 3 + 4 boundaries
+### Subsystem boundaries
 
 ```
-Perception (Phase 1) → never calls the LLM
-Attention (Phase 2)  → gates LLM access
-Context Builder      → controls what the LLM sees
-ReasoningModel       → replaceable behind protocol
-Response Decision    → separate from reasoning
-TTS (Phase 4)        → downstream of ResponseDecision, replaceable behind protocol
-AudioPlayer          → stop() for interruption, does not own VAD
+Audio Perception (Phase 1) → never calls the LLM
+Visual Perception (Phase 6) → Camera → FrameSampler → ChangeDetector → VisualAnalyzer
+Local Vision (Phase 7)      → LocalVisionAnalyzer → OllamaVisionBackend → structured observation
+Attention (Phase 2)         → gates LLM access for both speech and visual events
+Context Builder             → controls what the LLM sees (speech + conversation + visual context)
+ReasoningModel              → replaceable behind protocol
+Response Decision           → separate from reasoning
+TTS (Phase 4)               → downstream of ResponseDecision, replaceable behind protocol
+AudioPlayer                 → stop() for interruption, does not own VAD
 ```
 
 Reasoning does not block audio capture. LLM inference runs in a thread via `asyncio.to_thread`.
 TTS synthesis runs in a thread via `asyncio.to_thread`. Playback runs in a background thread.
+Vision inference runs in a thread via `asyncio.to_thread`. Camera capture runs independently.
 
-Phase 3 concurrency policy: at most one local LLM inference is active. If another attention-positive event arrives while inference is active, the event is dropped rather than creating unbounded inference tasks. The `reasoning_dropped` metric increments.
+Phase 3 concurrency policy: at most one local LLM inference is active. If another attention-positive event arrives while inference is active, the event is dropped rather than creating unbounded inference tasks.
 
-Phase 4 playback policy: at most one response plays at a time. A new response stops current playback and plays the latest response. `AudioPlayer.stop()` can be called externally to interrupt speech (Phase 5+ barge-in connection point).
+Phase 7 vision model: `LocalVisionAnalyzer` sits behind the `VisualAnalyzer` protocol. The `VisionBackend` protocol decouples from Ollama. At most one visual inference runs at a time (single analysis loop + latest-frame policy). Vision uses the same Ollama model as reasoning but through a separate endpoint (`/api/chat` with `images` field).
 
-TTS does not own VAD. VAD does not directly own TTS. This separation allows future barge-in without redesigning either subsystem.
+### Key protocols
 
-Phase 4 does not speak. Phase 4 does not execute tools. Phase 4 does not persist memory.
+```
+VisualAnalyzer  → MockVisualAnalyzer (testing) or LocalVisionAnalyzer (production)
+VisionBackend   → OllamaVisionBackend (production) or FakeVisionBackend (testing)
+ReasoningModel  → OllamaModel (production)
+Camera          → OpenCVCamera (production) or FakeCamera (testing)
+```
 
 ## Privacy
 
@@ -215,3 +295,8 @@ Phase 4 does not speak. Phase 4 does not execute tools. Phase 4 does not persist
 - Working memory is in-process only, cleared on restart.
 - Model prompts are not logged at INFO level.
 - Microphone capture is logged on startup.
+- Camera is disabled by default (explicit opt-in via config).
+- Raw camera frames are never persisted to disk, logs, or SQLite.
+- Frames are sent only to localhost Ollama as base64, discarded after inference.
+- Only structured descriptions (text) enter the reasoning pipeline — never raw image data.
+- VisualEvents contain text descriptions and metadata, never pixel data.
