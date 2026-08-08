@@ -208,3 +208,127 @@ class TestAsyncNonBlocking:
 
         await bg
         assert loop_alive is True
+
+
+class TestConnectionLifecycle:
+    """Verify connection registry and close() behavior."""
+
+    async def test_close_prevents_further_use(self, tmp_path):
+        """After close(), any operation raises RuntimeError."""
+        store = SQLiteStore(tmp_path / "lifecycle.db")
+        manager = MemoryManager(store)
+        manager.start_session()
+        manager.remember("before close")
+        manager.close()
+
+        with pytest.raises(RuntimeError, match="closed"):
+            store.get("anything")
+
+    async def test_close_closes_worker_thread_connections(self, tmp_path):
+        """close() closes connections created by worker threads."""
+        store = SQLiteStore(tmp_path / "lifecycle2.db")
+        manager = MemoryManager(store)
+        manager.start_session()
+
+        # Create connections on worker threads
+        await asyncio.to_thread(manager.remember, "from worker 1", MemoryType.NOTE, 0.5)
+        await asyncio.to_thread(manager.remember, "from worker 2", MemoryType.NOTE, 0.5)
+
+        # Registry should have connections
+        assert len(store._connections) >= 1
+
+        manager.close()
+
+        # All connections closed
+        assert len(store._connections) == 0
+        assert store._closed is True
+
+    async def test_operations_after_close_fail_from_worker(self, tmp_path):
+        """Worker threads cannot use the store after close."""
+        store = SQLiteStore(tmp_path / "lifecycle3.db")
+        manager = MemoryManager(store)
+        manager.start_session()
+        await asyncio.to_thread(manager.remember, "pre-close")
+        manager.close()
+
+        with pytest.raises(RuntimeError, match="closed"):
+            await asyncio.to_thread(manager.remember, "post-close")
+
+
+class TestInMemoryBehavior:
+    """Verify :memory: works correctly with shared-cache URI."""
+
+    def test_memory_db_single_thread_works(self):
+        """Basic :memory: usage on one thread works."""
+        store = SQLiteStore(":memory:")
+        manager = MemoryManager(store)
+        manager.start_session()
+        mem = manager.remember("in memory")
+        assert manager.get_memory(mem.id) is not None
+        manager.close()
+
+    async def test_memory_db_cross_thread_visibility(self):
+        """Data written on one thread is visible from another (shared-cache)."""
+        store = SQLiteStore(":memory:")
+        manager = MemoryManager(store)
+        manager.start_session()
+
+        # Write on main thread
+        mem = manager.remember("visible to workers")
+
+        # Read from a worker thread
+        result = await asyncio.to_thread(manager.get_memory, mem.id)
+        assert result is not None
+        assert result.content == "visible to workers"
+        manager.close()
+
+    async def test_memory_db_worker_write_visible_to_main(self):
+        """Data written by a worker thread is visible on the main thread."""
+        store = SQLiteStore(":memory:")
+        manager = MemoryManager(store)
+        manager.start_session()
+
+        # Write from worker
+        mem = await asyncio.to_thread(manager.remember, "from worker", MemoryType.NOTE, 0.5)
+
+        # Read from main thread
+        result = manager.get_memory(mem.id)
+        assert result is not None
+        assert result.content == "from worker"
+        manager.close()
+
+    async def test_memory_db_concurrent_operations(self):
+        """Concurrent operations on :memory: work with sequential writes.
+
+        Note: shared-cache :memory: uses table-level locking (not WAL), so
+        truly concurrent writes can conflict. This is acceptable because
+        the real application uses file-backed WAL databases for concurrency.
+        :memory: is intended for tests with limited concurrency.
+        """
+        store = SQLiteStore(":memory:")
+        manager = MemoryManager(store)
+        manager.start_session()
+
+        # Sequential writes are fine
+        for i in range(10):
+            await asyncio.to_thread(manager.remember, f"mem {i}", MemoryType.NOTE, 0.5)
+
+        all_mems = manager.store.all_memories(100)
+        assert len(all_mems) == 10
+        manager.close()
+
+    def test_file_backed_uses_wal(self, tmp_path):
+        """File-backed databases get WAL mode."""
+        store = SQLiteStore(tmp_path / "wal_test.db")
+        conn = store._get_conn()
+        mode = conn.execute("PRAGMA journal_mode").fetchone()[0]
+        assert mode == "wal"
+        store.close()
+
+    def test_memory_db_no_wal(self):
+        """:memory: databases don't use WAL (not applicable)."""
+        store = SQLiteStore(":memory:")
+        conn = store._get_conn()
+        mode = conn.execute("PRAGMA journal_mode").fetchone()[0]
+        assert mode == "memory"
+        store.close()

@@ -299,3 +299,70 @@ class TestEmptyQueryBehavior:
         # Single char words are filtered (len > 1)
         assert manager.search("a") == []
         manager.close()
+
+
+class TestContextCharacterAccounting:
+    """Verify total_characters accurately reflects to_messages() content."""
+
+    def test_total_characters_matches_message_content(self):
+        """total_characters should equal sum of all content strings in to_messages()."""
+        builder = ContextBuilder(max_messages=8, max_characters=6000)
+        memory = WorkingMemory(max_size=20)
+        memory.record("e1", "previous question", should_reason=True)
+        conv = [
+            {"role": "user", "content": "conv msg 1"},
+            {"role": "assistant", "content": "conv answer 1"},
+        ]
+        mem_ctx = ["User prefers Neovim"]
+
+        ctx = builder.build(_speech("current query"), memory, conversation_messages=conv, memory_context=mem_ctx)
+        msgs = builder.to_messages(ctx)
+
+        # total_characters = system + current + working memory + conversation + memory
+        # It does NOT include the "Relevant information:" formatting wrapper
+        # (that's formatting overhead, not content budget)
+        actual_content_chars = (
+            len(ctx.system_prompt)
+            + len(ctx.current_event.transcript)
+            + sum(len(e.transcript) for e in ctx.recent_events)
+            + sum(len(m.get("content", "")) for m in ctx.conversation_messages)
+            + sum(len(s) for s in ctx.memory_context)
+        )
+        assert ctx.total_characters == actual_content_chars
+
+    def test_to_messages_always_ends_with_current_request(self):
+        """The last message in to_messages() is always the current request."""
+        builder = ContextBuilder(max_messages=8, max_characters=6000)
+        memory = WorkingMemory(max_size=20)
+        memory.record("e1", "old stuff", should_reason=True)
+        conv = [{"role": "user", "content": "past"}]
+        mem_ctx = ["some memory"]
+
+        ctx = builder.build(_speech("CURRENT"), memory, conversation_messages=conv, memory_context=mem_ctx)
+        msgs = builder.to_messages(ctx)
+        assert msgs[-1] == {"role": "user", "content": "CURRENT"}
+
+    def test_to_messages_starts_with_system(self):
+        builder = ContextBuilder(max_messages=8, max_characters=6000)
+        memory = WorkingMemory(max_size=20)
+        ctx = builder.build(_speech("q"), memory)
+        msgs = builder.to_messages(ctx)
+        assert msgs[0]["role"] == "system"
+
+    def test_budget_is_content_only(self):
+        """The character budget applies to content strings, not to role labels
+        or message formatting. Document this: the limit is a content-character budget."""
+        builder = ContextBuilder(max_messages=8, max_characters=2000)
+        memory = WorkingMemory(max_size=20)
+        for i in range(20):
+            memory.record(f"e{i}", "a" * 50, should_reason=True)
+        ctx = builder.build(_speech("current"), memory)
+        # total_characters counts only content text
+        assert ctx.total_characters <= 2000
+        # The actual messages may have slightly more bytes due to role keys,
+        # but the content budget is what's enforced
+        msgs = builder.to_messages(ctx)
+        content_total = sum(len(m["content"]) for m in msgs)
+        # Content total should be close to total_characters
+        # (they differ only if memory_context formatting adds "Relevant information:" wrapper)
+        assert content_total >= ctx.total_characters

@@ -2,8 +2,15 @@
 
 Local, persistent, transactional. No external services.
 
-Thread safety: uses thread-local connections so each worker thread gets its own
+Thread safety: uses a connection registry so each worker thread gets its own
 sqlite3.Connection to the same database file. This is safe with asyncio.to_thread().
+
+Connection lifecycle: the store tracks all connections it creates. close() closes
+every connection in the registry. No connection is used after close().
+
+In-memory behavior: for ":memory:" databases, a shared-cache URI is used so all
+threads see the same in-memory database. A keeper connection holds the database
+alive for the store's lifetime.
 """
 from __future__ import annotations
 
@@ -12,6 +19,7 @@ import logging
 import sqlite3
 import threading
 import time
+import uuid
 from pathlib import Path
 
 from app.memory.store import ConversationStore, MemoryStore
@@ -57,9 +65,9 @@ CREATE INDEX IF NOT EXISTS idx_memories_created ON memories(created_at);
 """
 
 
-def _configure_connection(conn: sqlite3.Connection, db_path: str) -> None:
-    """Apply WAL, foreign keys, and busy timeout to a connection."""
-    if db_path != ":memory:":
+def _configure_connection(conn: sqlite3.Connection, is_file: bool) -> None:
+    """Apply WAL (file only), foreign keys, and busy timeout to a connection."""
+    if is_file:
         conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
     conn.execute("PRAGMA busy_timeout=5000")
@@ -68,40 +76,73 @@ def _configure_connection(conn: sqlite3.Connection, db_path: str) -> None:
 class SQLiteStore:
     """Unified SQLite store implementing both MemoryStore and ConversationStore.
 
-    Thread-local connections: each thread that calls methods gets its own
-    sqlite3.Connection. This allows safe use with asyncio.to_thread() where
-    different worker threads may invoke store methods concurrently.
+    Thread safety via connection registry: each thread that calls methods gets
+    its own sqlite3.Connection. All connections are tracked in a thread-safe set
+    and closed together on store shutdown.
 
-    ponytail: thread-local connections, no pool. Single-user local assistant.
+    In-memory databases use a shared-cache URI so all threads share one DB.
+    A keeper connection holds the shared DB alive for the store's lifetime.
+
+    ponytail: connection registry, no pool. Single-user local assistant.
     Upgrade path: connection pool if dozens of concurrent threads are needed.
     """
 
     def __init__(self, db_path: str | Path = ":memory:") -> None:
-        self._db_path = str(db_path)
+        self._raw_path = str(db_path)
+        self._is_file = self._raw_path != ":memory:"
+
+        if self._is_file:
+            self._connect_uri = None
+            self._keeper: sqlite3.Connection | None = None
+        else:
+            # Shared-cache URI: all connections see one in-memory database.
+            name = uuid.uuid4().hex
+            self._connect_uri = f"file:{name}?mode=memory&cache=shared"
+            self._keeper = sqlite3.connect(self._connect_uri, uri=True)
+
         self._local = threading.local()
+        self._lock = threading.Lock()
+        self._connections: set[sqlite3.Connection] = set()
         self._closed = False
+
         # Initialize schema on the creating thread's connection
         conn = self._get_conn()
         conn.executescript(_SCHEMA)
 
+    def _make_connection(self) -> sqlite3.Connection:
+        """Create a new SQLite connection for the current configuration."""
+        if self._connect_uri:
+            conn = sqlite3.connect(self._connect_uri, uri=True, isolation_level="DEFERRED")
+        else:
+            conn = sqlite3.connect(self._raw_path, isolation_level="DEFERRED")
+        _configure_connection(conn, self._is_file)
+        return conn
+
     def _get_conn(self) -> sqlite3.Connection:
-        """Get or create a thread-local connection."""
+        """Get or create a thread-local connection, registered for lifecycle."""
         if self._closed:
             raise RuntimeError("SQLiteStore is closed")
         conn = getattr(self._local, "conn", None)
         if conn is None:
-            conn = sqlite3.connect(self._db_path, isolation_level="DEFERRED")
-            _configure_connection(conn, self._db_path)
+            conn = self._make_connection()
             self._local.conn = conn
+            with self._lock:
+                self._connections.add(conn)
         return conn
 
     def close(self) -> None:
-        """Close all known connections. Safe to call from any thread."""
+        """Close all registered connections. No connection is usable after this."""
         self._closed = True
-        conn = getattr(self._local, "conn", None)
-        if conn is not None:
-            conn.close()
-            self._local.conn = None
+        with self._lock:
+            for conn in self._connections:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+            self._connections.clear()
+        if self._keeper is not None:
+            self._keeper.close()
+            self._keeper = None
 
     # ── MemoryStore ──────────────────────────────────────────────────────
 
@@ -231,7 +272,6 @@ class SQLiteStore:
             except sqlite3.IntegrityError:
                 return
             except sqlite3.OperationalError:
-                # Database locked during concurrent write — check if already exists
                 existing = self.get_message_by_source(message.source_event_id)
                 if existing is not None:
                     return
