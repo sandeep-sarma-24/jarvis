@@ -1,12 +1,16 @@
 """SQLite-backed memory and conversation store.
 
 Local, persistent, transactional. No external services.
+
+Thread safety: uses thread-local connections so each worker thread gets its own
+sqlite3.Connection to the same database file. This is safe with asyncio.to_thread().
 """
 from __future__ import annotations
 
 import json
 import logging
 import sqlite3
+import threading
 import time
 from pathlib import Path
 
@@ -32,6 +36,9 @@ CREATE TABLE IF NOT EXISTS conversation_messages (
     FOREIGN KEY (session_id) REFERENCES conversation_sessions(id)
 );
 
+CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_source_event_unique
+    ON conversation_messages(source_event_id) WHERE source_event_id IS NOT NULL;
+
 CREATE TABLE IF NOT EXISTS memories (
     id TEXT PRIMARY KEY,
     type TEXT NOT NULL,
@@ -45,36 +52,62 @@ CREATE TABLE IF NOT EXISTS memories (
 
 CREATE INDEX IF NOT EXISTS idx_messages_session_id ON conversation_messages(session_id);
 CREATE INDEX IF NOT EXISTS idx_messages_timestamp ON conversation_messages(timestamp);
-CREATE INDEX IF NOT EXISTS idx_messages_source_event ON conversation_messages(source_event_id);
 CREATE INDEX IF NOT EXISTS idx_memories_type ON memories(type);
 CREATE INDEX IF NOT EXISTS idx_memories_created ON memories(created_at);
 """
 
 
+def _configure_connection(conn: sqlite3.Connection, db_path: str) -> None:
+    """Apply WAL, foreign keys, and busy timeout to a connection."""
+    if db_path != ":memory:":
+        conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA foreign_keys=ON")
+    conn.execute("PRAGMA busy_timeout=5000")
+
+
 class SQLiteStore:
     """Unified SQLite store implementing both MemoryStore and ConversationStore.
 
-    ponytail: single-connection, synchronous. Caller wraps in asyncio.to_thread.
-    Upgrade path: connection pool if concurrent writes become a bottleneck.
+    Thread-local connections: each thread that calls methods gets its own
+    sqlite3.Connection. This allows safe use with asyncio.to_thread() where
+    different worker threads may invoke store methods concurrently.
+
+    ponytail: thread-local connections, no pool. Single-user local assistant.
+    Upgrade path: connection pool if dozens of concurrent threads are needed.
     """
 
     def __init__(self, db_path: str | Path = ":memory:") -> None:
         self._db_path = str(db_path)
-        self._conn = sqlite3.connect(self._db_path, isolation_level="DEFERRED")
-        self._conn.execute("PRAGMA journal_mode=WAL")
-        self._conn.execute("PRAGMA foreign_keys=ON")
-        self._init_schema()
+        self._local = threading.local()
+        self._closed = False
+        # Initialize schema on the creating thread's connection
+        conn = self._get_conn()
+        conn.executescript(_SCHEMA)
 
-    def _init_schema(self) -> None:
-        self._conn.executescript(_SCHEMA)
+    def _get_conn(self) -> sqlite3.Connection:
+        """Get or create a thread-local connection."""
+        if self._closed:
+            raise RuntimeError("SQLiteStore is closed")
+        conn = getattr(self._local, "conn", None)
+        if conn is None:
+            conn = sqlite3.connect(self._db_path, isolation_level="DEFERRED")
+            _configure_connection(conn, self._db_path)
+            self._local.conn = conn
+        return conn
 
     def close(self) -> None:
-        self._conn.close()
+        """Close all known connections. Safe to call from any thread."""
+        self._closed = True
+        conn = getattr(self._local, "conn", None)
+        if conn is not None:
+            conn.close()
+            self._local.conn = None
 
     # ── MemoryStore ──────────────────────────────────────────────────────
 
     def add(self, memory: Memory) -> None:
-        self._conn.execute(
+        conn = self._get_conn()
+        conn.execute(
             "INSERT OR IGNORE INTO memories (id, type, content, created_at, updated_at, importance, source_event_id, metadata_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 memory.id,
@@ -87,10 +120,11 @@ class SQLiteStore:
                 json.dumps(memory.metadata),
             ),
         )
-        self._conn.commit()
+        conn.commit()
 
     def get(self, memory_id: str) -> Memory | None:
-        row = self._conn.execute(
+        conn = self._get_conn()
+        row = conn.execute(
             "SELECT id, type, content, created_at, updated_at, importance, source_event_id, metadata_json FROM memories WHERE id = ?",
             (memory_id,),
         ).fetchone()
@@ -110,7 +144,8 @@ class SQLiteStore:
         if not words:
             return []
 
-        rows = self._conn.execute(
+        conn = self._get_conn()
+        rows = conn.execute(
             "SELECT id, type, content, created_at, updated_at, importance, source_event_id, metadata_json FROM memories ORDER BY created_at DESC LIMIT 1000"
         ).fetchall()
 
@@ -136,11 +171,13 @@ class SQLiteStore:
         return [mem for _, mem in scored[:limit]]
 
     def delete(self, memory_id: str) -> None:
-        self._conn.execute("DELETE FROM memories WHERE id = ?", (memory_id,))
-        self._conn.commit()
+        conn = self._get_conn()
+        conn.execute("DELETE FROM memories WHERE id = ?", (memory_id,))
+        conn.commit()
 
     def all_memories(self, limit: int = 100) -> list[Memory]:
-        rows = self._conn.execute(
+        conn = self._get_conn()
+        rows = conn.execute(
             "SELECT id, type, content, created_at, updated_at, importance, source_event_id, metadata_json FROM memories ORDER BY created_at DESC LIMIT ?",
             (limit,),
         ).fetchall()
@@ -149,14 +186,16 @@ class SQLiteStore:
     # ── ConversationStore ────────────────────────────────────────────────
 
     def create_session(self, session: ConversationSession) -> None:
-        self._conn.execute(
+        conn = self._get_conn()
+        conn.execute(
             "INSERT OR IGNORE INTO conversation_sessions (id, started_at, last_activity_at) VALUES (?, ?, ?)",
             (session.id, session.started_at, session.last_activity_at),
         )
-        self._conn.commit()
+        conn.commit()
 
     def get_session(self, session_id: str) -> ConversationSession | None:
-        row = self._conn.execute(
+        conn = self._get_conn()
+        row = conn.execute(
             "SELECT id, started_at, last_activity_at FROM conversation_sessions WHERE id = ?",
             (session_id,),
         ).fetchone()
@@ -165,36 +204,58 @@ class SQLiteStore:
         return ConversationSession(id=row[0], started_at=row[1], last_activity_at=row[2])
 
     def update_session_activity(self, session_id: str, timestamp: float) -> None:
-        self._conn.execute(
+        conn = self._get_conn()
+        conn.execute(
             "UPDATE conversation_sessions SET last_activity_at = ? WHERE id = ?",
             (timestamp, session_id),
         )
-        self._conn.commit()
+        conn.commit()
 
     def add_message(self, message: ConversationMessage) -> None:
-        # Idempotency: if source_event_id already exists, skip
+        conn = self._get_conn()
+        # Schema-level UNIQUE index on source_event_id enforces idempotency.
+        # IntegrityError = duplicate source_event_id → skip gracefully.
         if message.source_event_id:
-            existing = self.get_message_by_source(message.source_event_id)
-            if existing is not None:
+            try:
+                conn.execute(
+                    "INSERT INTO conversation_messages (id, session_id, role, content, timestamp, source_event_id) VALUES (?, ?, ?, ?, ?, ?)",
+                    (
+                        message.id,
+                        message.session_id,
+                        message.role,
+                        message.content,
+                        message.timestamp,
+                        message.source_event_id,
+                    ),
+                )
+            except sqlite3.IntegrityError:
                 return
-        self._conn.execute(
-            "INSERT OR IGNORE INTO conversation_messages (id, session_id, role, content, timestamp, source_event_id) VALUES (?, ?, ?, ?, ?, ?)",
-            (
-                message.id,
-                message.session_id,
-                message.role,
-                message.content,
-                message.timestamp,
-                message.source_event_id,
-            ),
-        )
-        self._conn.commit()
+            except sqlite3.OperationalError:
+                # Database locked during concurrent write — check if already exists
+                existing = self.get_message_by_source(message.source_event_id)
+                if existing is not None:
+                    return
+                raise
+        else:
+            conn.execute(
+                "INSERT OR IGNORE INTO conversation_messages (id, session_id, role, content, timestamp, source_event_id) VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    message.id,
+                    message.session_id,
+                    message.role,
+                    message.content,
+                    message.timestamp,
+                    message.source_event_id,
+                ),
+            )
+        conn.commit()
         self.update_session_activity(message.session_id, message.timestamp)
 
     def get_messages(
         self, session_id: str, limit: int = 50
     ) -> list[ConversationMessage]:
-        rows = self._conn.execute(
+        conn = self._get_conn()
+        rows = conn.execute(
             "SELECT id, session_id, role, content, timestamp, source_event_id FROM conversation_messages WHERE session_id = ? ORDER BY timestamp DESC LIMIT ?",
             (session_id, limit),
         ).fetchall()
@@ -209,7 +270,8 @@ class SQLiteStore:
         return msgs
 
     def get_message_by_source(self, source_event_id: str) -> ConversationMessage | None:
-        row = self._conn.execute(
+        conn = self._get_conn()
+        row = conn.execute(
             "SELECT id, session_id, role, content, timestamp, source_event_id FROM conversation_messages WHERE source_event_id = ?",
             (source_event_id,),
         ).fetchone()
@@ -221,13 +283,14 @@ class SQLiteStore:
         )
 
     def clear_session(self, session_id: str) -> None:
-        self._conn.execute(
+        conn = self._get_conn()
+        conn.execute(
             "DELETE FROM conversation_messages WHERE session_id = ?", (session_id,)
         )
-        self._conn.execute(
+        conn.execute(
             "DELETE FROM conversation_sessions WHERE id = ?", (session_id,)
         )
-        self._conn.commit()
+        conn.commit()
 
     # ── Helpers ──────────────────────────────────────────────────────────
 
