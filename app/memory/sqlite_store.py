@@ -2,11 +2,13 @@
 
 Local, persistent, transactional. No external services.
 
-Thread safety: uses a connection registry so each worker thread gets its own
-sqlite3.Connection to the same database file. This is safe with asyncio.to_thread().
+Thread safety: each worker thread gets its own sqlite3.Connection via thread-local
+storage. All connections are registered for lifecycle management.
 
-Connection lifecycle: the store tracks all connections it creates. close() closes
-every connection in the registry. No connection is used after close().
+Connection lifecycle: close() waits for active operations to drain, then closes
+every registered connection from any thread. check_same_thread=False permits this
+controlled cross-thread shutdown. Connections remain logically owned by their
+creating thread for all normal operations.
 
 In-memory behavior: for ":memory:" databases, a shared-cache URI is used so all
 threads see the same in-memory database. A keeper connection holds the database
@@ -76,14 +78,16 @@ def _configure_connection(conn: sqlite3.Connection, is_file: bool) -> None:
 class SQLiteStore:
     """Unified SQLite store implementing both MemoryStore and ConversationStore.
 
-    Thread safety via connection registry: each thread that calls methods gets
-    its own sqlite3.Connection. All connections are tracked in a thread-safe set
-    and closed together on store shutdown.
+    Each thread gets its own sqlite3.Connection (thread-local). All connections
+    use check_same_thread=False so close() can shut them down from any thread.
+    This does NOT mean connections are shared for operations — each thread uses
+    only its own connection. The flag exists solely for controlled lifecycle.
 
-    In-memory databases use a shared-cache URI so all threads share one DB.
-    A keeper connection holds the shared DB alive for the store's lifetime.
+    Active-operation guard: close() waits for in-flight operations to complete
+    before closing connections. This prevents corruption from closing a connection
+    mid-operation.
 
-    ponytail: connection registry, no pool. Single-user local assistant.
+    ponytail: connection registry + active-op counter, no pool. Single-user local.
     Upgrade path: connection pool if dozens of concurrent threads are needed.
     """
 
@@ -95,26 +99,35 @@ class SQLiteStore:
             self._connect_uri = None
             self._keeper: sqlite3.Connection | None = None
         else:
-            # Shared-cache URI: all connections see one in-memory database.
             name = uuid.uuid4().hex
             self._connect_uri = f"file:{name}?mode=memory&cache=shared"
-            self._keeper = sqlite3.connect(self._connect_uri, uri=True)
+            self._keeper = sqlite3.connect(
+                self._connect_uri, uri=True, check_same_thread=False
+            )
 
         self._local = threading.local()
         self._lock = threading.Lock()
         self._connections: set[sqlite3.Connection] = set()
         self._closed = False
+        self._active_ops = 0
+        self._active_ops_lock = threading.Lock()
+        self._drain_event = threading.Event()
+        self._drain_event.set()  # starts drained (no ops in flight)
 
-        # Initialize schema on the creating thread's connection
         conn = self._get_conn()
         conn.executescript(_SCHEMA)
 
     def _make_connection(self) -> sqlite3.Connection:
         """Create a new SQLite connection for the current configuration."""
         if self._connect_uri:
-            conn = sqlite3.connect(self._connect_uri, uri=True, isolation_level="DEFERRED")
+            conn = sqlite3.connect(
+                self._connect_uri, uri=True,
+                isolation_level="DEFERRED", check_same_thread=False,
+            )
         else:
-            conn = sqlite3.connect(self._raw_path, isolation_level="DEFERRED")
+            conn = sqlite3.connect(
+                self._raw_path, isolation_level="DEFERRED", check_same_thread=False,
+            )
         _configure_connection(conn, self._is_file)
         return conn
 
@@ -130,15 +143,34 @@ class SQLiteStore:
                 self._connections.add(conn)
         return conn
 
+    def _begin_op(self) -> None:
+        """Mark an operation as starting. Raises if store is closed."""
+        if self._closed:
+            raise RuntimeError("SQLiteStore is closed")
+        with self._active_ops_lock:
+            self._active_ops += 1
+            self._drain_event.clear()
+
+    def _end_op(self) -> None:
+        """Mark an operation as complete."""
+        with self._active_ops_lock:
+            self._active_ops -= 1
+            if self._active_ops == 0:
+                self._drain_event.set()
+
     def close(self) -> None:
-        """Close all registered connections. No connection is usable after this."""
+        """Close all registered connections. Waits for active operations to drain.
+
+        Safe to call from any thread. Idempotent.
+        """
+        if self._closed:
+            return
         self._closed = True
+        # Wait for in-flight operations (bounded — single-user app, ops are fast)
+        self._drain_event.wait(timeout=10.0)
         with self._lock:
             for conn in self._connections:
-                try:
-                    conn.close()
-                except Exception:
-                    pass
+                conn.close()
             self._connections.clear()
         if self._keeper is not None:
             self._keeper.close()
@@ -147,31 +179,39 @@ class SQLiteStore:
     # ── MemoryStore ──────────────────────────────────────────────────────
 
     def add(self, memory: Memory) -> None:
-        conn = self._get_conn()
-        conn.execute(
-            "INSERT OR IGNORE INTO memories (id, type, content, created_at, updated_at, importance, source_event_id, metadata_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (
-                memory.id,
-                memory.type.value,
-                memory.content,
-                memory.created_at,
-                memory.updated_at,
-                memory.importance,
-                memory.source_event_id,
-                json.dumps(memory.metadata),
-            ),
-        )
-        conn.commit()
+        self._begin_op()
+        try:
+            conn = self._get_conn()
+            conn.execute(
+                "INSERT OR IGNORE INTO memories (id, type, content, created_at, updated_at, importance, source_event_id, metadata_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    memory.id,
+                    memory.type.value,
+                    memory.content,
+                    memory.created_at,
+                    memory.updated_at,
+                    memory.importance,
+                    memory.source_event_id,
+                    json.dumps(memory.metadata),
+                ),
+            )
+            conn.commit()
+        finally:
+            self._end_op()
 
     def get(self, memory_id: str) -> Memory | None:
-        conn = self._get_conn()
-        row = conn.execute(
-            "SELECT id, type, content, created_at, updated_at, importance, source_event_id, metadata_json FROM memories WHERE id = ?",
-            (memory_id,),
-        ).fetchone()
-        if row is None:
-            return None
-        return self._row_to_memory(row)
+        self._begin_op()
+        try:
+            conn = self._get_conn()
+            row = conn.execute(
+                "SELECT id, type, content, created_at, updated_at, importance, source_event_id, metadata_json FROM memories WHERE id = ?",
+                (memory_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            return self._row_to_memory(row)
+        finally:
+            self._end_op()
 
     def search(self, query: str, limit: int = 5) -> list[Memory]:
         """Keyword + recency + importance scoring.
@@ -185,10 +225,14 @@ class SQLiteStore:
         if not words:
             return []
 
-        conn = self._get_conn()
-        rows = conn.execute(
-            "SELECT id, type, content, created_at, updated_at, importance, source_event_id, metadata_json FROM memories ORDER BY created_at DESC LIMIT 1000"
-        ).fetchall()
+        self._begin_op()
+        try:
+            conn = self._get_conn()
+            rows = conn.execute(
+                "SELECT id, type, content, created_at, updated_at, importance, source_event_id, metadata_json FROM memories ORDER BY created_at DESC LIMIT 1000"
+            ).fetchall()
+        finally:
+            self._end_op()
 
         now = time.time()
         scored: list[tuple[float, Memory]] = []
@@ -212,54 +256,93 @@ class SQLiteStore:
         return [mem for _, mem in scored[:limit]]
 
     def delete(self, memory_id: str) -> None:
-        conn = self._get_conn()
-        conn.execute("DELETE FROM memories WHERE id = ?", (memory_id,))
-        conn.commit()
+        self._begin_op()
+        try:
+            conn = self._get_conn()
+            conn.execute("DELETE FROM memories WHERE id = ?", (memory_id,))
+            conn.commit()
+        finally:
+            self._end_op()
 
     def all_memories(self, limit: int = 100) -> list[Memory]:
-        conn = self._get_conn()
-        rows = conn.execute(
-            "SELECT id, type, content, created_at, updated_at, importance, source_event_id, metadata_json FROM memories ORDER BY created_at DESC LIMIT ?",
-            (limit,),
-        ).fetchall()
-        return [self._row_to_memory(r) for r in rows]
+        self._begin_op()
+        try:
+            conn = self._get_conn()
+            rows = conn.execute(
+                "SELECT id, type, content, created_at, updated_at, importance, source_event_id, metadata_json FROM memories ORDER BY created_at DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+            return [self._row_to_memory(r) for r in rows]
+        finally:
+            self._end_op()
 
     # ── ConversationStore ────────────────────────────────────────────────
 
     def create_session(self, session: ConversationSession) -> None:
-        conn = self._get_conn()
-        conn.execute(
-            "INSERT OR IGNORE INTO conversation_sessions (id, started_at, last_activity_at) VALUES (?, ?, ?)",
-            (session.id, session.started_at, session.last_activity_at),
-        )
-        conn.commit()
+        self._begin_op()
+        try:
+            conn = self._get_conn()
+            conn.execute(
+                "INSERT OR IGNORE INTO conversation_sessions (id, started_at, last_activity_at) VALUES (?, ?, ?)",
+                (session.id, session.started_at, session.last_activity_at),
+            )
+            conn.commit()
+        finally:
+            self._end_op()
 
     def get_session(self, session_id: str) -> ConversationSession | None:
-        conn = self._get_conn()
-        row = conn.execute(
-            "SELECT id, started_at, last_activity_at FROM conversation_sessions WHERE id = ?",
-            (session_id,),
-        ).fetchone()
-        if row is None:
-            return None
-        return ConversationSession(id=row[0], started_at=row[1], last_activity_at=row[2])
+        self._begin_op()
+        try:
+            conn = self._get_conn()
+            row = conn.execute(
+                "SELECT id, started_at, last_activity_at FROM conversation_sessions WHERE id = ?",
+                (session_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            return ConversationSession(id=row[0], started_at=row[1], last_activity_at=row[2])
+        finally:
+            self._end_op()
 
     def update_session_activity(self, session_id: str, timestamp: float) -> None:
-        conn = self._get_conn()
-        conn.execute(
-            "UPDATE conversation_sessions SET last_activity_at = ? WHERE id = ?",
-            (timestamp, session_id),
-        )
-        conn.commit()
+        self._begin_op()
+        try:
+            conn = self._get_conn()
+            conn.execute(
+                "UPDATE conversation_sessions SET last_activity_at = ? WHERE id = ?",
+                (timestamp, session_id),
+            )
+            conn.commit()
+        finally:
+            self._end_op()
 
     def add_message(self, message: ConversationMessage) -> None:
-        conn = self._get_conn()
-        # Schema-level UNIQUE index on source_event_id enforces idempotency.
-        # IntegrityError = duplicate source_event_id → skip gracefully.
-        if message.source_event_id:
-            try:
+        self._begin_op()
+        try:
+            conn = self._get_conn()
+            if message.source_event_id:
+                try:
+                    conn.execute(
+                        "INSERT INTO conversation_messages (id, session_id, role, content, timestamp, source_event_id) VALUES (?, ?, ?, ?, ?, ?)",
+                        (
+                            message.id,
+                            message.session_id,
+                            message.role,
+                            message.content,
+                            message.timestamp,
+                            message.source_event_id,
+                        ),
+                    )
+                except sqlite3.IntegrityError:
+                    return
+                except sqlite3.OperationalError:
+                    existing = self._get_message_by_source_inner(message.source_event_id)
+                    if existing is not None:
+                        return
+                    raise
+            else:
                 conn.execute(
-                    "INSERT INTO conversation_messages (id, session_id, role, content, timestamp, source_event_id) VALUES (?, ?, ?, ?, ?, ?)",
+                    "INSERT OR IGNORE INTO conversation_messages (id, session_id, role, content, timestamp, source_event_id) VALUES (?, ?, ?, ?, ?, ?)",
                     (
                         message.id,
                         message.session_id,
@@ -269,47 +352,42 @@ class SQLiteStore:
                         message.source_event_id,
                     ),
                 )
-            except sqlite3.IntegrityError:
-                return
-            except sqlite3.OperationalError:
-                existing = self.get_message_by_source(message.source_event_id)
-                if existing is not None:
-                    return
-                raise
-        else:
-            conn.execute(
-                "INSERT OR IGNORE INTO conversation_messages (id, session_id, role, content, timestamp, source_event_id) VALUES (?, ?, ?, ?, ?, ?)",
-                (
-                    message.id,
-                    message.session_id,
-                    message.role,
-                    message.content,
-                    message.timestamp,
-                    message.source_event_id,
-                ),
-            )
-        conn.commit()
+            conn.commit()
+        finally:
+            self._end_op()
         self.update_session_activity(message.session_id, message.timestamp)
 
     def get_messages(
         self, session_id: str, limit: int = 50
     ) -> list[ConversationMessage]:
-        conn = self._get_conn()
-        rows = conn.execute(
-            "SELECT id, session_id, role, content, timestamp, source_event_id FROM conversation_messages WHERE session_id = ? ORDER BY timestamp DESC LIMIT ?",
-            (session_id, limit),
-        ).fetchall()
-        msgs = [
-            ConversationMessage(
-                id=r[0], session_id=r[1], role=r[2],
-                content=r[3], timestamp=r[4], source_event_id=r[5],
-            )
-            for r in rows
-        ]
-        msgs.reverse()
-        return msgs
+        self._begin_op()
+        try:
+            conn = self._get_conn()
+            rows = conn.execute(
+                "SELECT id, session_id, role, content, timestamp, source_event_id FROM conversation_messages WHERE session_id = ? ORDER BY timestamp DESC LIMIT ?",
+                (session_id, limit),
+            ).fetchall()
+            msgs = [
+                ConversationMessage(
+                    id=r[0], session_id=r[1], role=r[2],
+                    content=r[3], timestamp=r[4], source_event_id=r[5],
+                )
+                for r in rows
+            ]
+            msgs.reverse()
+            return msgs
+        finally:
+            self._end_op()
 
     def get_message_by_source(self, source_event_id: str) -> ConversationMessage | None:
+        self._begin_op()
+        try:
+            return self._get_message_by_source_inner(source_event_id)
+        finally:
+            self._end_op()
+
+    def _get_message_by_source_inner(self, source_event_id: str) -> ConversationMessage | None:
+        """Inner implementation without op guard (for use within add_message)."""
         conn = self._get_conn()
         row = conn.execute(
             "SELECT id, session_id, role, content, timestamp, source_event_id FROM conversation_messages WHERE source_event_id = ?",
@@ -323,14 +401,18 @@ class SQLiteStore:
         )
 
     def clear_session(self, session_id: str) -> None:
-        conn = self._get_conn()
-        conn.execute(
-            "DELETE FROM conversation_messages WHERE session_id = ?", (session_id,)
-        )
-        conn.execute(
-            "DELETE FROM conversation_sessions WHERE id = ?", (session_id,)
-        )
-        conn.commit()
+        self._begin_op()
+        try:
+            conn = self._get_conn()
+            conn.execute(
+                "DELETE FROM conversation_messages WHERE session_id = ?", (session_id,)
+            )
+            conn.execute(
+                "DELETE FROM conversation_sessions WHERE id = ?", (session_id,)
+            )
+            conn.commit()
+        finally:
+            self._end_op()
 
     # ── Helpers ──────────────────────────────────────────────────────────
 

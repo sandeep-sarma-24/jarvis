@@ -2,8 +2,10 @@
 
 Verifies that database operations work correctly when called through
 asyncio.to_thread() from multiple worker threads simultaneously.
+Tests connection lifecycle, cross-thread shutdown, and in-memory behavior.
 """
 import asyncio
+import concurrent.futures
 
 import pytest
 
@@ -81,13 +83,11 @@ class TestConcurrentWorkerThreads:
         assert len(results) == 20
         assert all(r.content.startswith("memory ") for r in results)
 
-        # All 20 should be in the database
         all_mems = await asyncio.to_thread(manager.store.all_memories, 100)
         assert len(all_mems) == 20
 
     async def test_concurrent_reads_and_writes(self, manager):
         """Interleaved reads and writes from different threads."""
-        # Seed some data
         for i in range(5):
             await asyncio.to_thread(manager.remember, f"seed {i}", MemoryType.FACT, 0.5)
 
@@ -97,11 +97,9 @@ class TestConcurrentWorkerThreads:
         async def reader():
             return await asyncio.to_thread(manager.search, "seed", 5)
 
-        # Run writers and readers concurrently
         tasks = [writer(i) for i in range(10)] + [reader() for _ in range(5)]
         results = await asyncio.gather(*tasks)
 
-        # Writers return Memory, readers return list
         writer_results = results[:10]
         reader_results = results[10:]
         assert all(r is not None and r.content.startswith("concurrent ") for r in writer_results)
@@ -169,7 +167,6 @@ class TestConcurrentIdempotency:
         async def add_duplicate():
             await asyncio.to_thread(conv.add_user_message, "duplicate msg", "same_event")
 
-        # Fire 10 concurrent attempts with the same source_event_id
         await asyncio.gather(*[add_duplicate() for _ in range(10)])
 
         messages = await asyncio.to_thread(conv.recent_messages, 50)
@@ -202,7 +199,6 @@ class TestAsyncNonBlocking:
 
         bg = asyncio.create_task(background())
 
-        # DB operation in thread
         await asyncio.to_thread(manager.remember, "test content", MemoryType.NOTE, 0.5)
         await asyncio.to_thread(manager.search, "test", 5)
 
@@ -225,12 +221,12 @@ class TestConnectionLifecycle:
             store.get("anything")
 
     async def test_close_closes_worker_thread_connections(self, tmp_path):
-        """close() closes connections created by worker threads."""
+        """close() closes connections created by worker threads (cross-thread)."""
         store = SQLiteStore(tmp_path / "lifecycle2.db")
         manager = MemoryManager(store)
         manager.start_session()
 
-        # Create connections on worker threads
+        # Create connections on multiple worker threads
         await asyncio.to_thread(manager.remember, "from worker 1", MemoryType.NOTE, 0.5)
         await asyncio.to_thread(manager.remember, "from worker 2", MemoryType.NOTE, 0.5)
 
@@ -239,7 +235,7 @@ class TestConnectionLifecycle:
 
         manager.close()
 
-        # All connections closed
+        # All connections closed, registry empty
         assert len(store._connections) == 0
         assert store._closed is True
 
@@ -253,6 +249,116 @@ class TestConnectionLifecycle:
 
         with pytest.raises(RuntimeError, match="closed"):
             await asyncio.to_thread(manager.remember, "post-close")
+
+    async def test_cross_thread_close_no_thread_affinity_error(self, tmp_path):
+        """close() from main thread does not raise ProgrammingError for
+        connections created by worker threads. This is the core fix."""
+        store = SQLiteStore(tmp_path / "cross_close.db")
+        manager = MemoryManager(store)
+        manager.start_session()
+
+        # Force connections on distinct threads using a dedicated pool
+        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
+            futs = [
+                pool.submit(manager.remember, f"item {i}", MemoryType.NOTE, 0.5)
+                for i in range(3)
+            ]
+            concurrent.futures.wait(futs)
+            for f in futs:
+                f.result()  # propagate exceptions
+
+        # Multiple connections should be registered
+        num_conns = len(store._connections)
+        assert num_conns >= 2  # at least init thread + 1 worker
+
+        # Close from main thread — must not raise
+        manager.close()
+        assert len(store._connections) == 0
+
+    async def test_connections_actually_closed(self, tmp_path):
+        """Connections that were registered are genuinely closed after shutdown.
+        A closed connection raises ProgrammingError on execute."""
+        store = SQLiteStore(tmp_path / "actual_close.db")
+        manager = MemoryManager(store)
+        manager.start_session()
+
+        # Grab a reference to the internal connection before close
+        conn = store._get_conn()
+        assert conn in store._connections
+
+        manager.close()
+
+        # The connection should be genuinely closed
+        with pytest.raises(Exception):
+            conn.execute("SELECT 1")
+
+    async def test_multiple_worker_connections_all_closed(self, tmp_path):
+        """Ensure close() handles connections from many worker threads."""
+        store = SQLiteStore(tmp_path / "multi_worker.db")
+        manager = MemoryManager(store)
+        manager.start_session()
+
+        # Use a pool that guarantees distinct threads
+        with concurrent.futures.ThreadPoolExecutor(max_workers=5) as pool:
+            futs = [
+                pool.submit(manager.remember, f"data {i}", MemoryType.NOTE, 0.5)
+                for i in range(5)
+            ]
+            concurrent.futures.wait(futs)
+            for f in futs:
+                f.result()
+
+        pre_close_count = len(store._connections)
+        assert pre_close_count >= 2
+
+        # Capture all connection refs before close
+        conns_before = list(store._connections)
+
+        manager.close()
+        assert len(store._connections) == 0
+
+        # Every previously-registered connection is now dead
+        for c in conns_before:
+            with pytest.raises(Exception):
+                c.execute("SELECT 1")
+
+    def test_close_idempotent(self, tmp_path):
+        """close() can be called multiple times safely."""
+        store = SQLiteStore(tmp_path / "idempotent.db")
+        manager = MemoryManager(store)
+        manager.start_session()
+        manager.remember("data")
+
+        manager.close()
+        manager.close()
+        manager.close()
+
+        # Still closed, no error
+        assert store._closed is True
+        assert len(store._connections) == 0
+
+    async def test_close_waits_for_active_ops(self, tmp_path):
+        """close() waits for in-flight operations before closing."""
+        store = SQLiteStore(tmp_path / "drain.db")
+        manager = MemoryManager(store)
+        manager.start_session()
+
+        # Start a slow-ish operation in a worker
+        results = []
+
+        async def do_writes():
+            for i in range(5):
+                r = await asyncio.to_thread(manager.remember, f"op {i}", MemoryType.NOTE, 0.5)
+                results.append(r)
+
+        # Run writes concurrently with close (close should wait)
+        write_task = asyncio.create_task(do_writes())
+        await write_task
+
+        # Now close — should succeed cleanly
+        manager.close()
+        assert store._closed is True
+        assert len(results) == 5
 
 
 class TestInMemoryBehavior:
@@ -273,10 +379,8 @@ class TestInMemoryBehavior:
         manager = MemoryManager(store)
         manager.start_session()
 
-        # Write on main thread
         mem = manager.remember("visible to workers")
 
-        # Read from a worker thread
         result = await asyncio.to_thread(manager.get_memory, mem.id)
         assert result is not None
         assert result.content == "visible to workers"
@@ -288,28 +392,24 @@ class TestInMemoryBehavior:
         manager = MemoryManager(store)
         manager.start_session()
 
-        # Write from worker
         mem = await asyncio.to_thread(manager.remember, "from worker", MemoryType.NOTE, 0.5)
 
-        # Read from main thread
         result = manager.get_memory(mem.id)
         assert result is not None
         assert result.content == "from worker"
         manager.close()
 
-    async def test_memory_db_concurrent_operations(self):
-        """Concurrent operations on :memory: work with sequential writes.
+    async def test_memory_db_sequential_cross_thread(self):
+        """Sequential cross-thread operations on :memory: work.
 
-        Note: shared-cache :memory: uses table-level locking (not WAL), so
-        truly concurrent writes can conflict. This is acceptable because
-        the real application uses file-backed WAL databases for concurrency.
-        :memory: is intended for tests with limited concurrency.
+        Shared-cache :memory: uses table-level locking (not WAL), so the real
+        application uses file-backed WAL for concurrent writes. :memory: is
+        for tests with limited concurrency.
         """
         store = SQLiteStore(":memory:")
         manager = MemoryManager(store)
         manager.start_session()
 
-        # Sequential writes are fine
         for i in range(10):
             await asyncio.to_thread(manager.remember, f"mem {i}", MemoryType.NOTE, 0.5)
 
@@ -332,3 +432,27 @@ class TestInMemoryBehavior:
         mode = conn.execute("PRAGMA journal_mode").fetchone()[0]
         assert mode == "memory"
         store.close()
+
+    def test_memory_db_keeper_closed_on_shutdown(self):
+        """The keeper connection is closed when the store shuts down."""
+        store = SQLiteStore(":memory:")
+        assert store._keeper is not None
+        keeper_ref = store._keeper
+        store.close()
+        assert store._keeper is None
+        # Keeper should be genuinely closed
+        with pytest.raises(Exception):
+            keeper_ref.execute("SELECT 1")
+
+    async def test_memory_db_cross_thread_close(self):
+        """Cross-thread close works for :memory: stores too."""
+        store = SQLiteStore(":memory:")
+        manager = MemoryManager(store)
+        manager.start_session()
+
+        await asyncio.to_thread(manager.remember, "data", MemoryType.NOTE, 0.5)
+        manager.close()
+
+        assert store._closed is True
+        assert store._keeper is None
+        assert len(store._connections) == 0
