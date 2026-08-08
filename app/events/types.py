@@ -33,3 +33,12 @@ class SpeechEvent(Event):
     duration_seconds: float = 0.0
     is_question: bool = False  # kept for arch compat, not used in Phase 1
     metadata: dict[str, object] = field(default_factory=dict)
+
+
+@dataclass
+class ResponseEvent(Event):
+    """Phase 4 — reasoning produced a response to be spoken."""
+
+    event_id: str = ""  # correlation back to original SpeechEvent
+    text: str = ""
+    reasoning_latency_ms: float = 0.0

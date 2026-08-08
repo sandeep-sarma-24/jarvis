@@ -37,5 +37,17 @@ max_concurrent_requests = 1
 [response]
 enabled = true
 
+[tts]
+enabled = true
+model = "mlx-community/Kokoro-82M-bf16"
+voice = "bf_emma"
+speed = 1.0
+sample_rate = 24000
+max_text_length = 2000
+
+[playback]
+enabled = true
+volume = 1.0
+
 [logging]
 level = "INFO"

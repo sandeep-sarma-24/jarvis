@@ -61,6 +61,22 @@ class ResponseConfig:
 
 
 @dataclass
+class TTSConfig:
+    enabled: bool = True
+    model: str = "mlx-community/Kokoro-82M-bf16"
+    voice: str = "bf_emma"
+    speed: float = 1.0
+    sample_rate: int = 24000
+    max_text_length: int = 2000
+
+
+@dataclass
+class PlaybackConfig:
+    enabled: bool = True
+    volume: float = 1.0
+
+
+@dataclass
 class LoggingConfig:
     level: str = "INFO"
 
@@ -74,6 +90,8 @@ class JarvisConfig:
     attention: AttentionConfig = field(default_factory=AttentionConfig)
     reasoning: ReasoningConfig = field(default_factory=ReasoningConfig)
     response: ResponseConfig = field(default_factory=ResponseConfig)
+    tts: TTSConfig = field(default_factory=TTSConfig)
+    playback: PlaybackConfig = field(default_factory=PlaybackConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
 
 
@@ -100,6 +118,10 @@ def load_config(path: Path | None = None) -> JarvisConfig:
         cfg.reasoning = ReasoningConfig(**{k: v for k, v in raw["reasoning"].items() if k in ReasoningConfig.__dataclass_fields__})
     if "response" in raw:
         cfg.response = ResponseConfig(**{k: v for k, v in raw["response"].items() if k in ResponseConfig.__dataclass_fields__})
+    if "tts" in raw:
+        cfg.tts = TTSConfig(**{k: v for k, v in raw["tts"].items() if k in TTSConfig.__dataclass_fields__})
+    if "playback" in raw:
+        cfg.playback = PlaybackConfig(**{k: v for k, v in raw["playback"].items() if k in PlaybackConfig.__dataclass_fields__})
     if "logging" in raw:
         cfg.logging = LoggingConfig(**{k: v for k, v in raw["logging"].items() if k in LoggingConfig.__dataclass_fields__})
     return cfg
