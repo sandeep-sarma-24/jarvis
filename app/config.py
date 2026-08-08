@@ -104,9 +104,22 @@ class CameraConfig:
 
 
 @dataclass
+class VisionConfig:
+    enabled: bool = False  # disabled by default — no vision model requirement
+    provider: str = "ollama"
+    model: str = "gemma4:12b"
+    ollama_url: str = "http://localhost:11434"
+    timeout_seconds: float = 30.0
+    max_image_size: int = 1024
+    temperature: float = 0.1
+    prompt: str = ""  # empty = use default prompt
+
+
+@dataclass
 class PerceptionConfig:
     enabled: bool = False  # disabled by default — privacy
     camera: CameraConfig = field(default_factory=CameraConfig)
+    vision: VisionConfig = field(default_factory=VisionConfig)
     max_visual_events: int = 5
     max_visual_context_characters: int = 500
     max_visual_event_age_seconds: float = 60.0
@@ -161,9 +174,13 @@ def load_config(path: Path | None = None) -> JarvisConfig:
         cfg.memory = MemoryConfig(**{k: v for k, v in raw["memory"].items() if k in MemoryConfig.__dataclass_fields__})
     if "perception" in raw:
         p = raw["perception"]
-        top = {k: v for k, v in p.items() if k in PerceptionConfig.__dataclass_fields__ and k != "camera"}
+        nested = {"camera", "vision"}
+        top = {k: v for k, v in p.items() if k in PerceptionConfig.__dataclass_fields__ and k not in nested}
         cam = CameraConfig()
         if "camera" in p:
             cam = CameraConfig(**{k: v for k, v in p["camera"].items() if k in CameraConfig.__dataclass_fields__})
-        cfg.perception = PerceptionConfig(camera=cam, **top)
+        vis = VisionConfig()
+        if "vision" in p:
+            vis = VisionConfig(**{k: v for k, v in p["vision"].items() if k in VisionConfig.__dataclass_fields__})
+        cfg.perception = PerceptionConfig(camera=cam, vision=vis, **top)
     return cfg

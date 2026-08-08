@@ -4,16 +4,20 @@ Responsibilities:
 - Enforce a bounded frame queue (latest-frame policy: newest wins).
 - Respect a configurable analysis interval.
 - Discard frames older than max_frame_age_seconds.
-- Expose metrics with clear semantics.
+- Expose metrics with clear, non-overlapping semantics.
 
-Metric definitions:
-    frames_received:        total frames submitted by capture via submit().
-    frames_sampled:         frames actually released for analysis via next_frame().
-    frames_dropped_stale:   frames rejected by next_frame() because age > max_frame_age.
-    frames_dropped_interval: frames in queue when next_frame() returns None because
-                             the analysis interval has not elapsed yet.
-    frames_evicted:         frames evicted from the bounded queue by newer arrivals
-                             (the oldest frame is silently replaced when queue is full).
+Metric definitions (each frame is counted in exactly one terminal category):
+    frames_received:         total frames submitted by capture via submit().
+    frames_sampled:          frames actually released for analysis via next_frame().
+    frames_dropped_stale:    frames removed from the queue because age > max_frame_age
+                             at the time next_frame() inspected them.
+    frames_dropped_superseded: fresh frames discarded by next_frame() because a newer
+                             fresh frame existed in the same queue drain. This is the
+                             core latest-frame policy: only the newest eligible frame
+                             is returned, older eligible frames are dropped.
+    frames_evicted:          frames silently replaced in the bounded queue when a new
+                             frame arrived and the queue was already full. These frames
+                             never reach next_frame() at all.
 """
 from __future__ import annotations
 
@@ -31,6 +35,9 @@ class FrameSampler:
 
     Bounded queue with latest-frame preference: when a new frame arrives
     and the queue is full, the oldest queued frame is evicted.
+
+    next_frame() drains the entire queue, discards stale frames, and returns
+    only the newest fresh frame. Older fresh frames are counted as superseded.
 
     analysis_interval_ms: minimum time between frames forwarded for analysis.
     max_frame_age_seconds: frames older than this are discarded as stale.
@@ -52,7 +59,7 @@ class FrameSampler:
         self.frames_received = 0
         self.frames_sampled = 0
         self.frames_dropped_stale = 0
-        self.frames_dropped_interval = 0
+        self.frames_dropped_superseded = 0
         self.frames_evicted = 0
 
     def submit(self, frame: Frame) -> None:
@@ -63,28 +70,45 @@ class FrameSampler:
         self._queue.append(frame)
 
     def next_frame(self) -> Frame | None:
-        """Return the next frame eligible for analysis, or None.
+        """Return the newest fresh frame eligible for analysis, or None.
 
-        Enforces analysis interval and frame freshness.
-        Discards stale frames until a fresh one is found or queue is empty.
+        Drains the entire queue on each call. Stale frames are counted and
+        discarded. Among fresh frames, only the newest is returned; older
+        fresh frames are counted as superseded. If the analysis interval
+        has not elapsed, the queue is left untouched and None is returned.
         """
         now = time.time()
 
         if now - self._last_analysis_time < self._interval_s:
-            self.frames_dropped_interval += len(self._queue)
             return None
+
+        if not self._queue:
+            return None
+
+        # Drain entire queue, find the newest fresh frame
+        best: Frame | None = None
+        stale = 0
+        superseded = 0
 
         while self._queue:
             frame = self._queue.popleft()
             if frame.age_seconds > self._max_age:
-                self.frames_dropped_stale += 1
+                stale += 1
                 continue
 
-            self._last_analysis_time = now
-            self.frames_sampled += 1
-            return frame
+            if best is not None:
+                superseded += 1
+            best = frame
 
-        return None
+        self.frames_dropped_stale += stale
+        self.frames_dropped_superseded += superseded
+
+        if best is None:
+            return None
+
+        self._last_analysis_time = now
+        self.frames_sampled += 1
+        return best
 
     @property
     def queue_depth(self) -> int:
@@ -96,6 +120,6 @@ class FrameSampler:
             "frames_received": self.frames_received,
             "frames_sampled": self.frames_sampled,
             "frames_dropped_stale": self.frames_dropped_stale,
-            "frames_dropped_interval": self.frames_dropped_interval,
+            "frames_dropped_superseded": self.frames_dropped_superseded,
             "frames_evicted": self.frames_evicted,
         }

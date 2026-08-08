@@ -555,7 +555,28 @@ async def run(cfg: JarvisConfig | None = None) -> None:
             max_queue_size=cam_cfg.max_queue_size,
         )
         change_detector = ChangeDetector(change_threshold=cam_cfg.change_threshold)
-        analyzer = MockVisualAnalyzer()
+
+        vis_cfg = cfg.perception.vision
+        if vis_cfg.enabled:
+            from app.perception.local_vision import LocalVisionAnalyzer, OllamaVisionBackend
+
+            vision_backend = OllamaVisionBackend(
+                model=vis_cfg.model,
+                base_url=vis_cfg.ollama_url,
+                timeout_seconds=vis_cfg.timeout_seconds,
+                temperature=vis_cfg.temperature,
+            )
+            analyzer = LocalVisionAnalyzer(
+                backend=vision_backend,
+                prompt=vis_cfg.prompt or "",
+                timeout_seconds=vis_cfg.timeout_seconds,
+                max_image_size=vis_cfg.max_image_size,
+            )
+            logger.info("Vision analyzer: LocalVisionAnalyzer (model=%s)", vis_cfg.model)
+        else:
+            analyzer = MockVisualAnalyzer()
+            logger.info("Vision analyzer: MockVisualAnalyzer")
+
         deduplicator = EventDeduplicator(dedup_window_seconds=cam_cfg.dedup_window_seconds)
 
         analysis_interval_ms = 1000.0 / cam_cfg.analysis_fps

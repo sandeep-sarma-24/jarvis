@@ -75,3 +75,13 @@ max_frame_age_seconds = 2.0
 max_queue_size = 2
 change_threshold = 0.05
 dedup_window_seconds = 30.0
+
+[perception.vision]
+enabled = false  # enable to use real local vision model instead of mock
+provider = "ollama"
+model = "gemma4:12b"
+ollama_url = "http://localhost:11434"
+timeout_seconds = 30.0
+max_image_size = 1024
+temperature = 0.1
+prompt = ""  # empty = use default prompt
