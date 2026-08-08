@@ -5,10 +5,10 @@ Local, persistent, transactional. No external services.
 Thread safety: each worker thread gets its own sqlite3.Connection via thread-local
 storage. All connections are registered for lifecycle management.
 
-Connection lifecycle: close() waits for active operations to drain, then closes
-every registered connection from any thread. check_same_thread=False permits this
-controlled cross-thread shutdown. Connections remain logically owned by their
-creating thread for all normal operations.
+Connection lifecycle: uses a Condition-based state machine (OPEN → CLOSING → CLOSED).
+Operation admission and close are atomic under the same lock, eliminating races.
+close() waits for active operations to drain, then closes all connections.
+check_same_thread=False permits this controlled cross-thread shutdown.
 
 In-memory behavior: for ":memory:" databases, a shared-cache URI is used so all
 threads see the same in-memory database. A keeper connection holds the database
@@ -78,16 +78,18 @@ def _configure_connection(conn: sqlite3.Connection, is_file: bool) -> None:
 class SQLiteStore:
     """Unified SQLite store implementing both MemoryStore and ConversationStore.
 
+    State machine: OPEN → CLOSING → CLOSED.
+
+    Operation admission and close() are serialized under a single Condition,
+    eliminating the race between checking closed state and incrementing the
+    active operation counter.
+
     Each thread gets its own sqlite3.Connection (thread-local). All connections
     use check_same_thread=False so close() can shut them down from any thread.
     This does NOT mean connections are shared for operations — each thread uses
     only its own connection. The flag exists solely for controlled lifecycle.
 
-    Active-operation guard: close() waits for in-flight operations to complete
-    before closing connections. This prevents corruption from closing a connection
-    mid-operation.
-
-    ponytail: connection registry + active-op counter, no pool. Single-user local.
+    ponytail: condition + active-op counter, no pool. Single-user local.
     Upgrade path: connection pool if dozens of concurrent threads are needed.
     """
 
@@ -106,13 +108,14 @@ class SQLiteStore:
             )
 
         self._local = threading.local()
-        self._lock = threading.Lock()
+        self._conn_lock = threading.Lock()
         self._connections: set[sqlite3.Connection] = set()
-        self._closed = False
+
+        # Lifecycle state: protected by _lifecycle_cond
+        self._lifecycle_cond = threading.Condition()
         self._active_ops = 0
-        self._active_ops_lock = threading.Lock()
-        self._drain_event = threading.Event()
-        self._drain_event.set()  # starts drained (no ops in flight)
+        self._closing = False
+        self._closed = False
 
         conn = self._get_conn()
         conn.executescript(_SCHEMA)
@@ -132,43 +135,54 @@ class SQLiteStore:
         return conn
 
     def _get_conn(self) -> sqlite3.Connection:
-        """Get or create a thread-local connection, registered for lifecycle."""
+        """Get or create a thread-local connection, registered for lifecycle.
+
+        Refuses only after CLOSED (not during CLOSING — already-admitted ops
+        must still access their connection).
+        """
         if self._closed:
             raise RuntimeError("SQLiteStore is closed")
         conn = getattr(self._local, "conn", None)
         if conn is None:
             conn = self._make_connection()
             self._local.conn = conn
-            with self._lock:
+            with self._conn_lock:
                 self._connections.add(conn)
         return conn
 
     def _begin_op(self) -> None:
-        """Mark an operation as starting. Raises if store is closed."""
-        if self._closed:
-            raise RuntimeError("SQLiteStore is closed")
-        with self._active_ops_lock:
+        """Atomically admit an operation. Raises if store is closing/closed."""
+        with self._lifecycle_cond:
+            if self._closing or self._closed:
+                raise RuntimeError("SQLiteStore is closed")
             self._active_ops += 1
-            self._drain_event.clear()
 
     def _end_op(self) -> None:
-        """Mark an operation as complete."""
-        with self._active_ops_lock:
+        """Mark an operation complete. Notifies close() if draining."""
+        with self._lifecycle_cond:
             self._active_ops -= 1
             if self._active_ops == 0:
-                self._drain_event.set()
+                self._lifecycle_cond.notify_all()
 
     def close(self) -> None:
-        """Close all registered connections. Waits for active operations to drain.
+        """Transition OPEN → CLOSING → CLOSED. Waits for active ops to drain.
 
         Safe to call from any thread. Idempotent.
         """
-        if self._closed:
-            return
-        self._closed = True
-        # Wait for in-flight operations (bounded — single-user app, ops are fast)
-        self._drain_event.wait(timeout=10.0)
-        with self._lock:
+        with self._lifecycle_cond:
+            if self._closed:
+                return
+            if self._closing:
+                # Another thread is already closing; wait for completion
+                self._lifecycle_cond.wait_for(lambda: self._closed)
+                return
+            self._closing = True
+            # Wait for all active operations to finish
+            self._lifecycle_cond.wait_for(lambda: self._active_ops == 0)
+            self._closed = True
+
+        # Now no new ops can be admitted and none are in-flight
+        with self._conn_lock:
             for conn in self._connections:
                 conn.close()
             self._connections.clear()

@@ -6,6 +6,8 @@ Tests connection lifecycle, cross-thread shutdown, and in-memory behavior.
 """
 import asyncio
 import concurrent.futures
+import threading
+import time
 
 import pytest
 
@@ -226,16 +228,13 @@ class TestConnectionLifecycle:
         manager = MemoryManager(store)
         manager.start_session()
 
-        # Create connections on multiple worker threads
         await asyncio.to_thread(manager.remember, "from worker 1", MemoryType.NOTE, 0.5)
         await asyncio.to_thread(manager.remember, "from worker 2", MemoryType.NOTE, 0.5)
 
-        # Registry should have connections
         assert len(store._connections) >= 1
 
         manager.close()
 
-        # All connections closed, registry empty
         assert len(store._connections) == 0
         assert store._closed is True
 
@@ -252,12 +251,11 @@ class TestConnectionLifecycle:
 
     async def test_cross_thread_close_no_thread_affinity_error(self, tmp_path):
         """close() from main thread does not raise ProgrammingError for
-        connections created by worker threads. This is the core fix."""
+        connections created by worker threads."""
         store = SQLiteStore(tmp_path / "cross_close.db")
         manager = MemoryManager(store)
         manager.start_session()
 
-        # Force connections on distinct threads using a dedicated pool
         with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
             futs = [
                 pool.submit(manager.remember, f"item {i}", MemoryType.NOTE, 0.5)
@@ -265,40 +263,34 @@ class TestConnectionLifecycle:
             ]
             concurrent.futures.wait(futs)
             for f in futs:
-                f.result()  # propagate exceptions
+                f.result()
 
-        # Multiple connections should be registered
         num_conns = len(store._connections)
-        assert num_conns >= 2  # at least init thread + 1 worker
+        assert num_conns >= 2
 
-        # Close from main thread — must not raise
         manager.close()
         assert len(store._connections) == 0
 
     async def test_connections_actually_closed(self, tmp_path):
-        """Connections that were registered are genuinely closed after shutdown.
-        A closed connection raises ProgrammingError on execute."""
+        """Registered connections are genuinely closed after shutdown."""
         store = SQLiteStore(tmp_path / "actual_close.db")
         manager = MemoryManager(store)
         manager.start_session()
 
-        # Grab a reference to the internal connection before close
         conn = store._get_conn()
         assert conn in store._connections
 
         manager.close()
 
-        # The connection should be genuinely closed
         with pytest.raises(Exception):
             conn.execute("SELECT 1")
 
     async def test_multiple_worker_connections_all_closed(self, tmp_path):
-        """Ensure close() handles connections from many worker threads."""
+        """close() handles connections from many worker threads."""
         store = SQLiteStore(tmp_path / "multi_worker.db")
         manager = MemoryManager(store)
         manager.start_session()
 
-        # Use a pool that guarantees distinct threads
         with concurrent.futures.ThreadPoolExecutor(max_workers=5) as pool:
             futs = [
                 pool.submit(manager.remember, f"data {i}", MemoryType.NOTE, 0.5)
@@ -311,13 +303,11 @@ class TestConnectionLifecycle:
         pre_close_count = len(store._connections)
         assert pre_close_count >= 2
 
-        # Capture all connection refs before close
         conns_before = list(store._connections)
 
         manager.close()
         assert len(store._connections) == 0
 
-        # Every previously-registered connection is now dead
         for c in conns_before:
             with pytest.raises(Exception):
                 c.execute("SELECT 1")
@@ -333,32 +323,210 @@ class TestConnectionLifecycle:
         manager.close()
         manager.close()
 
-        # Still closed, no error
         assert store._closed is True
         assert len(store._connections) == 0
 
-    async def test_close_waits_for_active_ops(self, tmp_path):
-        """close() waits for in-flight operations before closing."""
-        store = SQLiteStore(tmp_path / "drain.db")
+    def test_close_from_worker_thread(self, tmp_path):
+        """close() works correctly when called from a worker thread."""
+        store = SQLiteStore(tmp_path / "worker_close.db")
+        manager = MemoryManager(store)
+        manager.start_session()
+        manager.remember("data")
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            f = pool.submit(manager.close)
+            f.result()
+
+        assert store._closed is True
+        assert len(store._connections) == 0
+
+        with pytest.raises(RuntimeError, match="closed"):
+            store.get("anything")
+
+
+class TestLifecycleRace:
+    """Deterministic race tests using threading.Event for forced ordering.
+
+    These tests guarantee specific interleavings that ordinary concurrent
+    tests may never reproduce.
+    """
+
+    def test_close_waits_for_active_op(self, tmp_path):
+        """close() blocks until an in-flight operation finishes.
+
+        Forced ordering:
+          worker enters operation → worker pauses → main calls close() →
+          close enters CLOSING → worker finishes → close completes.
+        """
+        store = SQLiteStore(tmp_path / "race1.db")
         manager = MemoryManager(store)
         manager.start_session()
 
-        # Start a slow-ish operation in a worker
-        results = []
+        op_started = threading.Event()
+        op_may_finish = threading.Event()
+        op_result = [None]
 
-        async def do_writes():
-            for i in range(5):
-                r = await asyncio.to_thread(manager.remember, f"op {i}", MemoryType.NOTE, 0.5)
-                results.append(r)
+        def slow_operation():
+            store._begin_op()
+            op_started.set()
+            try:
+                op_may_finish.wait()
+                conn = store._get_conn()
+                conn.execute(
+                    "INSERT OR IGNORE INTO memories (id, type, content, created_at, updated_at, importance, source_event_id, metadata_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    ("test_id", "note", "race data", time.time(), time.time(), 0.5, None, "{}"),
+                )
+                conn.commit()
+                op_result[0] = "success"
+            finally:
+                store._end_op()
 
-        # Run writes concurrently with close (close should wait)
-        write_task = asyncio.create_task(do_writes())
-        await write_task
+        worker = threading.Thread(target=slow_operation)
+        worker.start()
 
-        # Now close — should succeed cleanly
-        manager.close()
+        # Wait for worker to be inside the operation
+        op_started.wait()
+
+        # close() should now block because active_ops > 0
+        close_done = threading.Event()
+
+        def do_close():
+            store.close()
+            close_done.set()
+
+        closer = threading.Thread(target=do_close)
+        closer.start()
+
+        # Give close() a moment to enter CLOSING state
+        time.sleep(0.05)
+        assert store._closing is True
+        assert not close_done.is_set()  # close is still waiting
+
+        # Let the worker finish
+        op_may_finish.set()
+        worker.join(timeout=5)
+
+        # close should now complete
+        closer.join(timeout=5)
+        assert close_done.is_set()
         assert store._closed is True
-        assert len(results) == 5
+        assert op_result[0] == "success"
+
+    def test_new_op_rejected_during_close(self, tmp_path):
+        """New operations are rejected once CLOSING state is entered.
+
+        Forced ordering:
+          worker A enters op → main calls close() → enters CLOSING →
+          worker B attempts op → worker B rejected → worker A finishes →
+          close completes.
+        """
+        store = SQLiteStore(tmp_path / "race2.db")
+        manager = MemoryManager(store)
+        manager.start_session()
+
+        op_a_started = threading.Event()
+        op_a_may_finish = threading.Event()
+        close_started = threading.Event()
+        op_b_result = [None]
+
+        def operation_a():
+            store._begin_op()
+            op_a_started.set()
+            try:
+                op_a_may_finish.wait()
+            finally:
+                store._end_op()
+
+        def operation_b():
+            close_started.wait()
+            time.sleep(0.02)  # ensure close has entered CLOSING
+            try:
+                store._begin_op()
+                store._end_op()
+                op_b_result[0] = "admitted"
+            except RuntimeError as e:
+                op_b_result[0] = f"rejected: {e}"
+
+        thread_a = threading.Thread(target=operation_a)
+        thread_b = threading.Thread(target=operation_b)
+        thread_a.start()
+
+        op_a_started.wait()
+
+        def do_close():
+            close_started.set()
+            store.close()
+
+        closer = threading.Thread(target=do_close)
+        closer.start()
+
+        thread_b.start()
+        thread_b.join(timeout=5)
+
+        # B must be rejected
+        assert op_b_result[0] is not None
+        assert "rejected" in op_b_result[0]
+
+        # Let A finish so close() can complete
+        op_a_may_finish.set()
+        thread_a.join(timeout=5)
+        closer.join(timeout=5)
+
+        assert store._closed is True
+
+    def test_op_completes_before_close_instant(self, tmp_path):
+        """If no operations are active, close() returns immediately."""
+        store = SQLiteStore(tmp_path / "race3.db")
+        manager = MemoryManager(store)
+        manager.start_session()
+        manager.remember("data")
+
+        start = time.time()
+        manager.close()
+        elapsed = time.time() - start
+
+        assert store._closed is True
+        assert elapsed < 1.0  # essentially instant
+
+    def test_close_does_not_close_active_connection(self, tmp_path):
+        """A connection being used by an active operation is not closed
+        until the operation finishes."""
+        store = SQLiteStore(tmp_path / "race4.db")
+        manager = MemoryManager(store)
+        manager.start_session()
+
+        op_started = threading.Event()
+        op_may_finish = threading.Event()
+        conn_worked = [False]
+
+        def operation_with_conn():
+            store._begin_op()
+            op_started.set()
+            try:
+                op_may_finish.wait()
+                conn = store._get_conn()
+                # This must work — connection must not be closed yet
+                conn.execute("SELECT 1").fetchone()
+                conn_worked[0] = True
+            finally:
+                store._end_op()
+
+        worker = threading.Thread(target=operation_with_conn)
+        worker.start()
+        op_started.wait()
+
+        close_done = threading.Event()
+        closer = threading.Thread(target=lambda: (store.close(), close_done.set()))
+        closer.start()
+
+        time.sleep(0.05)
+        # close is waiting; connection must still work for the active op
+        op_may_finish.set()
+        worker.join(timeout=5)
+        closer.join(timeout=5)
+
+        assert conn_worked[0] is True
+        assert store._closed is True
 
 
 class TestInMemoryBehavior:
