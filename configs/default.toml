@@ -17,5 +17,11 @@ model = "Qwen/Qwen3-ASR-0.6B"
 [event_bus]
 subscriber_queue_size = 256
 
+[attention]
+enabled = true
+reason_threshold = 0.4
+assistant_names = ["jarvis"]
+working_memory_size = 20
+
 [logging]
 level = "INFO"

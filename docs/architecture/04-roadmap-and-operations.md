@@ -2,13 +2,15 @@
 
 ## Phase 0: Architecture (This Document)
 
-**Status:** Current phase.
+**Status:** Complete.
 **Deliverable:** This architecture document, reviewed and approved.
 **Acceptance:** All Phase 1 architectural dependencies are resolved. Non-blocking architectural decisions are explicitly documented as deferred, with a trigger or phase at which they must be revisited.
 
 ---
 
 ## Phase 1: Microphone → VAD → ASR
+
+**Status:** Complete.
 
 **Objective:** Continuous audio capture with voice activity detection and speech recognition. The system listens, detects speech, and produces transcripts. No intelligence yet — just working perception.
 
@@ -126,9 +128,19 @@ Failure to initially hit the 800ms ASR target triggers profiling and evaluation,
 
 ## Phase 2: Speech → Attention
 
+**Status:** Complete.
+
 **Objective:** Given speech transcripts, decide whether they warrant reasoning — not whether to respond. Implement the tiered attention engine (rules + classifier). No LLM reasoning yet — just the gate that answers "should reason?" not "should respond?".
 
 **Note:** Phase 2 does NOT implement response decision — that separation comes in Phase 3. Attention outputs whether an event warrants reasoning; whether to actually speak is decided later.
+
+**Implementation notes:**
+- `AttentionDecision` schema: `{should_reason, salience, reason, tier}`. Simpler than the architecture's 6-field spec — `relevance` and `urgency` deferred to Phase 3+ when world state provides context for them.
+- Tier 3 (LLM judgment) not implemented — Phase 2 is LLM-free by design. Tier 3 arrives with Phase 3.
+- Default threshold: 0.4 (tuned empirically against 57-case evaluation dataset, 96.5% accuracy).
+- Scorer weights are heuristic starting values, not empirically optimized. Stored in `ScorerWeights` dataclass, configurable.
+- Working memory is a bounded deque (default 20 entries), in-process only, no persistence.
+- Attention evaluation latency: p99 < 0.03ms (target was <10ms).
 
 **Requirements:**
 - Deterministic rules handle obvious cases (explicit address, clear background)
@@ -640,4 +652,4 @@ Phase 0 is complete when:
 9. Phase 1 audio/event contracts are defined.
 10. Phase 1 can begin without architectural redesign.
 
-**Status: PHASE 0 APPROVED — READY FOR PHASE 1 IMPLEMENTATION.**
+**Status: PHASE 0 APPROVED. Phase 1 and Phase 2 complete.**

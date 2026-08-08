@@ -35,6 +35,14 @@ class EventBusConfig:
 
 
 @dataclass
+class AttentionConfig:
+    enabled: bool = True
+    reason_threshold: float = 0.4
+    assistant_names: list[str] = field(default_factory=lambda: ["jarvis"])
+    working_memory_size: int = 20
+
+
+@dataclass
 class LoggingConfig:
     level: str = "INFO"
 
@@ -45,6 +53,7 @@ class JarvisConfig:
     vad: VADConfig = field(default_factory=VADConfig)
     asr: ASRConfig = field(default_factory=ASRConfig)
     event_bus: EventBusConfig = field(default_factory=EventBusConfig)
+    attention: AttentionConfig = field(default_factory=AttentionConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
 
 
@@ -65,6 +74,8 @@ def load_config(path: Path | None = None) -> JarvisConfig:
         cfg.asr = ASRConfig(**{k: v for k, v in raw["asr"].items() if k in ASRConfig.__dataclass_fields__})
     if "event_bus" in raw:
         cfg.event_bus = EventBusConfig(**{k: v for k, v in raw["event_bus"].items() if k in EventBusConfig.__dataclass_fields__})
+    if "attention" in raw:
+        cfg.attention = AttentionConfig(**{k: v for k, v in raw["attention"].items() if k in AttentionConfig.__dataclass_fields__})
     if "logging" in raw:
         cfg.logging = LoggingConfig(**{k: v for k, v in raw["logging"].items() if k in LoggingConfig.__dataclass_fields__})
     return cfg

@@ -1,6 +1,6 @@
-"""JARVIS Phase 1 — Microphone → VAD → ASR → SpeechEvent → Console.
+"""JARVIS — Microphone → VAD → ASR → SpeechEvent → Attention → Console.
 
-Entry point and lifecycle orchestrator.
+Entry point and lifecycle orchestrator. Phase 1 audio pipeline + Phase 2 attention.
 """
 from __future__ import annotations
 
@@ -17,6 +17,8 @@ from app.audio.capture import MicrophoneCapture
 from app.audio.vad import VoiceActivityDetector
 from app.audio.segmentation import SpeechSegmenter
 from app.audio.asr import SpeechRecognizer
+from app.attention.engine import AttentionEngine
+from app.memory.working import WorkingMemory
 
 logger = logging.getLogger("jarvis")
 
@@ -147,6 +149,25 @@ async def run(cfg: JarvisConfig | None = None) -> None:
     # 1. EventBus
     bus = EventBus(queue_size=cfg.event_bus.subscriber_queue_size)
     bus.subscribe(SpeechEvent, _console_handler)
+
+    # 1b. Attention Engine (Phase 2)
+    attention: AttentionEngine | None = None
+    if cfg.attention.enabled:
+        working_mem = WorkingMemory(max_size=cfg.attention.working_memory_size)
+        attention = AttentionEngine(
+            assistant_names=cfg.attention.assistant_names,
+            reason_threshold=cfg.attention.reason_threshold,
+            working_memory=working_mem,
+        )
+
+        async def _attention_handler(event: Event) -> None:
+            if isinstance(event, SpeechEvent) and attention is not None:
+                attention.evaluate(event)
+
+        bus.subscribe(SpeechEvent, _attention_handler)
+        logger.info("Attention engine active — names=%s threshold=%.2f",
+                     cfg.attention.assistant_names, cfg.attention.reason_threshold)
+
     await bus.start()
 
     # 2. VAD
@@ -203,6 +224,8 @@ async def run(cfg: JarvisConfig | None = None) -> None:
         _metrics["speech_segments_failed"],
         _metrics["buffer_max_depth"],
     )
+    if attention is not None:
+        logger.info("Attention counters: %s", attention.counters)
 
 
 def main() -> None:
