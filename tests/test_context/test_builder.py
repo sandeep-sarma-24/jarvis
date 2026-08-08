@@ -43,6 +43,60 @@ class TestCurrentEventAlwaysPresent:
         ctx = builder.build(_speech(long_text), memory)
         assert ctx.current_event.transcript == long_text
 
+    def test_large_current_event_with_large_history(self):
+        """Current event exceeding the historical budget still appears."""
+        builder = ContextBuilder(max_messages=4, max_characters=2000)
+        memory = WorkingMemory(max_size=20)
+        for i in range(10):
+            memory.record(f"e{i}", "a" * 100, should_reason=True)
+        big = _speech("z" * 3000)
+        ctx = builder.build(big, memory)
+        assert ctx.current_event.transcript == "z" * 3000
+        assert len(ctx.recent_events) == 0
+
+
+class TestCurrentEventNeverDuplicated:
+    """The current event must appear exactly once in the model context,
+    even when it already exists in working memory."""
+
+    def test_no_duplication_after_attention(self):
+        from app.attention.engine import AttentionEngine
+        engine = AttentionEngine(assistant_names=["jarvis"], reason_threshold=0.4)
+        builder = ContextBuilder(max_messages=8, max_characters=6000)
+
+        event = _speech("Jarvis, what is the weather?")
+        engine.evaluate(event)
+
+        ctx = builder.build(event, engine.working_memory)
+        msgs = builder.to_messages(ctx)
+        user_contents = [m["content"] for m in msgs if m["role"] == "user"]
+        assert user_contents.count("Jarvis, what is the weather?") == 1
+
+    def test_no_duplication_manual_record(self, builder):
+        memory = WorkingMemory(max_size=20)
+        event = _speech("test query")
+        memory.record(event.id, event.transcript, should_reason=True)
+
+        ctx = builder.build(event, memory)
+        msgs = builder.to_messages(ctx)
+        user_contents = [m["content"] for m in msgs if m["role"] == "user"]
+        assert user_contents.count("test query") == 1
+
+    def test_historical_events_still_included(self):
+        from app.attention.engine import AttentionEngine
+        engine = AttentionEngine(assistant_names=["jarvis"], reason_threshold=0.4)
+        builder = ContextBuilder(max_messages=8, max_characters=6000)
+
+        engine.evaluate(_speech("Hey Jarvis, what is Python?"))
+        event2 = _speech("Hey Jarvis, and what about Go?")
+        engine.evaluate(event2)
+
+        ctx = builder.build(event2, engine.working_memory)
+        msgs = builder.to_messages(ctx)
+        user_contents = [m["content"] for m in msgs if m["role"] == "user"]
+        assert "Hey Jarvis, what is Python?" in user_contents
+        assert user_contents.count("Hey Jarvis, and what about Go?") == 1
+
 
 class TestRecentEventsBounded:
 
@@ -64,6 +118,19 @@ class TestRecentEventsBounded:
         assert "interaction 1" in transcripts
         assert "interaction 2" in transcripts
 
+    def test_selection_excludes_current_event(self):
+        """Historical selection must not include the current event."""
+        builder = ContextBuilder(max_messages=10, max_characters=10000)
+        memory = WorkingMemory(max_size=20)
+        memory.record("hist1", "historical meaningful", should_reason=True)
+        memory.record("hist2", "historical background", should_reason=False)
+        event = _speech("current request")
+        memory.record(event.id, event.transcript, should_reason=True)
+        ctx = builder.build(event, memory)
+        hist_ids = [e.event_id for e in ctx.recent_events]
+        assert event.id not in hist_ids
+        assert "hist1" in hist_ids
+
     def test_ordering_is_chronological(self, memory):
         builder = ContextBuilder(max_messages=10, max_characters=10000)
         memory.record("e1", "first", should_reason=True)
@@ -72,6 +139,15 @@ class TestRecentEventsBounded:
         ctx = builder.build(_speech("current"), memory)
         transcripts = [e.transcript for e in ctx.recent_events]
         assert transcripts == ["first", "second", "third"]
+
+    def test_messages_are_older_then_newer_then_current(self, memory):
+        builder = ContextBuilder(max_messages=10, max_characters=10000)
+        memory.record("e1", "older interaction", should_reason=True)
+        memory.record("e2", "newer interaction", should_reason=True)
+        ctx = builder.build(_speech("current event"), memory)
+        msgs = builder.to_messages(ctx)
+        user_msgs = [m["content"] for m in msgs if m["role"] == "user"]
+        assert user_msgs == ["older interaction", "newer interaction", "current event"]
 
 
 class TestMaxCharactersRespected:
@@ -114,6 +190,14 @@ class TestToMessages:
         assert len(msgs) == 2  # system + current
         assert msgs[0]["role"] == "system"
         assert msgs[1]["content"] == "just me"
+
+    def test_all_history_entries_are_user_role(self, builder, memory):
+        memory.record("e1", "question 1", should_reason=True)
+        memory.record("e2", "background", should_reason=False)
+        ctx = builder.build(_speech("current"), memory)
+        msgs = builder.to_messages(ctx)
+        for m in msgs[1:]:
+            assert m["role"] == "user"
 
 
 class TestContextGrowthBounded:

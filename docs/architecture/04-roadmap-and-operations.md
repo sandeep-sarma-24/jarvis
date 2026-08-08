@@ -221,12 +221,20 @@ SpeechEvent (from Phase 1)
 
 **Implementation notes:**
 - Model: Gemma 4 12B Q4 via Ollama (configurable). Behind `ReasoningModel` protocol — swappable.
-- Context builder: bounded by `max_context_messages` (8) and `max_context_characters` (6000). Current event always preserved. Prefers `should_reason=True` entries from working memory.
+- Context builder: bounded by `max_context_messages` (8) and `max_context_characters` (6000). Current event always preserved. Prefers `should_reason=True` entries from working memory. Current event excluded from historical candidates to prevent duplication.
 - Response decision: deterministic Phase 3 policy — attention-positive + successful reasoning = respond. No second LLM call.
 - Concurrency: bounded by `asyncio.Semaphore(max_concurrent_requests=1)`. Extra events dropped with warning.
 - LLM inference: runs in thread via `asyncio.to_thread` — does not block audio capture.
 - System prompt: versioned in `configs/system_prompt.txt`, not hardcoded.
 - No TTS, no tools, no persistent memory, no cloud inference.
+
+**Benchmarks (M4 16GB, Ollama v0.32.6, gemma4:12b 7.6GB Q4):**
+- Context assembly: 0.003 ms mean.
+- Model cold start: 7,545 ms.
+- Model warm inference: 5,494–8,820 ms (mean 8,144 ms). 11.3 tok/s.
+- Python RSS during inference: ~29 MB (Ollama holds model in its own process).
+- Gemma 4 is a thinking model — internal `<think>` phase consumes tokens before visible output. The 2s inference target is not met; a smaller or non-thinking model would be needed.
+- `gemma4:12b-mlx` is not an available Ollama tag. Ollama v0.32.6 already uses Metal on Apple Silicon for GGUF models.
 
 **Requirements:**
 - Context builder assembles relevant information into a compact prompt

@@ -29,7 +29,7 @@ class TestOllamaModelSmoke:
                 {"role": "system", "content": "Answer in one sentence."},
                 {"role": "user", "content": "What is 2 + 2?"},
             ],
-            max_tokens=50,
+            max_tokens=256,
             temperature=0.0,
         )
         assert result.success, f"Model failed: {result.error}"

@@ -97,7 +97,7 @@ def _benchmark_model() -> None:
 
     # Cold start
     print("\n  Cold start:")
-    result = model.generate(messages, max_tokens=50, temperature=0.0)
+    result = model.generate(messages, max_tokens=256, temperature=0.0)
     if not result.success:
         print(f"    FAILED: {result.error}")
         print("    Skipping warm inference benchmark.")

@@ -67,7 +67,9 @@ class ContextBuilder:
         budget -= len(self._system_prompt)
         budget -= len(event.transcript)
 
-        recent = self._select_recent(working_memory, budget)
+        recent = self._select_recent(
+            working_memory, budget, exclude_event_id=event.id,
+        )
         total_chars = (
             len(self._system_prompt)
             + len(event.transcript)
@@ -87,15 +89,16 @@ class ContextBuilder:
         )
 
     def to_messages(self, ctx: Context) -> list[dict[str, str]]:
-        """Convert Context into an OpenAI-style message list for the model."""
+        """Convert Context into an OpenAI-style message list for the model.
+
+        All working-memory entries are user speech in Phase 3.
+        ponytail: Phase 5 adds JARVIS response tracking in working memory,
+        which will require explicit conversation role distinction here.
+        """
         msgs: list[dict[str, str]] = [
             {"role": "system", "content": ctx.system_prompt},
         ]
         for entry in ctx.recent_events:
-            role = "assistant" if not entry.should_reason else "user"
-            # ponytail: all working-memory entries are user speech, so "user" is
-            # correct for Phase 3. When JARVIS responses are tracked in working
-            # memory (Phase 5), this will need the actual role distinction.
             msgs.append({"role": "user", "content": entry.transcript})
         msgs.append({"role": "user", "content": ctx.current_event.transcript})
         return msgs
@@ -104,8 +107,13 @@ class ContextBuilder:
         self,
         memory: WorkingMemory,
         char_budget: int,
+        *,
+        exclude_event_id: str | None = None,
     ) -> list[WorkingMemoryEntry]:
-        entries = memory.entries
+        entries = [
+            e for e in memory.entries
+            if e.event_id != exclude_event_id
+        ]
         # Prefer meaningful interactions, most recent first
         candidates = [e for e in reversed(entries) if e.should_reason]
         if len(candidates) < self._max_messages:

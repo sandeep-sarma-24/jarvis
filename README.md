@@ -41,9 +41,9 @@ python3 -m venv .venv
 source .venv/bin/activate
 pip install -e ".[dev]"
 
-# Install and start Ollama, then pull the reasoning model
+# Install and start Ollama, then pull the reasoning model (~7.6 GB)
 brew install ollama
-ollama serve &
+brew services start ollama
 ollama pull gemma4:12b
 
 # Run JARVIS (live microphone)
@@ -53,19 +53,26 @@ python -m app.main
 
 On first run, the ASR model (~1.2 GB) downloads from HuggingFace.
 
-## Performance Targets
+## Performance
 
-| Metric | Target |
-|--------|--------|
-| VAD latency | <1 ms per 32ms chunk |
-| ASR latency | <800 ms from speech-end to transcript |
-| End-to-end perception | <1 s speech-end to SpeechEvent |
-| Attention (Tier 1 rules) | <0.1 ms |
-| Attention (Tier 2 scorer) | <5 ms |
-| Total attention | <10 ms |
-| Context assembly | <50 ms |
-| Model inference (50 tokens) | <2 s |
-| Total reasoning pipeline | <3 s |
+Measured on MacBook Air M4, 16 GB RAM, Ollama v0.32.6, gemma4:12b (7.6 GB Q4).
+
+| Metric | Target | Measured |
+|--------|--------|----------|
+| VAD latency | <1 ms per 32ms chunk | — (see benchmark) |
+| ASR latency | <800 ms from speech-end | — (see benchmark) |
+| End-to-end perception | <1 s speech-end to event | — (see benchmark) |
+| Attention (Tier 1 rules) | <0.1 ms | <0.01 ms |
+| Attention (Tier 2 scorer) | <5 ms | <0.03 ms |
+| Total attention | <10 ms | <0.05 ms |
+| Context assembly | <50 ms | <0.003 ms |
+| Model cold start | — | 7,545 ms |
+| Model warm inference (mean) | <2 s | 8,144 ms |
+| Model warm inference (min) | — | 5,494 ms |
+| Model warm inference (max) | — | 8,820 ms |
+| Tokens/sec | — | 11.3 tok/s |
+
+Gemma 4 12B is a thinking model — inference includes an internal `<think>` phase before producing visible output. The 2s target is not met; typical warm responses take 5–9s. A smaller model or non-thinking variant would be needed to hit the target. Python RSS stays low (~29 MB); Ollama holds the model in its own process.
 
 Run `python -m scripts.benchmark_audio` for audio pipeline measurements.
 Run `python -m scripts.benchmark_attention` for attention latency measurements.
@@ -145,7 +152,11 @@ ReasoningModel       → replaceable behind protocol
 Response Decision    → separate from reasoning
 ```
 
-Reasoning does not block audio capture. LLM inference runs in a thread via `asyncio.to_thread`. Concurrent reasoning is bounded (`max_concurrent_requests = 1`).
+Reasoning does not block audio capture. LLM inference runs in a thread via `asyncio.to_thread`.
+
+Phase 3 concurrency policy: at most one local LLM inference is active. If another attention-positive event arrives while inference is active, the event is dropped rather than creating unbounded inference tasks. The `reasoning_dropped` metric increments.
+
+Phase 3 does not speak. Phase 3 does not execute tools. Phase 3 does not persist memory.
 
 ## Privacy
 
