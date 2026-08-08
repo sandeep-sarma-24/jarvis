@@ -4,7 +4,7 @@
 
 **Status:** Current phase.
 **Deliverable:** This architecture document, reviewed and approved.
-**Acceptance:** All deliverables A–X present, no unresolved blockers for Phase 1.
+**Acceptance:** All Phase 1 architectural dependencies are resolved. Non-blocking architectural decisions are explicitly documented as deferred, with a trigger or phase at which they must be revisited.
 
 ---
 
@@ -104,7 +104,9 @@ Microphone (sounddevice, 16kHz mono)
 
 ## Phase 2: Speech → Attention
 
-**Objective:** Given speech transcripts, decide whether they warrant a response. Implement the tiered attention engine (rules + classifier). No LLM reasoning yet — just the gate.
+**Objective:** Given speech transcripts, decide whether they warrant reasoning — not whether to respond. Implement the tiered attention engine (rules + classifier). No LLM reasoning yet — just the gate that answers "should reason?" not "should respond?".
+
+**Note:** Phase 2 does NOT implement response decision — that separation comes in Phase 3. Attention outputs whether an event warrants reasoning; whether to actually speak is decided later.
 
 **Requirements:**
 - Deterministic rules handle obvious cases (explicit address, clear background)
@@ -119,12 +121,12 @@ SpeechEvent (from Phase 1)
   → Attention Engine
     → Tier 1: Rules (pattern matching, <0.1ms)
     → Tier 2: Scorer (feature extraction + weighted scoring, ~5ms)
-  → AttentionScore {should_reason, salience, reason}
+  → AttentionDecision {should_reason, salience, reason}
   → Log decision
 ```
 
 **Interfaces:**
-- `AttentionEngine.evaluate(event) → AttentionScore`
+- `AttentionEngine.evaluate(event) → AttentionDecision`
 - `RulesEngine.check(event) → RuleResult | None`
 - `AttentionClassifier.score(event, context) → float`
 
@@ -142,7 +144,7 @@ SpeechEvent (from Phase 1)
 - None beyond Phase 1 (classifier is rule-based scoring initially, no ML dependency)
 
 **Implementation steps:**
-1. Define `AttentionScore` dataclass and `AttentionEngine` interface
+1. Define `AttentionDecision` dataclass and `AttentionEngine` interface
 2. Implement Tier 1 rules (explicit address detection, question detection, background detection)
 3. Implement Tier 2 scorer (weighted feature combination: is_question × 0.3 + contains_tech_terms × 0.2 + recent_interaction × 0.2 + ...)
 4. Implement engine orchestrator (rules first → scorer if unclear → decision)
@@ -161,7 +163,7 @@ SpeechEvent (from Phase 1)
 - System correctly classifies >90% of test utterances (curated set of 50)
 - False positive rate <10% on background speech
 - Attention evaluation: <10ms per event
-- Decisions logged with human-readable reasons
+- `AttentionDecision` logged with human-readable reasons
 
 **Performance criteria:**
 - Tier 1 rules: <0.1ms
@@ -177,9 +179,9 @@ SpeechEvent (from Phase 1)
 
 ---
 
-## Phase 3: Attention → LLM (Reasoning)
+## Phase 3: Attention → LLM (Reasoning + Response Decision)
 
-**Objective:** When attention decides to reason, assemble context and get a response from Gemma 4 12B. The system can now answer questions with voice output (Phase 4 dependency, but text-to-console for Phase 3).
+**Objective:** When attention decides to reason (`should_reason = true`), assemble context, run the reasoning model, and explicitly decide whether to respond. This phase implements BOTH reasoning AND response decision — the decision layer separates "I reasoned about this" from "I should respond to this". Text output to console for now (voice output is Phase 4).
 
 **Requirements:**
 - Context builder assembles relevant information into a compact prompt
@@ -191,15 +193,17 @@ SpeechEvent (from Phase 1)
 
 **Architecture:**
 ```
-AttentionScore {should_reason = true}
+AttentionDecision {should_reason = true}
+  → World State Update (minimal in Phase 3: just conversation state)
   → Context Builder
     → Working memory (recent turns, current activity)
+    → World State (current state snapshot)
     → System prompt (personality, guidelines)
     → Current event (transcript + metadata)
-  → Gemma 4 12B via Ollama (/v1/chat/completions)
-  → Decision Parser
+  → Reasoning Model via Ollama
+  → Response Decision
     → RESPOND: output text (console for now)
-    → SILENT: log reason
+    → SILENT: log reason (reasoned but chose not to respond)
     → STORE: persist observation
 ```
 
@@ -410,6 +414,8 @@ Phase 15 (Integration) ────── depends on all
 
 **Parallelizable after Phase 3:** Phases 7 and 9 can be developed in parallel with Phases 5-6 since they follow the same perception pattern. Phase 12 should be designed alongside Phase 7/9 even if implemented later.
 
+**World State rollout:** World State is introduced minimally in Phase 3 (conversation state only) and expanded in Phases 5, 7, and 9 as more modalities come online.
+
 ---
 
 # §O — Testing Strategy
@@ -534,9 +540,11 @@ Activation: Keyboard shortcut (global hotkey), voice command ("Jarvis, privacy m
 
 # §R — Performance/Latency Budget
 
+> Performance figures are engineering targets based on available benchmarks and must be validated on the target M4 Air hardware during implementation. Failure to initially meet a target triggers profiling and evaluation; it does not automatically invalidate the architecture.
+
 ## End-to-End Pipeline (Speech → Voice Response)
 
-| Stage | Target Latency | Notes |
+| Stage | Target | Notes |
 |-------|---------------|-------|
 | VAD (speech detection) | <1ms | Per 30ms chunk, CPU |
 | End-of-speech detection | 300ms | Silence threshold before declaring speech done |
@@ -589,6 +597,25 @@ ponytail: at peak, this leaves <1GB headroom. ASR and TTS are never active simul
 | **TTS voice** doesn't match JARVIS personality | Medium | Breaks immersion | Evaluate multiple voices; Qwen3-TTS voice cloning as upgrade |
 | **Ollama stability** under continuous use | Low | Service crashes | Supervisor pattern; auto-restart; health checks |
 | **macOS permissions** block mic/camera/screen | Low (one-time) | Can't start | Clear setup instructions; test permissions on launch |
-| **Model ecosystem churn** (better models appear monthly) | Certain | Architecture must not be model-locked | Interface abstraction; config-driven model selection |
+| **Model ecosystem churn** (better models appear monthly) | Certain | Architecture must not be model-locked | All models sit behind abstract interfaces; swapping is a config change |
 | **Single-process crash** takes down everything | Medium | Full restart required | asyncio exception isolation; crash recovery from SQLite state |
 | **Context window too small** for complex interactions | Medium | Truncated memory, lost context | Aggressive summarization; importance-based pruning; keep prompts lean |
+
+---
+
+# Phase 0 Exit Gate
+
+Phase 0 is complete when:
+
+1. Core architecture is documented (deliverables A–X present).
+2. Phase 1 dependencies are resolved (no blocking questions remain for Phase 1).
+3. World State, Memory, Attention, Context, and Reasoning responsibilities are distinct.
+4. Attention and response decisions are explicitly separated.
+5. Perception events have correlation semantics defined.
+6. Model implementations are documented as replaceable behind interfaces.
+7. Performance numbers are documented as measurable targets, not architectural guarantees.
+8. Non-blocking architectural questions are explicitly deferred to later phases.
+9. Architecture diagrams and repository structure are consistent with written descriptions.
+10. Phase 1 can begin without requiring architectural redesign.
+
+**Status: Phase 0 APPROVED. Phase 1 implementation may begin.**

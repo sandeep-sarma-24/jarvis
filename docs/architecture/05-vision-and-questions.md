@@ -2,6 +2,15 @@
 
 These are decisions that materially affect the architecture and cannot be resolved without your input or empirical testing.
 
+## Classification
+
+Questions are classified as:
+- **BLOCKING** — must be resolved before Phase 1 begins
+- **RESOLVE before Phase N** — must be resolved before that phase begins
+- **DEFERRED** — explicitly deferred with a trigger phase for revisiting
+
+No questions are BLOCKING for Phase 1. One question (T5) must be resolved before Phase 2.
+
 ## T1. TTS Voice Selection
 
 **Question:** Kokoro-82M has 54 voices. The closest British options are `bf_emma` (British female) and potentially other `b*` prefixed voices. A male British voice (closer to MCU JARVIS / Paul Bettany's delivery) may not exist in the current Kokoro library.
@@ -14,6 +23,8 @@ These are decisions that materially affect the architecture and cannot be resolv
 
 **Recommendation:** D — ship fast with the best available Kokoro voice, then invest in voice matching once the core system works.
 
+**Classification: DEFERRED -> Phase 4**
+
 ## T2. Ollama vs LiteRT-LM for Gemma 4 12B Inference
 
 **Question:** LiteRT-LM is Google's official runtime and shows better numbers on M4 Max. But benchmarks for 12B on base M4 (Air) are unconfirmed, and it's at v0.13. Ollama is battle-tested but slightly slower.
@@ -25,6 +36,8 @@ These are decisions that materially affect the architecture and cannot be resolv
 
 **Recommendation:** A. Ollama gives us a working system faster. The `ReasoningModel` interface means swapping runtime is a config change.
 
+**Classification: DEFERRED -> benchmark during Phase 3**
+
 ## T3. Attention Classifier Training Strategy
 
 **Question:** The Tier 2 classifier starts as a weighted feature combination (no ML). When should it become a trained model, and what's the training signal?
@@ -35,6 +48,8 @@ These are decisions that materially affect the architecture and cannot be resolv
 - C: After 500+ interactions. Train a small neural net.
 
 **Recommendation:** B. Logistic regression on implicit feedback is trivial to implement and provides real personalization. The interface doesn't change.
+
+**Classification: DEFERRED -> revisit after sufficient interaction data (Phase 5+)**
 
 ## T4. Camera Capture on macOS Without Privacy Concerns
 
@@ -48,6 +63,8 @@ These are decisions that materially affect the architecture and cannot be resolv
 - C: Periodic captures (every 5-10 seconds) — green light blinks briefly. Provides environmental awareness without persistent recording.
 
 **Recommendation:** C for solo use. The periodic capture gives environmental awareness while being honest about when the camera is active. User should be able to set frequency or disable entirely.
+
+**Classification: DEFERRED -> Phase 7**
 
 ## T5. How to Handle "Jarvis" in the Transcript
 
@@ -63,6 +80,8 @@ These are decisions that materially affect the architecture and cannot be resolv
 
 **Recommendation:** C. "Jarvis, what time is it?" is an explicit address. "I was telling Sarah about Jarvis earlier" is not. Position + context matters.
 
+**Classification: RESOLVE before Phase 2** (affects attention rules implementation)
+
 ## T6. Screen Capture Permissions and Approach
 
 **Question:** macOS screen capture requires explicit Screen Recording permission. The standard approach (CGWindowListCreateImage) captures the full screen. Alternative: use Accessibility APIs for just window titles + app names without the full screen capture permission.
@@ -74,6 +93,8 @@ These are decisions that materially affect the architecture and cannot be resolv
 
 **Recommendation:** C. App name + window title gives 80% of the value for 0% of the privacy concern. Full OCR is an upgrade.
 
+**Classification: DEFERRED -> Phase 9**
+
 ## T7. Response Length for Voice Output
 
 **Question:** Voice responses should be concise (nobody wants a 200-word spoken essay). How short?
@@ -84,6 +105,8 @@ These are decisions that materially affect the architecture and cannot be resolv
 - C: Adaptive — short for simple answers, longer for complex explanations, interrupt-able.
 
 **Recommendation:** B for V1, C for V2. The system prompt can enforce brevity while allowing the model flexibility for genuinely complex answers.
+
+**Classification: DEFERRED -> Phase 4** (TTS implementation)
 
 ---
 
@@ -205,6 +228,12 @@ All 15 principles reviewed against the full document:
 | 13 | Don't over-engineer V1 | ✓ | Weighted scoring over ML classifier; SQLite over Postgres; asyncio over message queue |
 | 14 | System can remain silent | ✓ | Silence is default; attention is conservative |
 | 15 | Useful through memory, not context size | ✓ | 3K token target context; memory retrieval fills it |
+| 16 | World State is distinct from persistent memory | ✓ | World State = now; Memory = before; separate subsystems |
+| 17 | Attention determines whether reasoning resources are spent | ✓ | Attention answers "should reason?" only |
+| 18 | Response decision is separate from attention | ✓ | Reasoning may fire without responding |
+| 19 | Perception events are correlatable | ✓ | Events carry session_id and correlation_id |
+| 20 | Models are replaceable behind interfaces | ✓ | All models sit behind abstract interfaces |
+| 21 | Performance budgets are measured targets, not guarantees | ✓ | Validated empirically, not architectural blockers |
 
 **Tradeoffs explicitly made:**
 - **Principle 8 (local) vs. reasoning quality:** Accepted. Gemma 4 12B Q4 is not GPT-4-class. Cloud fallback is the documented upgrade path.

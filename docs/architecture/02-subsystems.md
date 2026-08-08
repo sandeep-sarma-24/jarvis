@@ -1,22 +1,56 @@
-# ?E ? Memory Architecture
+# E ? Memory Architecture
 
 ## Design Philosophy
 
 Memory is the mechanism by which JARVIS becomes useful over time. The LLM has no persistent state ? every interaction begins with a blank context window that the memory system populates. Memory is external, queryable, and bounded.
 
-## Four Memory Layers
+**Memory answers: "What happened previously?"** It is distinct from World State (which answers "What is happening right now?") and from Working Memory (which holds ephemeral conversational context).
 
-### 1. Working Memory (In-Process State)
+## Memory Lifecycle
 
-**What it holds:** Current conversation turns, current task context, current environment state, events from the last ~5 minutes, active tool executions.
+Memory has two distinct operational paths:
 
-**Implementation:** Python dataclass instances in the main process. No persistence ? lost on restart (this is intentional; working memory is ephemeral).
+### Retrieval Path (before reasoning)
 
-**Capacity:** ~20 recent events, ~10 conversation turns, current environment snapshot.
+Memory is queried before the reasoning model is invoked, to provide relevant historical context.
 
-**Access pattern:** Direct attribute access, no query needed. Always included in context.
+```
+Attention fires --> Context Builder --> Memory Retrieval --> Top-k memories --> Assembled Context --> LLM
+```
 
-### 2. Episodic Memory (What Happened)
+### Consolidation Path (after reasoning)
+
+After reasoning/interaction, the response decision may trigger a memory write. Not every event is persisted ? the Memory Writer applies importance scoring and only stores information above threshold.
+
+```
+Response Decision --> Memory Writer --> Importance Scoring --> Store if >= 0.2 / Discard if < 0.2
+```
+
+**Key constraint:** Raw continuous perception is never persisted by default. Only information that passes importance scoring enters persistent memory.
+
+```
+                    EVENT
+                      |
+                  ATTENTION
+                      |
+             +--------+--------+
+             |                 |
+        MEMORY READ       WORLD STATE
+             |                 |
+             +--------+--------+
+                      |
+                CONTEXT BUILDER
+                      |
+                  REASONING
+                      |
+               RESPONSE DECISION
+                      |
+                MEMORY WRITE (conditional)
+```
+
+## Three Persistent Memory Layers
+
+### 1. Episodic Memory (What Happened)
 
 **What it holds:** Previous interactions, conversations, projects worked on, notable events, decisions made, outcomes observed.
 
@@ -26,7 +60,7 @@ Memory is the mechanism by which JARVIS becomes useful over time. The LLM has no
 
 **Lifecycle:** Importance scoring on write. Decay function reduces importance over time (exponential decay with floor). Summarization compresses old episodes. Deduplication merges near-identical entries.
 
-### 3. Semantic Memory (What is Known)
+### 2. Semantic Memory (What is Known)
 
 **What it holds:** Facts about the user, preferences, people, projects, environment, relationships between entities.
 
@@ -36,7 +70,7 @@ Memory is the mechanism by which JARVIS becomes useful over time. The LLM has no
 
 **Lifecycle:** New facts can contradict existing ones ? when detected, the older fact gets `contradiction_of` set and confidence reduced. Facts with confidence below threshold are candidates for forgetting.
 
-### 4. Procedural Memory (How Things Are Done)
+### 3. Procedural Memory (How Things Are Done)
 
 **What it holds:** User workflows, repeated procedures, preferred patterns, tool usage sequences, scheduling habits.
 
@@ -49,17 +83,17 @@ Memory is the mechanism by which JARVIS becomes useful over time. The LLM has no
 ## Memory Operations
 
 ```
-???????????????????????????????????????????????????????????
-?                    Memory Operations                      ?
-???????????????????????????????????????????????????????????
-? STORE       ? Score importance ? embed ? write to layer  ?
-? RETRIEVE    ? Query ? vector search ? rerank ? return    ?
-? UPDATE      ? Detect contradiction ? merge or supersede  ?
-? SUMMARIZE   ? Compress old episodes ? reduce storage     ?
-? DECAY       ? Reduce importance over time                ?
-? FORGET      ? Remove entries below confidence threshold  ?
-? DEDUPLICATE ? Merge semantically identical entries       ?
-???????????????????????????????????????????????????????????
++-----------------------------------------------------------+
+|                    Memory Operations                        |
++-------------+---------------------------------------------+
+| STORE       | Score importance -> embed -> write to layer  |
+| RETRIEVE    | Query -> vector search -> rerank -> return   |
+| UPDATE      | Detect contradiction -> merge or supersede   |
+| SUMMARIZE   | Compress old episodes -> reduce storage      |
+| DECAY       | Reduce importance over time                  |
+| FORGET      | Remove entries below confidence threshold    |
+| DEDUPLICATE | Merge semantically identical entries         |
++-------------+---------------------------------------------+
 ```
 
 ## Storage Technology Decision
@@ -81,17 +115,17 @@ ponytail: ceiling is ~100K memories before in-process numpy search becomes notic
 
 ## Embedding Model
 
-**Chosen: `nomic-embed-text` via Ollama** (137M params, 768-dim, runs on CPU in <10ms per embedding)
+**Architectural requirement:** An embedding model capable of producing dense vector representations for semantic search.
 
-Alternatives considered: `all-MiniLM-L6-v2` (faster but less capable), `mxbai-embed-large` (better quality, larger). Nomic is the sweet spot ? high quality, small enough to run alongside the 12B model without memory pressure, and available through Ollama's unified interface.
+**Current implementation:** `nomic-embed-text` via Ollama (137M params, 768-dim, runs on CPU in <10ms per embedding). Alternatives: `all-MiniLM-L6-v2` (faster, less capable), `mxbai-embed-large` (better quality, larger). Swappable behind the `EmbeddingModel` interface.
 
 ## Memory Flow Diagram
 
 ```mermaid
 flowchart TD
-    INPUT[New Information] --> SCORE[Importance Scoring<br/>0.0 - 1.0]
+    INPUT[New Information<br/>from Response Decision] --> SCORE[Importance Scoring<br/>0.0 - 1.0]
     SCORE -->|"< 0.2"| DISCARD[Discard]
-    SCORE -->|"? 0.2"| EMBED[Generate Embedding]
+    SCORE -->|">= 0.2"| EMBED[Generate Embedding]
     EMBED --> DEDUP{Duplicate<br/>Check}
     DEDUP -->|"similar entry exists"| MERGE[Merge / Update]
     DEDUP -->|"novel"| ROUTE{Route to Layer}
@@ -99,7 +133,7 @@ flowchart TD
     ROUTE -->|"fact/preference"| SEMANTIC[Semantic Memory]
     ROUTE -->|"repeated pattern"| PROCEDURAL[Procedural Memory]
 
-    QUERY[Memory Query] --> EMBED_Q[Embed Query]
+    QUERY[Memory Query<br/>from Context Builder] --> EMBED_Q[Embed Query]
     EMBED_Q --> SEARCH[Vector Search<br/>All Layers]
     SEARCH --> RERANK[Importance + Recency<br/>Weighted Rerank]
     RERANK --> TOP_K[Return Top-K<br/>Typically 3-7 Memories]
@@ -107,7 +141,71 @@ flowchart TD
 
 ---
 
-# ?F ? Attention Architecture
+# E.1 ? World State
+
+## What World State Is
+
+World State represents the system's understanding of **what is happening right now**. It is transient, in-process, and updated continuously as perception events flow through the system.
+
+**World State answers: "What is happening right now?"**
+
+This is distinct from:
+- **Memory** ? "What happened previously?" (persistent, queryable, historical)
+- **Working Memory** ? short-lived conversational state (recent turns, used for multi-turn coherence)
+
+## What World State Contains
+
+| Slot | Example | Updated By |
+|------|---------|------------|
+| Current user | "Sandeep" | Always set |
+| Current activity | "software development" | Screen + audio inference |
+| Inferred task | "debugging API auth" | Combined modality inference |
+| Active application | "VS Code" | Screen events |
+| Screen context | "terminal showing 500 error" | Screen events |
+| Visual context | "user at desk, alone" | Camera events |
+| Recent observations | last N perception summaries | All events |
+| Conversation state | "idle" / "active" / "follow-up expected" | Speech + response history |
+| Privacy state | "perception active, camera off" | Privacy controller |
+| Active entities | ["Arduino board", "sensor"] | Correlated events |
+
+## Implementation
+
+Python dataclass in the main process. No persistence ? lost on restart (this is intentional and correct). Updated by the attention engine when events pass the attention threshold.
+
+```python
+@dataclass
+class WorldState:
+    user: str
+    activity: str
+    task: str | None
+    active_app: str | None
+    screen_context: str | None
+    visual_context: str | None
+    recent_observations: list[str]   # bounded, ~10 items
+    conversation_state: str          # idle | active | follow_up
+    privacy_mode: bool
+    active_entities: list[str]
+    last_updated: float
+```
+
+## World State vs Working Memory vs Persistent Memory
+
+```
++-------------------+----------------------------+-------------------------------+
+| World State       | Working Memory             | Persistent Memory             |
++-------------------+----------------------------+-------------------------------+
+| What is now       | Recent conversation        | What happened before          |
+| Transient         | Session-scoped             | Persistent (SQLite)           |
+| Updated by events | Updated by interactions    | Updated by Memory Writer      |
+| Always in context | Always in context          | Retrieved by query            |
+| Survives nothing  | Survives within session    | Survives restarts             |
+| ~10 fields        | ~10 turns + recent events  | Thousands of entries          |
++-------------------+----------------------------+-------------------------------+
+```
+
+---
+
+# F ? Attention Architecture
 
 ## The Core Problem
 
@@ -115,9 +213,40 @@ The attention engine is the single most important component for user experience.
 - **Annoying:** Responds to everything, interrupts, feels like a surveillance system with a mouth.
 - **Useless:** Never responds, misses obvious requests, feels broken.
 
-The goal: JARVIS should feel like a perceptive, discreet human assistant who's present but not intrusive. It speaks when spoken to, notices when you're struggling, and stays out of the way otherwise.
+The goal: JARVIS should feel like a perceptive, discreet human assistant who's present but not intrusive.
 
-## Architecture: Tiered Filtering
+## Attention vs Response Decision
+
+These are explicitly separate concerns:
+
+| Component | Question It Answers | When It Runs |
+|-----------|-------------------|--------------|
+| **Attention Engine** | "Should JARVIS spend reasoning resources on this event?" | On every perception event |
+| **Response Decision** | "Given the reasoning result, should JARVIS actually respond?" | After LLM reasoning completes |
+
+Example ? attention fires but response is silent:
+
+```
+User mutters: "I need to fix this API."
+
+Attention:  should_reason = true  (relevant to current task)
+Reasoning:  understands context, notes the user's intent
+Decision:   respond = false, store = true
+            (useful context to remember, but not a question directed at JARVIS)
+```
+
+Example ? attention fires and response is generated:
+
+```
+User says: "Jarvis, why is this API failing?"
+
+Attention:  should_reason = true  (explicit address)
+Reasoning:  formulates answer using context + memory
+Decision:   respond = true
+            (direct question, answer available)
+```
+
+## Attention Architecture: Tiered Filtering
 
 The attention engine is a pipeline of increasingly expensive filters. Each tier handles the cases it's confident about and passes ambiguous cases up.
 
@@ -128,18 +257,20 @@ Fast, no-ML rules that handle obvious cases:
 | Rule | Input Signal | Decision | Confidence |
 |------|-------------|----------|------------|
 | No speech | VAD = false | SILENT | 1.0 |
-| Explicit name | transcript contains "Jarvis" | RESPOND | 0.95 |
-| Direct question to system | question + no other humans present | LIKELY_RESPOND | 0.8 |
+| Explicit name | transcript contains "Jarvis" at start | REASON | 0.95 |
+| Direct question to system | question + no other humans present | LIKELY_REASON | 0.8 |
 | Background conversation | multiple speakers detected | SILENT | 0.9 |
 | Music/TV playing | audio event = music/media | SILENT | 0.95 |
 | System just responded | < 3s since last response | BOOST (continuation likely) | 0.7 |
 | Privacy mode active | privacy flag set | SILENT | 1.0 |
 
-Rules are hard-coded, not learned. They encode social norms and obvious cases. They're fast because they're just boolean checks on event metadata.
+Rules are hard-coded, not learned. They encode social norms and obvious cases.
 
 ### Tier 2: Lightweight Classifier (~5ms, handles ~30% of events)
 
-A small model (or logistic regression / small neural net) that scores the remaining events on multiple dimensions:
+**Architectural requirement:** A fast classifier that scores events on salience and relevance.
+
+**Current implementation:** Initially rule-based scoring (weighted feature combination). Graduates to trained logistic regression after sufficient interaction data accumulates (see Open Questions T3).
 
 **Input features:**
 - Speech prosody (question intonation? trailing off? emphatic?)
@@ -160,11 +291,9 @@ A small model (or logistic regression / small neural net) that scores the remain
 ```
 
 **Decision thresholds:**
-- `salience > 0.7` AND `addressed_to_system > 0.6` ? proceed to reasoning
-- `salience < 0.3` OR `addressed_to_system < 0.2` ? SILENT
-- Everything else ? Tier 3 (ambiguous)
-
-**Training strategy:** Initially rule-based scoring (weighted feature combination). As interaction data accumulates, train a proper classifier on user feedback (implicit: did the user accept/reject/ignore the response?).
+- `salience > 0.7` AND `addressed_to_system > 0.6` -> proceed to reasoning
+- `salience < 0.3` OR `addressed_to_system < 0.2` -> SILENT
+- Everything else -> Tier 3 (ambiguous)
 
 ### Tier 3: LLM Judgment (~1-2s, handles ~10% of events)
 
@@ -172,7 +301,7 @@ For genuinely ambiguous cases, ask the reasoning model directly. This is expensi
 
 **Prompt template:**
 ```
-You are an attention filter for a personal AI assistant. Given the following context, determine whether this event requires a response.
+You are an attention filter for a personal AI assistant. Given the following context, determine whether this event warrants spending reasoning resources.
 
 Current context:
 - User activity: {activity}
@@ -180,33 +309,33 @@ Current context:
 - Current event: {event}
 
 Output JSON:
-{"should_respond": bool, "reason": string, "confidence": float}
+{"should_reason": bool, "reason": string, "confidence": float}
 
 Guidelines:
-- Silence is the default. Only respond if clearly addressed or if proactive help would be genuinely useful.
+- Default to NOT reasoning unless clearly warranted.
 - A question spoken aloud while working alone is likely addressed to you.
 - Muttering, self-talk, and thinking-out-loud are NOT addressed to you.
 - If someone else is in the room, assume speech is addressed to them unless explicitly addressed to you.
 ```
 
-## Decision Flow
+## Attention Decision Flow
 
 ```mermaid
 flowchart TD
     EVENT[Perception Event] --> T1{Tier 1:<br/>Deterministic Rules}
     T1 -->|"obvious silence<br/>(~40%)"| SILENT[SILENT]
-    T1 -->|"obvious respond<br/>(~20%)"| RESPOND[? Context Builder]
+    T1 -->|"obvious reason<br/>(~20%)"| REASON[should_reason = true]
     T1 -->|"unclear<br/>(~40%)"| T2{Tier 2:<br/>Classifier}
 
-    T2 -->|"high salience<br/>(~20%)"| RESPOND
+    T2 -->|"high salience<br/>(~20%)"| REASON
     T2 -->|"low salience<br/>(~10%)"| SILENT
     T2 -->|"ambiguous<br/>(~10%)"| T3{Tier 3:<br/>LLM Judgment}
 
-    T3 -->|"respond"| RESPOND
+    T3 -->|"reason"| REASON
     T3 -->|"silent"| SILENT
 
     SILENT --> LOG[Log Decision + Reason]
-    RESPOND --> CTX[Assemble Context]
+    REASON --> WS[Update World State<br/>then Context Builder]
 ```
 
 ## False Positive / False Negative Handling
@@ -219,18 +348,18 @@ Threshold adaptation: exponential moving average, adjusted weekly. Stored in sem
 
 ## Why Not Just Use the LLM for Everything?
 
-At ~30 tok/s on the M4 Air, each LLM attention judgment takes 1-2 seconds. If the user speaks 10 sentences in a minute, that's 10-20 seconds of GPU time just deciding whether to respond ? leaving no capacity for actually responding. The tiered approach ensures the LLM spends its limited compute budget on actual reasoning, not gatekeeping.
+At ~25-35 tok/s on the M4 Air (target, unvalidated), each LLM attention judgment takes 1-2 seconds. If the user speaks 10 sentences in a minute, that's 10-20 seconds of GPU time just deciding whether to reason ? leaving no capacity for actually reasoning. The tiered approach ensures the LLM spends its limited compute budget on useful work.
 
 ---
 
-# ?G ? Multimodal Perception Architecture
+# G ? Multimodal Perception Architecture
 
 ## Shared Design Pattern
 
 All perception pipelines follow the same pattern:
 
 ```
-Raw Input ? Cheap Continuous Processing ? Change Detection ? Event Emission ? (Optional) Expensive Analysis
+Raw Input -> Cheap Continuous Processing -> Change Detection -> Event Emission -> (Optional) Expensive Analysis
 ```
 
 The expensive analysis (LLM-based) only happens when the attention engine requests it. Perception itself is cheap.
@@ -239,70 +368,62 @@ The expensive analysis (LLM-based) only happens when the attention engine reques
 
 ```
 Microphone (16kHz, mono)
-  ? Ring buffer (30s rolling)
-  ? VAD (Silero, 30ms chunks, <1ms CPU)
-  ? Speech segments
-  ? ASR (Qwen3-ASR 0.6B, ~0.5s per utterance on MLX)
-  ? SpeechEvent {transcript, confidence, duration, is_question_heuristic}
-  ? Event Bus
+  -> Ring buffer (30s rolling)
+  -> VAD (30ms chunks, <1ms CPU)
+  -> Speech segments
+  -> ASR (~0.5s per utterance)
+  -> SpeechEvent {transcript, confidence, duration, is_question_heuristic, correlation_id}
+  -> Event Bus
 ```
 
 **Key decisions:**
 - **Continuous listening:** The ring buffer always records. VAD determines when speech starts/stops. Non-speech audio is discarded (never stored, never sent to ASR).
 - **Streaming ASR:** Process speech segments as they complete (after end-of-speech detected by VAD). No streaming partial transcripts in V1 ? the added complexity isn't worth it until barge-in is needed.
-- **Buffer strategy:** 30-second rolling buffer means we can retroactively transcribe if something becomes relevant. E.g., the user mutters something, then 5 seconds later says "what did I just say?"
-- **Question detection:** Simple heuristic on transcript (ends with '?', starts with question word, rising intonation if supported by ASR). Not ML-based in V1.
+- **Buffer strategy:** 30-second rolling buffer means we can retroactively transcribe if something becomes relevant.
+- **Question detection:** Simple heuristic on transcript (ends with '?', starts with question word). Not ML-based in V1.
 
-**Latency budget:** VAD detection (1ms) + end-of-speech wait (300ms silence threshold) + ASR (500ms) = ~800ms from speech end to event.
+**Latency budget (target):** VAD detection (1ms) + end-of-speech wait (300ms silence threshold) + ASR (500ms) = ~800ms from speech end to event.
 
 ## Camera Pipeline
 
 ```
 Camera (built-in MacBook)
-  ? Adaptive frame sampling (1-5 FPS based on change rate)
-  ? Frame differencing (pixel-level, ~1ms)
-  ? If significant change:
-    ? Lightweight description (YOLO/object detection OR Gemma 4 vision, depending on change magnitude)
-    ? VisualEvent {description, objects_detected, scene_change_magnitude, timestamp}
-    ? Event Bus
-  ? If no change:
-    ? Discard frame
+  -> Adaptive frame sampling (1-5 FPS based on change rate)
+  -> Frame differencing (pixel-level, ~1ms)
+  -> If significant change:
+    -> Lightweight description (or LLM vision, depending on change magnitude)
+    -> VisualEvent {description, objects_detected, scene_change_magnitude, correlation_id}
+    -> Event Bus
+  -> If no change:
+    -> Discard frame
 ```
 
 **Key decisions:**
-- **Adaptive FPS:** When the scene is static (user sitting at desk), sample at 1 FPS. When motion detected, ramp to 5 FPS. Never higher ? this isn't a security camera.
+- **Adaptive FPS:** When the scene is static (user sitting at desk), sample at 1 FPS. When motion detected, ramp to 5 FPS. Never higher.
 - **Change detection:** Simple pixel delta thresholding between consecutive frames. If < 5% of pixels changed by > threshold, discard.
-- **Two-stage analysis:** Small changes (5-15% pixel delta) get lightweight processing (object detection if available, or skip). Large changes (>15% delta) get LLM vision analysis.
-- **Privacy:** Camera is explicitly opt-in. Clear visual indicator when active. Frames are NEVER stored to disk by default. Only the extracted event (text description) persists.
-
-**Latency budget:** Frame capture (10ms) + differencing (1ms) + description if needed (1-3s via LLM) = 10ms for discarded frames, 1-3s for analyzed frames.
+- **Two-stage analysis:** Small changes get lightweight processing. Large changes get LLM vision analysis.
+- **Privacy:** Camera is explicitly opt-in. Clear visual indicator when active. Frames are NEVER stored to disk by default.
 
 ## Screen Perception Pipeline
 
 ```
-Screen capture (macOS CGWindowListCreateImage)
-  ? Periodic capture (every 2-5 seconds, adaptive)
-  ? Hash-based change detection (perceptual hash)
-  ? If changed:
-    ? App identification (window title, bundle ID via Accessibility API)
-    ? OCR on changed regions (Apple Vision framework, ~100ms)
-    ? ScreenEvent {app_name, window_title, visible_text_excerpt, change_type}
-    ? Event Bus
-  ? If unchanged:
-    ? Discard
+Screen capture (macOS CGWindowListCreateImage / Accessibility API)
+  -> Periodic capture (every 2-5 seconds, adaptive)
+  -> Hash-based change detection (perceptual hash)
+  -> If changed:
+    -> App identification (window title, bundle ID via Accessibility API)
+    -> OCR on changed regions (Apple Vision framework, ~100ms)
+    -> ScreenEvent {app_name, window_title, visible_text_excerpt, change_type, correlation_id}
+    -> Event Bus
+  -> If unchanged:
+    -> Discard
 ```
 
-**Key decisions:**
-- **Capture frequency:** Every 2s when actively working (typing/clicking detected), every 5s when idle. Never captures during privacy mode.
-- **Change detection:** Perceptual hash (pHash) comparison, not pixel-level. Tolerant of minor rendering differences.
-- **App identification:** Use macOS Accessibility APIs to get the frontmost app name and window title without OCR. OCR is only for content understanding.
-- **OCR scope:** Only OCR changed regions, not the full screen. Use Apple's built-in Vision framework (fast, free, private).
+## Event Correlation
 
-**Latency budget:** Capture (5ms) + hash (1ms) + OCR if needed (100ms) + app ID (5ms) = 5ms for unchanged, ~110ms for changed screens.
+Individual perception events are not always independent. Events occurring close in time across modalities often relate to the same situation.
 
-## Event Types (Shared Schema)
-
-All perception events share a base shape:
+**Event correlation semantics:**
 
 ```python
 @dataclass
@@ -310,6 +431,36 @@ class PerceptionEvent:
     id: str                     # UUID
     timestamp: float            # Unix timestamp
     source: Modality            # AUDIO | VISUAL | SCREEN
+    session_id: str             # Session identifier
+    correlation_id: str | None  # Groups related events into a situation
+    importance_hint: float      # 0.0 - 1.0, from perception layer
+    raw_available: bool         # Whether raw data can be retrieved from buffer
+```
+
+Events that occur within a short temporal window and relate to the same activity may share a `correlation_id`. This allows the context builder to group related observations:
+
+```
+              Situation (correlation_id = "abc123")
+                          |
+             +------------+------------+
+             |            |            |
+         Audio         Camera        Screen
+    "Let's test     Arduino board   Arduino IDE
+     this sensor"    detected        opened
+```
+
+The exact grouping heuristic (temporal proximity, semantic similarity) is an implementation detail deferred to Phase 5+. The architectural requirement is that the event schema supports correlation.
+
+## Event Types (Shared Schema)
+
+```python
+@dataclass
+class PerceptionEvent:
+    id: str                     # UUID
+    timestamp: float            # Unix timestamp
+    source: Modality            # AUDIO | VISUAL | SCREEN
+    session_id: str             # Session identifier
+    correlation_id: str | None  # Relates to same situation/task
     importance_hint: float      # 0.0 - 1.0, from perception layer
     raw_available: bool         # Whether raw data can be retrieved from buffer
 
@@ -338,30 +489,61 @@ class ScreenEvent(PerceptionEvent):
 
 ---
 
-# ?H ? Model Architecture
+# H ? Model Architecture
 
-## Model Hierarchy
+## Architectural Requirement
 
-| Tier | Role | Model | Size | Runtime | Latency | Memory |
-|------|------|-------|------|---------|---------|--------|
+Every model in the system sits behind an abstract interface. The architecture does not depend on any specific model vendor, model name, or runtime. Models are swappable via configuration.
+
+```
+ReasoningModel (interface)
+    |-- Current: Gemma 4 12B Unified (Q4)
+    |-- Alternative: Gemma 4 E4B (smaller, faster)
+    |-- Future: any model matching the interface
+
+SpeechRecognizer (interface)
+    |-- Current: Qwen3-ASR 0.6B
+    |-- Alternative: Qwen3-ASR 1.7B, Whisper, Parakeet
+    |-- Future: any model matching the interface
+
+VoiceActivityDetector (interface)
+    |-- Current: Silero VAD v5
+    |-- Alternative: FireRedVAD
+    |-- Future: any model matching the interface
+
+TextToSpeech (interface)
+    |-- Current: Kokoro-82M
+    |-- Alternative: Qwen3-TTS, Holler
+    |-- Future: any model matching the interface
+
+EmbeddingModel (interface)
+    |-- Current: nomic-embed-text
+    |-- Alternative: all-MiniLM-L6-v2, mxbai-embed-large
+    |-- Future: any model matching the interface
+```
+
+## Current Implementation: Model Hierarchy
+
+| Tier | Role | Current Model | Size | Runtime | Target Latency | Memory |
+|------|------|---------------|------|---------|----------------|--------|
 | **Perception** | VAD | Silero VAD v5 | 2MB (JIT) | ONNX/CPU | <1ms/chunk | ~50MB |
 | **Perception** | ASR | Qwen3-ASR 0.6B | 1.2GB (fp16) | MLX | ~500ms/utterance | ~1.5GB |
 | **Perception** | OCR | Apple Vision | System | CoreML | ~100ms | 0 (system) |
-| **Attention** | Classifier | TBD (logistic ? small NN) | <10MB | CPU/sklearn | ~5ms | ~50MB |
+| **Attention** | Classifier | Weighted scoring (initial) | <10MB | CPU | ~5ms | ~50MB |
 | **Reasoning** | Primary LLM | Gemma 4 12B Unified (Q4) | 7.6GB | Ollama (llama.cpp Metal) | ~1.5-2s per response | ~9GB |
 | **Embeddings** | Memory search | nomic-embed-text | ~500MB | Ollama/CPU | <10ms | ~700MB |
-| **Output** | TTS | Kokoro-82M (bf16) | 327MB | MLX | ~200ms for short utterance | ~500MB |
+| **Output** | TTS | Kokoro-82M (bf16) | 327MB | MLX | ~200ms short utterance | ~500MB |
 
-**Total memory pressure (peak, all models hot):** ~12GB. On 16GB system, this leaves ~4GB for OS + apps. Acceptable but tight. In practice, ASR and TTS won't be simultaneously active, and embeddings are loaded on-demand.
+**Total memory pressure (peak, all models hot):** ~12GB target. On 16GB system, this leaves ~4GB for OS + apps. In practice, ASR and TTS won't be simultaneously active, and embeddings are loaded on-demand.
 
 ## Concurrency Strategy
 
 Models cannot all be resident simultaneously at peak. Strategy:
 
-1. **Always loaded:** VAD (tiny), Working Memory (in-process state)
-2. **Hot standby:** Gemma 4 12B (loaded in Ollama, always ready) ? this is the big one at ~9GB
+1. **Always loaded:** VAD (tiny)
+2. **Hot standby:** Reasoning model (loaded in Ollama, always ready) ? this is the big one at ~9GB
 3. **Load on demand:** ASR (loaded when VAD detects speech), TTS (loaded when response needed), Embeddings (loaded for memory operations)
-4. **Mutual exclusion consideration:** On 16GB, running ASR (1.5GB) + Gemma 4 (9GB) + TTS (0.5GB) simultaneously = ~11GB model memory. Feasible, but context window must be kept short.
+4. **Mutual exclusion consideration:** On 16GB, running ASR (1.5GB) + Reasoning (9GB) + TTS (0.5GB) simultaneously = ~11GB model memory. Feasible, but context window must be kept short.
 
 ponytail: on 16GB, if memory pressure becomes an issue, the first thing to sacrifice is keeping ASR hot. Load it on VAD trigger (~2s cold start penalty, acceptable for non-streaming ASR).
 
@@ -396,23 +578,19 @@ class SpeechRecognizer(ABC):
 class VoiceActivityDetector(ABC):
     @abstractmethod
     def process_chunk(self, chunk: bytes) -> bool:
-        """Returns True if speech detected in this chunk."""
         ...
 
     @abstractmethod
     def get_speech_segment(self) -> bytes | None:
-        """Returns complete speech segment if one has ended, else None."""
         ...
 
 class TextToSpeech(ABC):
     @abstractmethod
-    async def synthesize(self, text: str, voice: str = "bf_emma") -> bytes:
-        """Returns audio bytes (WAV, 24kHz)."""
+    async def synthesize(self, text: str, voice: str = "default") -> bytes:
         ...
 
     @abstractmethod
-    async def synthesize_stream(self, text: str, voice: str = "bf_emma") -> AsyncIterator[bytes]:
-        """Streams audio chunks for low-latency playback."""
+    async def synthesize_stream(self, text: str, voice: str = "default") -> AsyncIterator[bytes]:
         ...
 
 class EmbeddingModel(ABC):
@@ -427,16 +605,15 @@ class EmbeddingModel(ABC):
 class VisionModel(ABC):
     @abstractmethod
     async def describe(self, frame: bytes, prompt: str = "") -> str:
-        """Describe a visual frame. Optional prompt for directed questions."""
         ...
 
 class AttentionClassifier(ABC):
     @abstractmethod
-    def score(self, event: 'PerceptionEvent', context: 'WorkingMemory') -> 'AttentionScore':
+    def score(self, event: 'PerceptionEvent', context: 'WorldState') -> 'AttentionDecision':
         ...
 ```
 
-## Why Gemma 4 12B?
+## Why Gemma 4 12B (Current Selection)?
 
 | Criterion | Gemma 4 12B | Llama 3.x 8B | Phi-4 14B | Qwen3 14B |
 |-----------|-------------|--------------|-----------|-----------|
@@ -446,13 +623,12 @@ class AttentionClassifier(ABC):
 | Local audio understanding | Yes (native) | No | No | No |
 | License | Apache 2.0 | Llama license | MIT | Apache 2.0 |
 | MLX/Ollama support | Official | Official | Community | Official |
-| Thinking mode | Configurable | No | No | Yes |
 
-Gemma 4 12B is the only model in its size class that natively handles text, image, AND audio in a single encoder-free architecture. For a multimodal assistant, this eliminates the need for a separate vision model for complex queries ? the reasoning model can directly understand images and audio when needed.
+This is an *implementation choice*, not an architectural dependency. The `ReasoningModel` interface is model-agnostic. If a better local model appears, swapping is a configuration change.
 
 ---
 
-# ?I ? Hardware/Runtime Architecture
+# I ? Hardware/Runtime Architecture
 
 ## Primary Machine: MacBook Air M4 (16GB)
 
@@ -467,11 +643,13 @@ Gemma 4 12B is the only model in its size class that natively handles text, imag
 | Microphone | Built-in array | Adequate for solo desk use. External mic optional. |
 | Camera | Built-in 12MP | Adequate for desk/room monitoring |
 
-**Expected Gemma 4 12B performance on M4 Air (Q4):**
-- Decode: ~25-35 tok/s (extrapolated ? M4 Max with 40 GPU cores achieves 101 tok/s via LiteRT-LM; M4 Air has 10 cores and 120 GB/s bandwidth vs Max's 273 GB/s. No published benchmark exists for 12B on base M4 Air specifically. This estimate could be optimistic; actual numbers must be measured in Phase 1.)
+**Target performance for reasoning model (Gemma 4 12B Q4):**
+- Decode: ~25-35 tok/s (extrapolated ? M4 Max achieves 101 tok/s via LiteRT-LM with 40 GPU cores; M4 Air has 10 cores and 120 GB/s bandwidth. No published benchmark exists for 12B on base M4 Air specifically. **This estimate must be validated empirically.**)
 - Prefill: ~800-1200 tok/s (less GPU-bound)
 - Time to first token: ~0.5-1s
 - 50-token response: ~1.5-2s generation time (could be 2-3s if decode is closer to 20 tok/s)
+
+Performance figures are engineering targets based on available benchmarks and must be validated on the target M4 Air hardware during implementation. Failure to initially meet a target triggers profiling and evaluation; it does not automatically invalidate the architecture.
 
 **Runtime:** Ollama (wraps llama.cpp with Metal backend). Chosen over raw MLX because:
 1. Model management (pull, quantize, swap) is handled
@@ -480,34 +658,32 @@ Gemma 4 12B is the only model in its size class that natively handles text, imag
 4. Community model library (important for swapping/experimenting)
 5. Slightly lower peak throughput than raw MLX (~10-15%) but dramatically better developer experience
 
-**Alternative runtime for TTS/ASR:** Direct MLX via `mlx-vlm` (for Gemma 4 multimodal) and `kokoro-mlx` (for TTS). These use MLX directly because they need streaming and fine-grained control that Ollama's API doesn't expose.
+**Alternative runtime for TTS/ASR:** Direct MLX via `mlx-vlm` (for multimodal queries) and `kokoro-mlx` (for TTS). These use MLX directly because they need streaming and fine-grained control that Ollama's API doesn't expose.
 
 ## Secondary Machine: HP Omen (Ryzen 5 4600H, 8GB RAM, GTX 1650 Ti 4GB)
 
 | Component | Spec | Implication |
 |-----------|------|-------------|
 | CPU | 6-core/12-thread Ryzen 5 | Adequate for orchestration + CPU models |
-| GPU | GTX 1650 Ti, 4GB VRAM | Too small for Gemma 4 12B. Can run smaller models. |
-| RAM | 8GB DDR4 | Severely limiting. Gemma 4 Q4 (7.6GB) won't fit with OS. |
+| GPU | GTX 1650 Ti, 4GB VRAM | Too small for 12B. Can run smaller models. |
+| RAM | 8GB DDR4 | Severely limiting. 12B Q4 (7.6GB) won't fit with OS. |
 | Storage | SSD | Fine |
 
 **Viable on this machine:**
 - Gemma 4 E2B (2.5GB, fits in 4GB VRAM): reduced capability but functional
-- Qwen3-ASR 0.6B on CUDA: fast ASR
-- Silero VAD on CPU: same as Mac
+- ASR on CUDA: fast
+- VAD on CPU: same as Mac
 - TTS on CPU: slower but functional
 
-**Strategy:** Same codebase, different model configuration. The interface abstraction means swapping `gemma-4-12b` for `gemma-4-e2b` is a config change. Performance will be degraded but functional.
+**Strategy:** Same codebase, different model configuration. The interface abstraction means swapping models is a config change. Performance will be degraded but functional.
 
 ## Runtime Comparison
 
 | Runtime | Use For | Platform | API | Notes |
 |---------|---------|----------|-----|-------|
-| Ollama | Gemma 4 12B, embeddings | Both | OpenAI-compat | Primary inference server |
-| MLX (mlx-vlm) | Gemma 4 multimodal queries | Mac only | Python API | For image/audio understanding |
+| Ollama | Reasoning model, embeddings | Both | OpenAI-compat | Primary inference server |
+| MLX (mlx-vlm) | Multimodal queries | Mac only | Python API | For image/audio understanding |
 | kokoro-mlx | TTS | Mac only | Python API | Low-latency voice synthesis |
 | mlx-qwen3-asr | ASR | Mac only | Python API | Speech recognition |
 | Silero VAD | VAD | Both | Python (ONNX) | Voice activity detection |
-| LiteRT-LM | Potential Ollama replacement | Both | OpenAI-compat | Google's runtime; higher throughput on Mac but newer, less battle-tested |
-
-**LiteRT-LM consideration:** Google's official runtime for Gemma 4 shows impressive numbers (101 tok/s decode for 12B on M4 Max). However: it's newer, less battle-tested, and the E4B/E2B benchmarks don't directly translate to 12B on M4 Air (non-Max). Listed as an upgrade path once it matures further and community benchmarks on base M4 confirm the numbers. For now, Ollama provides stability and ecosystem compatibility.
+| LiteRT-LM | Potential Ollama replacement | Both | OpenAI-compat | Google's runtime; potentially higher throughput but newer |
