@@ -42,3 +42,4 @@ class ResponseEvent(Event):
     event_id: str = ""  # correlation back to original SpeechEvent
     text: str = ""
     reasoning_latency_ms: float = 0.0
+    speech_end_timestamp: float = 0.0  # original speech end time for latency measurement

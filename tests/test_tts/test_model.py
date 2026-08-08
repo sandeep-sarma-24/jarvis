@@ -42,23 +42,34 @@ class FakeTTS:
 
 
 class FakePlayer:
-    """Minimal AudioPlayer for testing."""
+    """Minimal AudioPlayer for testing with outcome tracking."""
 
     def __init__(self) -> None:
         self.plays: list[tuple[int, int]] = []  # (num_samples, sample_rate)
         self._playing = False
         self.stop_count = 0
+        self.outcomes: list[str] = []  # "completed" or "interrupted"
 
     def play(self, audio: np.ndarray, sample_rate: int) -> None:
+        if self._playing:
+            self.outcomes.append("interrupted")
         self.plays.append((len(audio), sample_rate))
         self._playing = True
 
     def stop(self) -> None:
+        if self._playing:
+            self.outcomes.append("interrupted")
         self._playing = False
         self.stop_count += 1
 
     def is_playing(self) -> bool:
         return self._playing
+
+    def complete(self) -> None:
+        """Simulate natural completion."""
+        if self._playing:
+            self._playing = False
+            self.outcomes.append("completed")
 
     def close(self) -> None:
         self.stop()
@@ -164,3 +175,24 @@ class TestFakePlayer:
         for _ in range(10):
             player.stop()
         assert player.is_playing() is False
+
+    def test_natural_completion(self):
+        player = FakePlayer()
+        player.play(np.zeros(100, dtype=np.float32), 24000)
+        player.complete()
+        assert player.is_playing() is False
+        assert player.outcomes == ["completed"]
+
+    def test_interruption_tracked(self):
+        player = FakePlayer()
+        player.play(np.zeros(100, dtype=np.float32), 24000)
+        player.stop()
+        assert player.outcomes == ["interrupted"]
+
+    def test_new_play_interrupts_previous(self):
+        player = FakePlayer()
+        audio = np.zeros(100, dtype=np.float32)
+        player.play(audio, 24000)
+        player.play(audio, 24000)  # interrupts first
+        assert player.outcomes == ["interrupted"]
+        assert len(player.plays) == 2

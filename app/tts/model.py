@@ -56,6 +56,7 @@ class AudioPlayer(Protocol):
     """Abstract interface for audio playback.
 
     Must support non-blocking play and immediate stop (interruption).
+    Exposes on_done callback for completion/interruption reporting.
     """
 
     def play(self, audio: np.ndarray, sample_rate: int) -> None: ...

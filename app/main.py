@@ -246,6 +246,7 @@ def _build_reasoning_handler(cfg: JarvisConfig, attention: AttentionEngine, bus:
                 event_id=event.id,
                 text=resp.text,
                 reasoning_latency_ms=result.latency_ms,
+                speech_end_timestamp=event.timestamp,
             )
             await bus.publish(response_event)
         else:
@@ -273,7 +274,13 @@ def _build_tts_handler(cfg: JarvisConfig):
     Text exceeding max_text_length is split at sentence boundaries.
     """
     from app.tts.local_tts import KokoroTTS
-    from app.tts.player import LocalAudioPlayer
+    from app.tts.player import LocalAudioPlayer, PlaybackOutcome
+
+    def _on_playback_done(outcome: PlaybackOutcome) -> None:
+        if outcome == PlaybackOutcome.COMPLETED:
+            _metrics["playback_completed"] += 1
+        elif outcome == PlaybackOutcome.INTERRUPTED:
+            _metrics["playback_interrupted"] += 1
 
     tts_engine = KokoroTTS(
         model_id=cfg.tts.model,
@@ -282,7 +289,7 @@ def _build_tts_handler(cfg: JarvisConfig):
         sample_rate=cfg.tts.sample_rate,
     )
 
-    player = LocalAudioPlayer(volume=cfg.playback.volume)
+    player = LocalAudioPlayer(volume=cfg.playback.volume, on_done=_on_playback_done)
     tts_logger = logging.getLogger("jarvis.tts")
 
     def _truncate_text(text: str) -> str:
@@ -290,7 +297,6 @@ def _build_tts_handler(cfg: JarvisConfig):
         limit = cfg.tts.max_text_length
         if len(text) <= limit:
             return text
-        # Find last sentence end within limit
         for i in range(limit - 1, max(limit // 2, 0), -1):
             if text[i] in ".!?\n":
                 return text[: i + 1]
@@ -324,19 +330,23 @@ def _build_tts_handler(cfg: JarvisConfig):
 
         _metrics["tts_successes"] += 1
 
-        # Measure speech_end → response_audio_start
-        response_audio_latency = (time.time() - event.timestamp) * 1000
-        tts_logger.info(
-            "TTS event_id=%s model=%s latency_ms=%.0f duration=%.2fs "
-            "response_audio_latency_ms=%.0f",
-            event.event_id[:12], result.model, result.latency_ms,
-            result.duration_seconds, response_audio_latency,
+        # speech_end_to_audio_start: time from original speech end to playback start
+        # This includes: attention + reasoning + TTS synthesis
+        speech_end_to_audio_ms = (
+            (time.time() - event.speech_end_timestamp) * 1000
+            if event.speech_end_timestamp > 0
+            else 0.0
         )
 
-        was_playing = player.is_playing()
-        if was_playing:
-            player.stop()
-            _metrics["playback_interrupted"] += 1
+        # response_event_to_audio: time from ResponseEvent creation to playback
+        response_to_audio_ms = (time.time() - event.timestamp) * 1000
+
+        tts_logger.info(
+            "TTS event_id=%s model=%s tts_latency_ms=%.0f duration=%.2fs "
+            "speech_end_to_audio_ms=%.0f response_to_audio_ms=%.0f",
+            event.event_id[:12], result.model, result.latency_ms,
+            result.duration_seconds, speech_end_to_audio_ms, response_to_audio_ms,
+        )
 
         _metrics["playback_started"] += 1
         player.play(result.audio, result.sample_rate)
@@ -344,8 +354,9 @@ def _build_tts_handler(cfg: JarvisConfig):
         print(
             f"\n[TTS]\n"
             f"  event_id={event.event_id[:12]}\n"
-            f"  latency={result.latency_ms:.0f}ms\n"
+            f"  tts_latency={result.latency_ms:.0f}ms\n"
             f"  duration={result.duration_seconds:.2f}s\n"
+            f"  speech_end_to_audio={speech_end_to_audio_ms:.0f}ms\n"
             f"  model={result.model}\n"
         )
 

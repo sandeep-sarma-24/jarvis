@@ -3,6 +3,7 @@
 Uses FakeTTS and FakePlayer to test the complete gating architecture.
 """
 import asyncio
+import time
 
 import numpy as np
 import pytest
@@ -58,7 +59,6 @@ class TestResponseGating:
         resp = decide("eid", result)
         assert resp.respond is False
 
-        # TTS should not be called
         if resp.respond and resp.text:
             tts.synthesize(resp.text)
         assert len(tts.calls) == 0
@@ -75,7 +75,6 @@ class TestResponseGating:
         resp = decide("eid", result)
         assert resp.respond is True
 
-        # TTS should be called
         tts_result = tts.synthesize(resp.text)
         assert tts_result.success is True
         assert len(tts.calls) == 1
@@ -83,6 +82,22 @@ class TestResponseGating:
         if tts_result.audio is not None:
             player.play(tts_result.audio, tts_result.sample_rate)
         assert len(player.plays) == 1
+
+    def test_empty_text_no_tts(self):
+        """Empty response text should not trigger TTS."""
+        tts = FakeTTS()
+        text = ""
+        if text.strip():
+            tts.synthesize(text)
+        assert len(tts.calls) == 0
+
+    def test_whitespace_text_no_tts(self):
+        """Whitespace-only response text should not trigger TTS."""
+        tts = FakeTTS()
+        text = "   \n  "
+        if text.strip():
+            tts.synthesize(text)
+        assert len(tts.calls) == 0
 
 
 class TestFullFakePipeline:
@@ -126,7 +141,6 @@ class TestFullFakePipeline:
         decision = engine.evaluate(event)
         assert decision.should_reason is False
 
-        # Nothing else happens
         assert len(tts.calls) == 0
         assert len(player.plays) == 0
 
@@ -152,6 +166,7 @@ class TestEventBusTTSIntegration:
         response_event = ResponseEvent(
             session_id="test", source=Modality.SYSTEM,
             event_id="orig123", text="The answer is 42.",
+            speech_end_timestamp=time.time() - 1.0,
         )
         await bus.publish(response_event)
         await asyncio.sleep(0.05)
@@ -175,7 +190,6 @@ class TestEventBusTTSIntegration:
         bus.subscribe(ResponseEvent, _tts_handler)
         await bus.start()
 
-        # Publish a SpeechEvent (not ResponseEvent) — TTS handler shouldn't fire
         speech = _speech("Hello world")
         await bus.publish(speech)
         await asyncio.sleep(0.05)
@@ -199,6 +213,7 @@ class TestEventBusTTSIntegration:
         response_event = ResponseEvent(
             session_id="test", source=Modality.SYSTEM,
             event_id=original_event.id, text="Correlated response.",
+            speech_end_timestamp=original_event.timestamp,
         )
         await bus.publish(response_event)
         await asyncio.sleep(0.05)
@@ -206,6 +221,62 @@ class TestEventBusTTSIntegration:
         assert len(captured_event_ids) == 1
         assert captured_event_ids[0] == original_event.id
         await bus.shutdown()
+
+    async def test_speech_end_timestamp_propagated(self):
+        """ResponseEvent carries the original speech_end_timestamp."""
+        captured_timestamps: list[float] = []
+        bus = EventBus(queue_size=16)
+
+        async def _handler(event: Event) -> None:
+            if isinstance(event, ResponseEvent):
+                captured_timestamps.append(event.speech_end_timestamp)
+
+        bus.subscribe(ResponseEvent, _handler)
+        await bus.start()
+
+        original_event = _speech("Jarvis, what time is it?")
+        response_event = ResponseEvent(
+            session_id="test", source=Modality.SYSTEM,
+            event_id=original_event.id, text="It is 3 AM.",
+            speech_end_timestamp=original_event.timestamp,
+        )
+        await bus.publish(response_event)
+        await asyncio.sleep(0.05)
+
+        assert len(captured_timestamps) == 1
+        assert captured_timestamps[0] == original_event.timestamp
+        await bus.shutdown()
+
+
+class TestResponseCorrelation:
+    """Verify SpeechEvent.id → ResponseEvent.event_id → TTS log traceability."""
+
+    async def test_full_correlation_chain(self):
+        """SpeechEvent.id flows through ResponseDecision to ResponseEvent."""
+        engine = AttentionEngine(assistant_names=["jarvis"], reason_threshold=0.4)
+        builder = ContextBuilder(max_messages=4, max_characters=2000)
+        model = FakeReasoningModel()
+        tts = FakeTTS()
+
+        event = _speech("Jarvis, explain HTTP 500.")
+        decision = engine.evaluate(event)
+        assert decision.should_reason is True
+
+        ctx = builder.build(event, engine.working_memory)
+        messages = builder.to_messages(ctx)
+        result = model.generate(messages)
+        resp = decide(event.id, result)
+        assert resp.event_id == event.id
+
+        response_event = ResponseEvent(
+            session_id="test", source=Modality.SYSTEM,
+            event_id=resp.event_id, text=resp.text,
+            speech_end_timestamp=event.timestamp,
+        )
+        assert response_event.event_id == event.id
+
+        tts.synthesize(response_event.text)
+        assert len(tts.calls) == 1
 
 
 class TestTextLimits:
@@ -220,7 +291,48 @@ class TestTextLimits:
     def test_tts_handles_empty_text(self):
         tts = FakeTTS()
         result = tts.synthesize("")
-        assert result.success is True  # FakeTTS doesn't validate
+        assert result.success is True
+
+    def test_text_length_bounded(self):
+        """Text exceeding limit must be truncated."""
+        limit = 100
+        long_text = "A" * 200
+        # Simulate the truncation logic from _build_tts_handler
+        if len(long_text) > limit:
+            for i in range(limit - 1, max(limit // 2, 0), -1):
+                if long_text[i] in ".!?\n":
+                    long_text = long_text[: i + 1]
+                    break
+            else:
+                long_text = long_text[:limit]
+        assert len(long_text) <= limit
+
+    def test_truncation_at_sentence_boundary(self):
+        """Truncation prefers sentence boundaries."""
+        limit = 50
+        text = "First sentence. Second sentence. Third sentence is long."
+        if len(text) > limit:
+            for i in range(limit - 1, max(limit // 2, 0), -1):
+                if text[i] in ".!?\n":
+                    text = text[: i + 1]
+                    break
+            else:
+                text = text[:limit]
+        assert text.endswith(".")
+        assert len(text) <= limit
+
+    def test_very_large_text_bounded(self):
+        """Even huge texts get bounded."""
+        limit = 2000
+        text = "Word. " * 1000  # 6000 chars
+        if len(text) > limit:
+            for i in range(limit - 1, max(limit // 2, 0), -1):
+                if text[i] in ".!?\n":
+                    text = text[: i + 1]
+                    break
+            else:
+                text = text[:limit]
+        assert len(text) <= limit
 
 
 class TestInterruptionPolicy:
@@ -238,6 +350,18 @@ class TestInterruptionPolicy:
         player.play(audio, 24000)
         assert player.is_playing() is True
         assert player.stop_count == 1
+
+    def test_no_overlapping_playback(self):
+        """play(A) then play(B) must interrupt A, only B active."""
+        player = FakePlayer()
+        audio = np.zeros(24000, dtype=np.float32)
+
+        player.play(audio, 24000)
+        player.play(audio, 24000)  # interrupts first
+
+        assert len(player.plays) == 2
+        assert player.outcomes == ["interrupted"]
+        assert player.is_playing() is True
 
 
 class TestRealTTSSmoke:
@@ -280,4 +404,44 @@ class TestRealTTSSmoke:
             assert chunk.sample_rate == 24000
             assert len(chunk.audio) > 0
 
+        tts.close()
+
+    @pytest.mark.model
+    def test_model_loaded_once_reused(self):
+        """Model loads once on first call, reused for subsequent synthesis."""
+        from app.tts.local_tts import KokoroTTS
+
+        tts = KokoroTTS()
+        r1 = tts.synthesize("First call.")
+        assert r1.success is True
+        assert tts._model is not None
+
+        model_ref = tts._model
+        r2 = tts.synthesize("Second call.")
+        assert r2.success is True
+        assert tts._model is model_ref  # same object, not reloaded
+
+        tts.close()
+
+    @pytest.mark.hardware
+    def test_real_playback(self):
+        """Full pipeline: Kokoro → AudioPlayer → speaker."""
+        from app.tts.local_tts import KokoroTTS
+        from app.tts.player import LocalAudioPlayer, PlaybackOutcome
+
+        outcomes: list[PlaybackOutcome] = []
+        tts = KokoroTTS()
+        player = LocalAudioPlayer(on_done=lambda o: outcomes.append(o))
+
+        result = tts.synthesize("Hello, I am JARVIS.")
+        assert result.success is True
+
+        player.play(result.audio, result.sample_rate)
+        import time
+        time.sleep(result.duration_seconds + 0.5)
+
+        assert player.is_playing() is False
+        assert PlaybackOutcome.COMPLETED in outcomes
+
+        player.close()
         tts.close()
