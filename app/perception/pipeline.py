@@ -1,8 +1,11 @@
-"""Perception pipeline — camera capture → sampling → analysis → visual events.
+"""Perception pipeline — decoupled camera capture and visual analysis.
 
-Wires together Camera, FrameSampler, ChangeDetector, VisualAnalyzer,
-and EventDeduplicator into an async loop that publishes VisualEvents
-to the EventBus.
+Architecture:
+    capture task → FrameSampler (bounded/latest-frame buffer) → analysis task
+
+The capture loop and analysis loop run as independent asyncio tasks.
+A slow visual analyzer never blocks camera capture. The sampler enforces
+freshness, analysis interval, and bounded queue semantics between them.
 
 Frames exist only as long as needed for analysis. No frame persistence,
 no raw frames in logs, no cloud APIs.
@@ -24,10 +27,15 @@ logger = logging.getLogger(__name__)
 
 
 class PerceptionPipeline:
-    """Async pipeline: Camera → FrameSampler → ChangeDetector → VisualAnalyzer → EventBus.
+    """Decoupled capture + analysis pipeline.
 
-    Capture loop runs at capture_interval; analysis only happens when the sampler
-    releases a frame AND the change detector confirms a meaningful difference.
+    Two independent async tasks:
+      _capture_loop: captures frames at capture_interval, submits to FrameSampler.
+      _analysis_loop: polls sampler for eligible frames, runs change detection,
+                      visual analysis, deduplication, and publishes VisualEvents.
+
+    A slow analyzer does not block capture. The sampler's bounded queue
+    ensures the analysis loop always gets the freshest available frame.
     """
 
     def __init__(
@@ -41,6 +49,7 @@ class PerceptionPipeline:
         bus: EventBus,
         session_id: str,
         capture_interval_ms: float = 100.0,
+        analysis_interval_ms: float = 1000.0,
     ) -> None:
         self._camera = camera
         self._sampler = sampler
@@ -50,7 +59,9 @@ class PerceptionPipeline:
         self._bus = bus
         self._session_id = session_id
         self._capture_interval_s = capture_interval_ms / 1000.0
-        self._task: asyncio.Task | None = None
+        self._analysis_interval_s = analysis_interval_ms / 1000.0
+        self._capture_task: asyncio.Task | None = None
+        self._analysis_task: asyncio.Task | None = None
 
         self.frames_captured = 0
         self.frames_analyzed = 0
@@ -74,25 +85,32 @@ class PerceptionPipeline:
         }
 
     async def start(self) -> None:
-        """Start the camera and begin the capture → analyze loop."""
+        """Start the camera, then spawn capture and analysis tasks."""
+        if self._capture_task is not None:
+            return
+
         try:
             await self._camera.start()
         except CameraError:
             logger.warning("Camera unavailable — perception pipeline disabled")
             return
 
-        self._task = asyncio.create_task(self._run())
-        logger.info("Perception pipeline started")
+        self._capture_task = asyncio.create_task(self._capture_loop())
+        self._analysis_task = asyncio.create_task(self._analysis_loop())
+        logger.info("Perception pipeline started (capture + analysis)")
 
     async def stop(self) -> None:
-        """Stop the capture loop and shut down the camera."""
-        if self._task is not None:
-            self._task.cancel()
+        """Cancel both tasks, stop camera, release resources."""
+        tasks = [t for t in (self._capture_task, self._analysis_task) if t is not None]
+        for t in tasks:
+            t.cancel()
+        for t in tasks:
             try:
-                await self._task
+                await t
             except asyncio.CancelledError:
                 pass
-            self._task = None
+        self._capture_task = None
+        self._analysis_task = None
 
         if self._camera.state in (CameraState.RUNNING, CameraState.STARTING):
             try:
@@ -102,42 +120,54 @@ class PerceptionPipeline:
 
         logger.info("Perception pipeline stopped — %s", self.metrics)
 
-    async def _run(self) -> None:
+    # ── Capture loop ─────────────────────────────────────────────────────
+
+    async def _capture_loop(self) -> None:
+        """Capture frames at capture_interval, submit to sampler. Never blocks on analysis."""
         try:
             while True:
-                await self._tick()
+                try:
+                    frame = await self._camera.capture()
+                    if frame is not None:
+                        self.frames_captured += 1
+                        self._sampler.submit(frame)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    self.capture_errors += 1
+                    logger.exception("Frame capture error")
+
                 await asyncio.sleep(self._capture_interval_s)
         except asyncio.CancelledError:
             return
 
-    async def _tick(self) -> None:
-        """One capture-and-maybe-analyze cycle."""
-        frame = await self._capture_frame()
-        if frame is None:
-            return
+    # ── Analysis loop ────────────────────────────────────────────────────
 
-        self._sampler.submit(frame)
+    async def _analysis_loop(self) -> None:
+        """Poll sampler for eligible frames, analyze, publish events.
 
-        candidate = self._sampler.next_frame()
-        if candidate is None:
-            return
+        The sampler enforces analysis interval and freshness. This loop
+        polls at a rate slightly faster than the analysis interval to stay
+        responsive, but the sampler gates actual analysis.
+        """
+        poll_interval = min(self._analysis_interval_s, self._capture_interval_s * 2)
+        poll_interval = max(poll_interval, 0.01)
 
-        if not self._change_detector.has_changed(candidate):
-            self.frames_skipped_no_change += 1
-            return
-
-        await self._analyze_and_emit(candidate)
-
-    async def _capture_frame(self):
         try:
-            frame = await self._camera.capture()
-            if frame is not None:
-                self.frames_captured += 1
-            return frame
-        except Exception:
-            self.capture_errors += 1
-            logger.exception("Frame capture error")
-            return None
+            while True:
+                candidate = self._sampler.next_frame()
+                if candidate is None:
+                    await asyncio.sleep(poll_interval)
+                    continue
+
+                if not self._change_detector.has_changed(candidate):
+                    self.frames_skipped_no_change += 1
+                    await asyncio.sleep(poll_interval)
+                    continue
+
+                await self._analyze_and_emit(candidate)
+        except asyncio.CancelledError:
+            return
 
     async def _analyze_and_emit(self, frame) -> None:
         t0 = time.time()

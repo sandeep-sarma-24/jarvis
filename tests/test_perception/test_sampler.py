@@ -38,6 +38,19 @@ def test_interval_blocks_second_frame():
     assert result is None  # too soon
 
 
+def test_interval_increments_dropped_interval():
+    """When interval hasn't elapsed, frames_dropped_interval is incremented."""
+    sampler = FrameSampler(analysis_interval_ms=10000.0, max_frame_age_seconds=5.0, max_queue_size=4)
+    sampler.submit(_frame(pixel=1))
+    sampler.next_frame()  # first passes
+
+    sampler.submit(_frame(pixel=2))
+    sampler.submit(_frame(pixel=3))
+    result = sampler.next_frame()
+    assert result is None
+    assert sampler.frames_dropped_interval == 2  # 2 frames in queue when interval gate fires
+
+
 def test_stale_frame_dropped():
     sampler = FrameSampler(analysis_interval_ms=0, max_frame_age_seconds=0.001)
     f = _frame(age_offset=1.0)  # 1 second old

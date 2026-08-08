@@ -4,7 +4,16 @@ Responsibilities:
 - Enforce a bounded frame queue (latest-frame policy: newest wins).
 - Respect a configurable analysis interval.
 - Discard frames older than max_frame_age_seconds.
-- Expose metrics: captured, analyzed, dropped (stale), dropped (sampled).
+- Expose metrics with clear semantics.
+
+Metric definitions:
+    frames_received:        total frames submitted by capture via submit().
+    frames_sampled:         frames actually released for analysis via next_frame().
+    frames_dropped_stale:   frames rejected by next_frame() because age > max_frame_age.
+    frames_dropped_interval: frames in queue when next_frame() returns None because
+                             the analysis interval has not elapsed yet.
+    frames_evicted:         frames evicted from the bounded queue by newer arrivals
+                             (the oldest frame is silently replaced when queue is full).
 """
 from __future__ import annotations
 
@@ -62,6 +71,7 @@ class FrameSampler:
         now = time.time()
 
         if now - self._last_analysis_time < self._interval_s:
+            self.frames_dropped_interval += len(self._queue)
             return None
 
         while self._queue:

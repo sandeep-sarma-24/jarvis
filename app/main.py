@@ -558,6 +558,7 @@ async def run(cfg: JarvisConfig | None = None) -> None:
         analyzer = MockVisualAnalyzer()
         deduplicator = EventDeduplicator(dedup_window_seconds=cam_cfg.dedup_window_seconds)
 
+        analysis_interval_ms = 1000.0 / cam_cfg.analysis_fps
         perception_pipeline = PerceptionPipeline(
             camera=camera,
             sampler=sampler,
@@ -567,6 +568,7 @@ async def run(cfg: JarvisConfig | None = None) -> None:
             bus=bus,
             session_id=session_id,
             capture_interval_ms=1000.0 / cam_cfg.capture_fps,
+            analysis_interval_ms=analysis_interval_ms,
         )
 
         vis_handler = _build_visual_attention_handler(
