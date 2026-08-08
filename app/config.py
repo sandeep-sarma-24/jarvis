@@ -90,6 +90,29 @@ class MemoryConfig:
 
 
 @dataclass
+class CameraConfig:
+    enabled: bool = False  # disabled by default — privacy
+    device_index: int = 0
+    width: int = 640
+    height: int = 480
+    capture_fps: float = 10.0
+    analysis_fps: float = 1.0
+    max_frame_age_seconds: float = 2.0
+    max_queue_size: int = 2
+    change_threshold: float = 0.05
+    dedup_window_seconds: float = 30.0
+
+
+@dataclass
+class PerceptionConfig:
+    enabled: bool = False  # disabled by default — privacy
+    camera: CameraConfig = field(default_factory=CameraConfig)
+    max_visual_events: int = 5
+    max_visual_context_characters: int = 500
+    max_visual_event_age_seconds: float = 60.0
+
+
+@dataclass
 class JarvisConfig:
     audio: AudioConfig = field(default_factory=AudioConfig)
     vad: VADConfig = field(default_factory=VADConfig)
@@ -102,6 +125,7 @@ class JarvisConfig:
     playback: PlaybackConfig = field(default_factory=PlaybackConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
     memory: MemoryConfig = field(default_factory=MemoryConfig)
+    perception: PerceptionConfig = field(default_factory=PerceptionConfig)
 
 
 def load_config(path: Path | None = None) -> JarvisConfig:
@@ -135,4 +159,11 @@ def load_config(path: Path | None = None) -> JarvisConfig:
         cfg.logging = LoggingConfig(**{k: v for k, v in raw["logging"].items() if k in LoggingConfig.__dataclass_fields__})
     if "memory" in raw:
         cfg.memory = MemoryConfig(**{k: v for k, v in raw["memory"].items() if k in MemoryConfig.__dataclass_fields__})
+    if "perception" in raw:
+        p = raw["perception"]
+        top = {k: v for k, v in p.items() if k in PerceptionConfig.__dataclass_fields__ and k != "camera"}
+        cam = CameraConfig()
+        if "camera" in p:
+            cam = CameraConfig(**{k: v for k, v in p["camera"].items() if k in CameraConfig.__dataclass_fields__})
+        cfg.perception = PerceptionConfig(camera=cam, **top)
     return cfg

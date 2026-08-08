@@ -36,6 +36,15 @@ class SpeechEvent(Event):
 
 
 @dataclass
+class VisualEvent(Event):
+    """Phase 6 — visual perception produced a meaningful observation."""
+
+    event_type: str = ""  # e.g. "SCENE_CHANGE", "PERSON_DETECTED"
+    description: str = ""
+    metadata: dict[str, object] = field(default_factory=dict)
+
+
+@dataclass
 class ResponseEvent(Event):
     """Phase 4 — reasoning produced a response to be spoken."""
 

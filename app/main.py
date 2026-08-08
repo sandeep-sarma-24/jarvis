@@ -1,7 +1,8 @@
-"""JARVIS — Microphone → VAD → ASR → Attention → Context → LLM → Response Decision → TTS.
+"""JARVIS — Multimodal perception → Attention → Context → LLM → Response Decision → TTS.
 
 Entry point and lifecycle orchestrator.
-Phase 1 audio pipeline + Phase 2 attention + Phase 3 reasoning + Phase 4 TTS + Phase 5 memory.
+Phase 1 audio + Phase 2 attention + Phase 3 reasoning + Phase 4 TTS + Phase 5 memory
++ Phase 6 visual perception.
 """
 from __future__ import annotations
 
@@ -10,11 +11,12 @@ import logging
 import signal
 import time
 import uuid
+from collections import deque
 from pathlib import Path
 
 from app.config import JarvisConfig, load_config
 from app.events.bus import EventBus
-from app.events.types import Event, Modality, ResponseEvent, SpeechEvent
+from app.events.types import Event, Modality, ResponseEvent, SpeechEvent, VisualEvent
 from app.audio.capture import MicrophoneCapture
 from app.audio.vad import VoiceActivityDetector
 from app.audio.segmentation import SpeechSegmenter
@@ -47,6 +49,8 @@ _metrics = {
     "playback_started": 0,
     "playback_completed": 0,
     "playback_interrupted": 0,
+    "visual_events_received": 0,
+    "visual_events_attention_worthy": 0,
 }
 
 
@@ -141,12 +145,19 @@ async def _audio_pipeline(
 
 # ── Reasoning pipeline ──────────────────────────────────────────────────
 
-def _build_reasoning_handler(cfg: JarvisConfig, attention: AttentionEngine, bus: EventBus, memory_manager=None):
+def _build_reasoning_handler(
+    cfg: JarvisConfig,
+    attention: AttentionEngine,
+    bus: EventBus,
+    memory_manager=None,
+    visual_context_ring: deque | None = None,
+):
     """Build the attention→context→reasoning→response handler.
 
     Returns the async handler and the model instance (for cleanup).
     Uses a bounded semaphore to limit concurrent reasoning.
     Phase 5: integrates conversation state and memory retrieval.
+    Phase 6: includes recent visual context.
     """
     from app.context.builder import ContextBuilder
     from app.reasoning.local_model import OllamaModel
@@ -163,6 +174,8 @@ def _build_reasoning_handler(cfg: JarvisConfig, attention: AttentionEngine, bus:
         max_messages=cfg.reasoning.max_context_messages,
         max_characters=cfg.reasoning.max_context_characters,
         max_memory_items=cfg.memory.max_retrieved_memories,
+        max_visual_events=cfg.perception.max_visual_events,
+        max_visual_context_characters=cfg.perception.max_visual_context_characters,
     )
 
     reasoning_sem = asyncio.Semaphore(cfg.reasoning.max_concurrent_requests)
@@ -233,10 +246,14 @@ def _build_reasoning_handler(cfg: JarvisConfig, attention: AttentionEngine, bus:
                     if memories:
                         mem_context = [m.content for m in memories]
 
+            # Phase 6: gather recent visual context descriptions (bounded by config)
+            vis_ctx = [desc for _, desc in visual_context_ring] if visual_context_ring else None
+
             ctx = context_builder.build(
                 event, attention.working_memory,
                 conversation_messages=conv_messages,
                 memory_context=mem_context,
+                visual_context=vis_ctx,
             )
             messages = context_builder.to_messages(ctx)
 
@@ -407,6 +424,39 @@ def _build_tts_handler(cfg: JarvisConfig):
     return _handler, tts_engine, player
 
 
+# ── Visual attention handler ──────────────────────────────────────────────
+
+def _build_visual_attention_handler(
+    attention: AttentionEngine,
+    visual_context_ring: deque,
+    max_age_seconds: float,
+):
+    """Build a handler that routes VisualEvents through the attention engine.
+
+    Relevant visual events are stored in a bounded ring for context inclusion.
+    No automatic LLM response — attention decides relevance only.
+    Entries older than max_age_seconds are pruned on each event.
+    """
+    async def _handler(event: Event) -> None:
+        if not isinstance(event, VisualEvent):
+            return
+
+        _metrics["visual_events_received"] += 1
+
+        # Prune expired entries: (timestamp, description)
+        now = time.time()
+        while visual_context_ring and now - visual_context_ring[0][0] > max_age_seconds:
+            visual_context_ring.popleft()
+
+        decision = attention.evaluate_visual(event)
+
+        if decision.should_reason:
+            _metrics["visual_events_attention_worthy"] += 1
+            visual_context_ring.append((now, event.description))
+
+    return _handler
+
+
 # ── Lifecycle ────────────────────────────────────────────────────────────
 
 async def run(cfg: JarvisConfig | None = None) -> None:
@@ -457,7 +507,9 @@ async def run(cfg: JarvisConfig | None = None) -> None:
         )
 
         if cfg.reasoning.enabled:
-            handler, model_cleanup = _build_reasoning_handler(cfg, attention, bus, memory_manager)
+            handler, model_cleanup = _build_reasoning_handler(
+                cfg, attention, bus, memory_manager, visual_context_ring,
+            )
             bus.subscribe(SpeechEvent, handler)
             logger.info(
                 "Reasoning pipeline active — model=%s max_concurrent=%d",
@@ -481,24 +533,73 @@ async def run(cfg: JarvisConfig | None = None) -> None:
             cfg.tts.model, cfg.tts.voice, cfg.tts.sample_rate,
         )
 
+    # 4. Visual perception pipeline (Phase 6)
+    perception_pipeline = None
+    visual_context_ring: deque[tuple[float, str]] = deque(maxlen=cfg.perception.max_visual_events)
+
+    if cfg.perception.enabled and cfg.perception.camera.enabled and attention is not None:
+        from app.perception.camera import CameraError, OpenCVCamera
+        from app.perception.pipeline import PerceptionPipeline
+        from app.perception.sampler import FrameSampler
+        from app.perception.visual import ChangeDetector, EventDeduplicator, MockVisualAnalyzer
+
+        cam_cfg = cfg.perception.camera
+        camera = OpenCVCamera(
+            device_index=cam_cfg.device_index,
+            width=cam_cfg.width,
+            height=cam_cfg.height,
+        )
+        sampler = FrameSampler(
+            analysis_interval_ms=1000.0 / cam_cfg.analysis_fps,
+            max_frame_age_seconds=cam_cfg.max_frame_age_seconds,
+            max_queue_size=cam_cfg.max_queue_size,
+        )
+        change_detector = ChangeDetector(change_threshold=cam_cfg.change_threshold)
+        analyzer = MockVisualAnalyzer()
+        deduplicator = EventDeduplicator(dedup_window_seconds=cam_cfg.dedup_window_seconds)
+
+        perception_pipeline = PerceptionPipeline(
+            camera=camera,
+            sampler=sampler,
+            change_detector=change_detector,
+            analyzer=analyzer,
+            deduplicator=deduplicator,
+            bus=bus,
+            session_id=session_id,
+            capture_interval_ms=1000.0 / cam_cfg.capture_fps,
+        )
+
+        vis_handler = _build_visual_attention_handler(
+            attention, visual_context_ring, cfg.perception.max_visual_event_age_seconds,
+        )
+        bus.subscribe(VisualEvent, vis_handler)
+        logger.info(
+            "Visual perception configured — device=%d capture_fps=%.1f analysis_fps=%.1f",
+            cam_cfg.device_index, cam_cfg.capture_fps, cam_cfg.analysis_fps,
+        )
+
     await bus.start()
 
-    # 3. VAD
+    # 4a. Start perception pipeline if configured
+    if perception_pipeline is not None:
+        await perception_pipeline.start()
+
+    # 5. VAD
     vad = VoiceActivityDetector(threshold=cfg.vad.threshold)
     vad.load()
 
-    # 4. ASR
+    # 6. ASR
     asr = SpeechRecognizer(cfg.asr)
     asr.load()
 
-    # 5. Segmenter
+    # 7. Segmenter
     segmenter = SpeechSegmenter(
         config=cfg.vad,
         sample_rate=cfg.audio.sample_rate,
         chunk_samples=cfg.audio.chunk_samples,
     )
 
-    # 6. Microphone
+    # 8. Microphone
     mic = MicrophoneCapture(cfg.audio)
     loop = asyncio.get_running_loop()
 
@@ -508,7 +609,7 @@ async def run(cfg: JarvisConfig | None = None) -> None:
 
     mic.start(loop)
 
-    # 7. Run pipeline
+    # 9. Run audio pipeline
     pipeline_task = asyncio.create_task(
         _audio_pipeline(mic, vad, segmenter, asr, bus, session_id)
     )
@@ -517,8 +618,13 @@ async def run(cfg: JarvisConfig | None = None) -> None:
 
     await shutdown.wait()
 
-    # 8. Graceful shutdown
+    # 10. Graceful shutdown
     logger.info("Shutting down…")
+
+    # Stop perception before audio (reverse startup order)
+    if perception_pipeline is not None:
+        await perception_pipeline.stop()
+
     mic.stop()
     pipeline_task.cancel()
     try:
@@ -566,6 +672,13 @@ async def run(cfg: JarvisConfig | None = None) -> None:
         _metrics["playback_started"],
         _metrics["playback_completed"],
         _metrics["playback_interrupted"],
+    )
+    if perception_pipeline is not None:
+        logger.info("Perception: %s", perception_pipeline.metrics)
+    logger.info(
+        "Visual attention: received=%d attention_worthy=%d",
+        _metrics["visual_events_received"],
+        _metrics["visual_events_attention_worthy"],
     )
 
 

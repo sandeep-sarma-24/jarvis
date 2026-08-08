@@ -57,3 +57,21 @@ enabled = true
 database_path = "~/.jarvis/jarvis.db"
 max_retrieved_memories = 5
 max_recent_messages = 8
+
+[perception]
+enabled = false  # disabled by default — camera requires explicit opt-in
+max_visual_events = 5
+max_visual_context_characters = 500
+max_visual_event_age_seconds = 60.0
+
+[perception.camera]
+enabled = false
+device_index = 0
+width = 640
+height = 480
+capture_fps = 10.0
+analysis_fps = 1.0
+max_frame_age_seconds = 2.0
+max_queue_size = 2
+change_threshold = 0.05
+dedup_window_seconds = 30.0

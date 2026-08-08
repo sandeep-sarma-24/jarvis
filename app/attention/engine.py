@@ -11,7 +11,7 @@ from dataclasses import dataclass
 
 from app.attention.classifier import AttentionScorer, ScorerWeights
 from app.attention.rules import AttentionRules
-from app.events.types import SpeechEvent
+from app.events.types import SpeechEvent, VisualEvent
 from app.memory.working import WorkingMemory
 
 logger = logging.getLogger(__name__)
@@ -47,6 +47,8 @@ class AttentionEngine:
         self._threshold = reason_threshold
         self._memory = working_memory if working_memory is not None else WorkingMemory()
 
+        self._visual_salience_threshold = 0.7
+
         self._counters = {
             "evaluations": 0,
             "reason_true": 0,
@@ -54,6 +56,9 @@ class AttentionEngine:
             "rule_decisions": 0,
             "scorer_decisions": 0,
             "fallback_decisions": 0,
+            "visual_evaluations": 0,
+            "visual_reason_true": 0,
+            "visual_reason_false": 0,
         }
 
     @property
@@ -130,6 +135,48 @@ class AttentionEngine:
             reason=reason,
             tier="scorer",
         )
+
+    def evaluate_visual(self, event: VisualEvent) -> AttentionDecision:
+        """Evaluate a visual event for attention-worthiness.
+
+        Conservative policy: only high-salience visual events (e.g. person entering)
+        warrant attention. Mundane observations are logged but not acted on.
+        """
+        self._counters["visual_evaluations"] += 1
+
+        _HIGH_SALIENCE_TYPES = {"PERSON_DETECTED", "SCENE_CHANGE"}
+
+        try:
+            if event.event_type in _HIGH_SALIENCE_TYPES and event.confidence >= self._visual_salience_threshold:
+                salience = event.confidence
+                reason = f"visual: {event.event_type} ({event.description[:60]})"
+                decision = AttentionDecision(
+                    should_reason=True, salience=salience,
+                    reason=reason, tier="visual",
+                )
+            else:
+                decision = AttentionDecision(
+                    should_reason=False,
+                    salience=event.confidence * 0.3,
+                    reason=f"visual: low-salience {event.event_type}",
+                    tier="visual",
+                )
+        except Exception:
+            logger.exception("Visual attention evaluation failed for event %s", event.id)
+            decision = _FALLBACK
+            self._counters["fallback_decisions"] += 1
+
+        if decision.should_reason:
+            self._counters["visual_reason_true"] += 1
+        else:
+            self._counters["visual_reason_false"] += 1
+
+        logger.info(
+            "ATTENTION_VISUAL event_id=%s type=%s should_reason=%s salience=%.2f",
+            event.id[:12], event.event_type, decision.should_reason, decision.salience,
+        )
+
+        return decision
 
     def _build_scorer_reason(self, features, salience: float) -> str:
         signals = []

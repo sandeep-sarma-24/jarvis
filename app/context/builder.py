@@ -27,6 +27,7 @@ class Context:
     recent_events: tuple[WorkingMemoryEntry, ...]
     conversation_messages: tuple[dict[str, str], ...] = ()
     memory_context: tuple[str, ...] = ()
+    visual_context: tuple[str, ...] = ()
     metadata: dict[str, object] = field(default_factory=dict)
     total_characters: int = 0
 
@@ -56,10 +57,14 @@ class ContextBuilder:
         max_characters: int = 6000,
         system_prompt_path: Path | None = None,
         max_memory_items: int = 5,
+        max_visual_events: int = 5,
+        max_visual_context_characters: int = 500,
     ) -> None:
         self._max_messages = max_messages
         self._max_characters = max_characters
         self._max_memory_items = max_memory_items
+        self._max_visual_events = max_visual_events
+        self._max_visual_chars = max_visual_context_characters
         self._system_prompt = _load_system_prompt(system_prompt_path)
 
     @property
@@ -73,6 +78,7 @@ class ContextBuilder:
         *,
         conversation_messages: list[dict[str, str]] | None = None,
         memory_context: list[str] | None = None,
+        visual_context: list[str] | None = None,
     ) -> Context:
         budget = self._max_characters
         budget -= len(self._system_prompt)
@@ -98,6 +104,19 @@ class ContextBuilder:
                 mem_ctx.append(mem_str)
                 budget -= cost
 
+        # Phase 6: include recent visual context within its own sub-budget
+        vis_ctx: list[str] = []
+        if visual_context:
+            vis_budget = min(self._max_visual_chars, budget)
+            vis_used = 0
+            for desc in visual_context[: self._max_visual_events]:
+                cost = len(desc)
+                if vis_used + cost > vis_budget:
+                    break
+                vis_ctx.append(desc)
+                vis_used += cost
+            budget -= vis_used
+
         # Phase 1-4 working memory selection with remaining budget
         recent = self._select_recent(
             working_memory, budget, exclude_event_id=event.id,
@@ -108,6 +127,7 @@ class ContextBuilder:
             + sum(len(e.transcript) for e in recent)
             + sum(len(m.get("content", "")) for m in conv_msgs)
             + sum(len(s) for s in mem_ctx)
+            + sum(len(s) for s in vis_ctx)
         )
 
         return Context(
@@ -116,11 +136,13 @@ class ContextBuilder:
             recent_events=tuple(recent),
             conversation_messages=tuple(conv_msgs),
             memory_context=tuple(mem_ctx),
+            visual_context=tuple(vis_ctx),
             metadata={
                 "context_built_at": time.time(),
                 "recent_count": len(recent),
                 "conversation_count": len(conv_msgs),
                 "memory_count": len(mem_ctx),
+                "visual_count": len(vis_ctx),
                 "total_characters": total_chars,
             },
             total_characters=total_chars,
@@ -141,6 +163,13 @@ class ContextBuilder:
                 f"- {m}" for m in ctx.memory_context
             )
             msgs.append({"role": "system", "content": memory_block})
+
+        # Phase 6: recent visual context as system note (text descriptions, never raw frames)
+        if ctx.visual_context:
+            visual_block = "Recent visual context:\n" + "\n".join(
+                f"- {v}" for v in ctx.visual_context
+            )
+            msgs.append({"role": "system", "content": visual_block})
 
         # Persistent conversation history (already has roles)
         for msg in ctx.conversation_messages:
