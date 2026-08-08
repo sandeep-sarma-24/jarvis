@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
-"""10-minute continuous-run stability test.
+"""Synthetic pipeline stability test.
 
-Feeds synthetic audio through the pipeline and measures memory stability.
-Does NOT require a real microphone — uses simulated audio chunks.
+Feeds simulated audio through VAD + segmentation + ASR + EventBus and measures
+memory stability over time.  Does NOT use a real microphone.
+
+This is NOT a substitute for a real microphone hardware test.
 
 Usage: python -m scripts.stability_test [--minutes 10]
 """
@@ -16,7 +18,7 @@ import time
 import numpy as np
 import psutil  # type: ignore[import-untyped]
 
-from app.audio.vad import VoiceActivityDetector
+from app.audio.vad import VoiceActivityDetector, VADResult
 from app.audio.segmentation import SpeechSegmenter
 from app.audio.asr import SpeechRecognizer
 from app.config import ASRConfig, VADConfig
@@ -30,21 +32,16 @@ CHUNK = 512
 async def run(minutes: int = 10) -> None:
     proc = psutil.Process(os.getpid())
 
-    print(f"Stability test: {minutes} minutes")
+    print(f"Synthetic pipeline stability test: {minutes} minutes")
     print(f"RSS at start: {proc.memory_info().rss / 1024 / 1024:.1f} MB")
 
-    # Setup
     vad = VoiceActivityDetector(threshold=0.5)
     vad.load()
 
     asr = SpeechRecognizer(ASRConfig())
     asr.load()
 
-    segmenter = SpeechSegmenter(
-        config=VADConfig(),
-        sample_rate=SR,
-        chunk_samples=CHUNK,
-    )
+    segmenter = SpeechSegmenter(config=VADConfig(), sample_rate=SR, chunk_samples=CHUNK)
 
     bus = EventBus(queue_size=256)
     event_count = 0
@@ -66,15 +63,11 @@ async def run(minutes: int = 10) -> None:
     start = time.time()
     half = minutes * 60 / 2
 
-    from app.audio.vad import VADResult
-
     silence = np.zeros(CHUNK, dtype=np.float32)
     noise = np.random.randn(CHUNK).astype(np.float32) * 0.01
 
-    # Simulate speech segments by faking VAD results directly.
-    # Real VAD runs on silence chunks to keep it exercised.
-    speech_interval = 30  # seconds between speech bursts
-    speech_chunks_count = int(1.5 * SR / CHUNK)  # ~1.5s of speech
+    speech_interval = 30
+    speech_chunks_count = int(1.5 * SR / CHUNK)
     silence_end_count = 15
 
     last_speech_time = -speech_interval
@@ -84,9 +77,8 @@ async def run(minutes: int = 10) -> None:
         elapsed = time.time() - start
 
         if elapsed - last_speech_time >= speech_interval:
-            # Simulate a speech segment via VAD override
             for _ in range(speech_chunks_count):
-                vad.process_chunk(silence)  # keep VAD exercised
+                vad.process_chunk(silence)
                 vr = VADResult(is_speech=True, confidence=0.9, latency_ms=0.1)
                 seg = segmenter.process(noise, vr)
                 chunks_processed += 1
@@ -98,7 +90,7 @@ async def run(minutes: int = 10) -> None:
                         event = SpeechEvent(
                             session_id="stability",
                             source=Modality.AUDIO,
-                            confidence=1.0,
+                            confidence=0.0,
                             transcript=r.text or "(empty)",
                             duration_seconds=seg.duration_seconds,
                         )
@@ -118,7 +110,7 @@ async def run(minutes: int = 10) -> None:
                         event = SpeechEvent(
                             session_id="stability",
                             source=Modality.AUDIO,
-                            confidence=1.0,
+                            confidence=0.0,
                             transcript=r.text or "(empty)",
                             duration_seconds=seg.duration_seconds,
                         )
@@ -145,9 +137,10 @@ async def run(minutes: int = 10) -> None:
     await bus.shutdown()
     vad.reset()
 
-    print(f"\n── Stability Test Results ({minutes} min) ──")
+    print(f"\n── Synthetic Stability Test Results ({minutes} min) ──")
     print(f"  RSS start (after load): {rss_start:.1f} MB")
-    print(f"  RSS halfway:            {rss_half:.1f} MB")
+    if rss_half is not None:
+        print(f"  RSS halfway:            {rss_half:.1f} MB")
     print(f"  RSS end:                {rss_end:.1f} MB")
     print(f"  RSS drift:              {rss_end - rss_start:+.1f} MB")
     print(f"  Chunks processed:       {chunks_processed}")
@@ -158,7 +151,6 @@ async def run(minutes: int = 10) -> None:
     print(f"  Bus drops:              {bus.events_dropped}")
 
     drift = rss_end - rss_start
-    # Upward drift >50MB = possible leak. Downward drift = MLX releasing GPU memory, fine.
     stable = drift < 50
     print(f"\n  Memory stable: {'YES' if stable else 'NO — investigate leak'}")
 

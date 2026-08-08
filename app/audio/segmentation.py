@@ -5,8 +5,9 @@ Consumes VADResult stream, emits SpeechSegment when an utterance is complete.
 """
 from __future__ import annotations
 
+import math
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum, auto
 
 import numpy as np
@@ -41,8 +42,8 @@ class SpeechSegmenter:
         self._chunk_samples = chunk_samples
         self._chunk_duration_ms = (chunk_samples / sample_rate) * 1000
 
-        self._speech_start_chunks = max(1, int(config.minimum_speech_ms / self._chunk_duration_ms / 3))
-        self._silence_end_chunks = max(1, int(config.speech_end_silence_ms / self._chunk_duration_ms))
+        self._min_speech_chunks = math.ceil(config.minimum_speech_ms / self._chunk_duration_ms)
+        self._silence_end_chunks = math.ceil(config.speech_end_silence_ms / self._chunk_duration_ms)
         self._max_chunks = int(config.maximum_segment_seconds * sample_rate / chunk_samples)
 
         self._state = _State.SILENCE
@@ -61,7 +62,7 @@ class SpeechSegmenter:
             if vad_result.is_speech:
                 self._consecutive_speech += 1
                 self._speech_chunks.append(chunk.copy())
-                if self._consecutive_speech >= self._speech_start_chunks:
+                if self._consecutive_speech >= 2:
                     self._state = _State.SPEECH
                     self._segment_start = now - (self._consecutive_speech * self._chunk_duration_ms / 1000)
             else:
@@ -93,14 +94,12 @@ class SpeechSegmenter:
 
         return None  # unreachable
 
-    def _emit(self, end_time: float) -> SpeechSegment:
+    def _emit(self, end_time: float) -> SpeechSegment | None:
         audio = np.concatenate(self._speech_chunks)
         duration = len(audio) / self._sample_rate
-        # ponytail: minimum_speech_ms check — discard noise bursts
-        min_dur = self._cfg.minimum_speech_ms / 1000
         self._reset()
-        if duration < min_dur:
-            return None  # type: ignore[return-value]
+        if duration < self._cfg.minimum_speech_ms / 1000:
+            return None
         self.segments_detected += 1
         return SpeechSegment(
             audio=audio,

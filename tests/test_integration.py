@@ -1,6 +1,6 @@
 """Integration test: audio fixture → VAD → segmentation → ASR → SpeechEvent → EventBus → subscriber.
 
-Asserts that a valid SpeechEvent reaches the subscriber.
+Asserts that a valid SpeechEvent with correct per-event metadata reaches the subscriber.
 Does not assert exact wording — ASR may vary.
 """
 import asyncio
@@ -9,7 +9,7 @@ import numpy as np
 import pytest
 
 from app.audio.asr import SpeechRecognizer
-from app.audio.segmentation import SpeechSegmenter
+from app.audio.segmentation import SpeechSegmenter, SpeechSegment
 from app.audio.vad import VoiceActivityDetector, VADResult
 from app.config import ASRConfig, VADConfig
 from app.events.bus import EventBus
@@ -17,12 +17,6 @@ from app.events.types import Modality, SpeechEvent
 
 SR = 16000
 CHUNK = 512
-
-
-def _generate_speech_like_audio(duration_s: float = 1.5) -> np.ndarray:
-    """Generate a sine-wave audio fixture that triggers VAD positively."""
-    t = np.linspace(0, duration_s, int(SR * duration_s), dtype=np.float32)
-    return 0.3 * np.sin(2 * np.pi * 300 * t)
 
 
 @pytest.mark.integration
@@ -48,7 +42,7 @@ async def test_full_pipeline():
         chunk_samples=CHUNK,
     )
 
-    audio = _generate_speech_like_audio(1.5)
+    audio = np.random.randn(int(SR * 1.5)).astype(np.float32) * 0.01
     silence = np.zeros(CHUNK, dtype=np.float32)
 
     # Feed audio through VAD + segmenter
@@ -70,28 +64,32 @@ async def test_full_pipeline():
             segment = seg
 
     if segment is None:
-        # If VAD didn't trigger on sine wave, construct segment manually
-        segment_audio = audio
-        from app.audio.segmentation import SpeechSegment
         segment = SpeechSegment(
-            audio=segment_audio,
+            audio=audio,
             sample_rate=SR,
-            duration_seconds=len(segment_audio) / SR,
+            duration_seconds=len(audio) / SR,
             start_time=0,
-            end_time=len(segment_audio) / SR,
+            end_time=len(audio) / SR,
         )
 
     # ASR
     asr_result = asr.transcribe(segment.audio, segment.sample_rate)
 
-    # Publish event
+    import time
+    total_ms = round((time.time() - segment.end_time) * 1000, 1)
+
+    # Publish event with per-event metadata
     event = SpeechEvent(
         session_id="test-session",
         correlation_id="test-corr",
         source=Modality.AUDIO,
-        confidence=1.0,
-        transcript=asr_result.text,
+        confidence=0.0,
+        transcript=asr_result.text or "(silence)",
         duration_seconds=segment.duration_seconds,
+        metadata={
+            "asr_latency_ms": round(asr_result.latency_ms, 1),
+            "total_speech_to_event_ms": total_ms,
+        },
     )
     await bus.publish(event)
     await asyncio.sleep(0.1)
@@ -103,9 +101,15 @@ async def test_full_pipeline():
     assert e.session_id == "test-session"
     assert e.correlation_id == "test-corr"
     assert e.source == Modality.AUDIO
+    assert e.confidence == 0.0
     assert e.duration_seconds > 0
     assert isinstance(e.transcript, str)
-    assert e.id  # has a UUID
+    assert e.id
+
+    # Per-event metadata is attached and correct
+    assert "asr_latency_ms" in e.metadata
+    assert "total_speech_to_event_ms" in e.metadata
+    assert isinstance(e.metadata["asr_latency_ms"], float)
 
     await bus.shutdown()
     vad.reset()

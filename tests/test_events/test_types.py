@@ -22,6 +22,11 @@ def test_event_source_default():
     assert e.source == Modality.SYSTEM
 
 
+def test_event_confidence_default():
+    e = Event()
+    assert e.confidence == 0.0
+
+
 def test_speech_event_fields():
     se = SpeechEvent(
         session_id="sess1",
@@ -42,6 +47,17 @@ def test_speech_event_fields():
 def test_speech_event_is_question_optional():
     se = SpeechEvent()
     assert se.is_question is False
+
+
+def test_speech_event_metadata_default():
+    se = SpeechEvent()
+    assert se.metadata == {}
+
+
+def test_speech_event_metadata_with_diagnostics():
+    se = SpeechEvent(metadata={"asr_latency_ms": 340.0, "total_speech_to_event_ms": 490.0})
+    assert se.metadata["asr_latency_ms"] == 340.0
+    assert se.metadata["total_speech_to_event_ms"] == 490.0
 
 
 def test_modality_values():

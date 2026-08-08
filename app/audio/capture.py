@@ -31,6 +31,12 @@ class BoundedAudioBuffer:
         self._loop: asyncio.AbstractEventLoop | None = None
         self.chunks_received = 0
         self.chunks_dropped = 0
+        self.max_depth = 0
+
+    @property
+    def depth(self) -> int:
+        with self._lock:
+            return len(self._buf)
 
     def bind_loop(self, loop: asyncio.AbstractEventLoop) -> None:
         self._loop = loop
@@ -42,6 +48,9 @@ class BoundedAudioBuffer:
             if len(self._buf) == self._max:
                 self.chunks_dropped += 1
             self._buf.append(chunk)
+            current = len(self._buf)
+            if current > self.max_depth:
+                self.max_depth = current
         if self._loop is not None:
             self._loop.call_soon_threadsafe(self._event.set)
 

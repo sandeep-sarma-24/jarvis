@@ -61,3 +61,33 @@ async def test_async_get():
     chunk = await asyncio.wait_for(buf.get(), timeout=1.0)
     assert chunk is not None
     assert chunk[0] == 1.0
+
+
+def test_depth_empty(buffer: BoundedAudioBuffer):
+    assert buffer.depth == 0
+
+
+def test_depth_tracks_contents(buffer: BoundedAudioBuffer):
+    buffer.put(np.zeros(512, dtype=np.float32))
+    buffer.put(np.zeros(512, dtype=np.float32))
+    assert buffer.depth == 2
+    buffer.get_nowait()
+    assert buffer.depth == 1
+
+
+def test_max_depth_tracks_peak(buffer: BoundedAudioBuffer):
+    for _ in range(3):
+        buffer.put(np.zeros(512, dtype=np.float32))
+    assert buffer.max_depth == 3
+    buffer.get_nowait()
+    buffer.get_nowait()
+    assert buffer.max_depth == 3  # peak, not current
+
+
+def test_overflow_tracks_dropped_count():
+    buf = BoundedAudioBuffer(max_chunks=2)
+    for _ in range(5):
+        buf.put(np.zeros(512, dtype=np.float32))
+    assert buf.chunks_dropped == 3
+    assert buf.chunks_received == 5
+    assert buf.max_depth == 2

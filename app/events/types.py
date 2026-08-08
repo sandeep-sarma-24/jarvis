@@ -32,3 +32,4 @@ class SpeechEvent(Event):
     transcript: str = ""
     duration_seconds: float = 0.0
     is_question: bool = False  # kept for arch compat, not used in Phase 1
+    metadata: dict[str, object] = field(default_factory=dict)

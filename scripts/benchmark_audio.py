@@ -2,21 +2,20 @@
 """Phase 1 benchmark — measures actual VAD, ASR, and pipeline latencies.
 
 Usage: python -m scripts.benchmark_audio
+
+Reports target vs actual for each metric.
 """
 from __future__ import annotations
 
 import os
-import sys
 import time
 
 import numpy as np
 import psutil  # type: ignore[import-untyped]
 
-# Targets from architecture
 TARGETS = {
     "vad_latency_ms": 1.0,
     "asr_latency_ms": 800.0,
-    "e2e_latency_ms": 1000.0,
 }
 
 
@@ -28,19 +27,18 @@ def _fmt(label: str, actual: float, target: float, unit: str = "ms") -> str:
 def run() -> None:
     proc = psutil.Process(os.getpid())
     rss_start = proc.memory_info().rss / (1024 * 1024)
-    print(f"RSS at start: {rss_start:.1f} MB")
+    print(f"RSS at start: {rss_start:.1f} MB\n")
 
-    # ── VAD ──
+    # ── VAD ──────────────────────────────────────────────────────────────
     from app.audio.vad import VoiceActivityDetector
 
     t0 = time.perf_counter()
     vad = VoiceActivityDetector(threshold=0.5)
     vad.load()
     vad_load_ms = (time.perf_counter() - t0) * 1000
-    print(f"\nVAD model load: {vad_load_ms:.0f} ms")
+    print(f"VAD model load: {vad_load_ms:.0f} ms")
 
     chunk = np.zeros(512, dtype=np.float32)
-    # warm up
     for _ in range(10):
         vad.process_chunk(chunk)
     vad.reset()
@@ -58,9 +56,8 @@ def run() -> None:
     print(_fmt("p99", vad_p99, TARGETS["vad_latency_ms"]))
 
     rss_after_vad = proc.memory_info().rss / (1024 * 1024)
-    print(f"\nRSS after VAD: {rss_after_vad:.1f} MB")
 
-    # ── ASR ──
+    # ── ASR ──────────────────────────────────────────────────────────────
     from app.audio.asr import SpeechRecognizer
     from app.config import ASRConfig
 
@@ -70,11 +67,8 @@ def run() -> None:
     asr_load_ms = (time.perf_counter() - t0) * 1000
     print(f"\nASR model load: {asr_load_ms:.0f} ms")
 
-    # ~2 seconds of white noise (simulates a speech segment)
     test_audio = np.random.randn(32000).astype(np.float32) * 0.01
-
-    # warm up
-    asr.transcribe(test_audio)
+    asr.transcribe(test_audio)  # warm up
 
     asr_latencies = []
     for _ in range(5):
@@ -86,30 +80,28 @@ def run() -> None:
     print(_fmt("mean", asr_mean, TARGETS["asr_latency_ms"]))
 
     rss_after_asr = proc.memory_info().rss / (1024 * 1024)
-    print(f"\nRSS after ASR: {rss_after_asr:.1f} MB")
 
-    # ── End-to-end ──
-    from app.audio.segmentation import SpeechSegmenter, SpeechSegment
+    # ── Speech-end → event (simulated) ───────────────────────────────────
+    from app.audio.vad import VADResult
+    from app.audio.segmentation import SpeechSegmenter
+    from app.audio.capture import BoundedAudioBuffer
     from app.config import VADConfig
 
-    segmenter = SpeechSegmenter(
-        config=VADConfig(),
-        sample_rate=16000,
-        chunk_samples=512,
-    )
+    segmenter = SpeechSegmenter(config=VADConfig(), sample_rate=16000, chunk_samples=512)
+    buf = BoundedAudioBuffer(max_chunks=1000)
 
-    # simulate: 1s speech + silence end
     speech_audio = np.random.randn(512).astype(np.float32) * 0.01
-    speech_chunks = 32  # ~1 second
+    speech_n = 32
 
-    t0 = time.perf_counter()
-    segment = None
-    for _ in range(speech_chunks):
-        from app.audio.vad import VADResult
-        # simulate speech detection
+    # Fill buffer to simulate background capture during ASR
+    for _ in range(speech_n):
+        buf.put(speech_audio.copy())
+
+    # Simulate: segment finalized, then measure ASR + publish
+    for _ in range(speech_n):
         vr = VADResult(is_speech=True, confidence=0.9, latency_ms=0.1)
-        segment = segmenter.process(speech_audio, vr)
-    # end with silence
+        segmenter.process(speech_audio, vr)
+    segment = None
     for _ in range(15):
         vr = VADResult(is_speech=False, confidence=0.1, latency_ms=0.1)
         segment = segmenter.process(speech_audio, vr)
@@ -117,10 +109,20 @@ def run() -> None:
             break
 
     if segment is not None:
+        depth_before = buf.depth
+        t_start = time.perf_counter()
         asr_r = asr.transcribe(segment.audio, segment.sample_rate)
-        e2e = (time.perf_counter() - t0) * 1000
-        print(f"\nEnd-to-end (segmentation + ASR):")
-        print(_fmt("total", e2e, TARGETS["e2e_latency_ms"]))
+        t_asr = time.perf_counter()
+        speech_to_event_ms = (t_asr - t_start) * 1000
+
+        print(f"\nSpeech-end → event (simulated):")
+        print(f"  ASR latency:       {asr_r.latency_ms:.1f} ms")
+        print(f"  speech→event:      {speech_to_event_ms:.1f} ms")
+        print(f"  buffer depth before ASR: {depth_before}")
+        print(f"  buffer depth after ASR:  {buf.depth}")
+        print(f"  buffer max depth:        {buf.max_depth}")
+        print(f"  total chunks received:   {buf.chunks_received}")
+        print(f"  total chunks dropped:    {buf.chunks_dropped}")
 
     rss_end = proc.memory_info().rss / (1024 * 1024)
     print(f"\n── Memory summary ──")

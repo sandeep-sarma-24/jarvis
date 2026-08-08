@@ -139,3 +139,32 @@ async def test_shutdown_is_clean(bus: EventBus):
 
     bus.subscribe(Event, handler)
     await bus.shutdown()
+
+
+async def test_publish_after_shutdown():
+    bus = EventBus(queue_size=4)
+    await bus.start()
+    await bus.shutdown()
+    # Should not raise — publish after shutdown is a no-op to subscribers
+    await bus.publish(Event())
+    assert bus.events_published == 1
+
+
+async def test_event_counters_correct():
+    bus = EventBus(queue_size=4)
+    received: list[Event] = []
+
+    async def handler(event: Event):
+        received.append(event)
+
+    bus.subscribe(Event, handler)
+    await bus.start()
+
+    for _ in range(3):
+        await bus.publish(Event())
+    await asyncio.sleep(0.05)
+
+    assert bus.events_published == 3
+    assert bus.events_dropped == 0
+    assert len(received) == 3
+    await bus.shutdown()
