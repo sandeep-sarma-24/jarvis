@@ -38,8 +38,12 @@ class LocalAudioPlayer:
     Generation-based cancellation ensures no overlapping streams:
     - Each play() increments _generation.
     - The worker thread holds its own generation value.
-    - If the worker's generation != current _generation, it exits.
+    - If the worker's generation != current _generation, it exits as INTERRUPTED.
     - stop() increments generation and aborts the stream.
+
+    Completion semantics:
+    - COMPLETED: all audio frames written, generation still current at end.
+    - INTERRUPTED: anything else (stale generation, stop(), device error).
     """
 
     def __init__(
@@ -126,9 +130,10 @@ class LocalAudioPlayer:
         """Background worker that plays audio through sounddevice.
 
         Exits immediately if its generation is no longer current.
-        Reports outcome (COMPLETED vs INTERRUPTED) via on_done callback.
+        Only reports COMPLETED when ALL frames were written and generation
+        remained current throughout. Every other exit path is INTERRUPTED.
         """
-        interrupted = False
+        completed = False
         try:
             if not self._is_current(gen):
                 return
@@ -156,7 +161,6 @@ class LocalAudioPlayer:
             offset = 0
             while offset < total_frames:
                 if not self._is_current(gen):
-                    interrupted = True
                     break
 
                 end = min(offset + block_size, total_frames)
@@ -166,16 +170,18 @@ class LocalAudioPlayer:
                         if self._stream is not None and self._stream.active and self._generation == gen:
                             self._stream.write(block)
                         else:
-                            interrupted = True
                             break
-                except sd.PortAudioError:
-                    interrupted = True
+                except sd.PortAudioError as exc:
+                    logger.error("Playback device error: %s", exc)
                     break
                 offset = end
 
+            # Only mark completed if we wrote all frames and still own the generation
+            if offset >= total_frames and self._is_current(gen):
+                completed = True
+
         except Exception as exc:
             logger.error("Playback failed: %s", exc)
-            interrupted = True
         finally:
             with self._lock:
                 if self._generation == gen:
@@ -188,7 +194,7 @@ class LocalAudioPlayer:
                         self._stream = None
                     self._playing = False
 
-            outcome = PlaybackOutcome.INTERRUPTED if interrupted else PlaybackOutcome.COMPLETED
+            outcome = PlaybackOutcome.COMPLETED if completed else PlaybackOutcome.INTERRUPTED
             if self._on_done is not None:
                 try:
                     self._on_done(outcome)

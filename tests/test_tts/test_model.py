@@ -168,6 +168,8 @@ class TestFakePlayer:
         player.stop()
         player.stop()
         assert player.stop_count == 3
+        # No outcomes generated when not playing
+        assert player.outcomes == []
 
     def test_repeated_stop_no_crash(self):
         player = FakePlayer()
@@ -175,6 +177,8 @@ class TestFakePlayer:
         for _ in range(10):
             player.stop()
         assert player.is_playing() is False
+        # Only one interruption (the first stop while playing)
+        assert player.outcomes == ["interrupted"]
 
     def test_natural_completion(self):
         player = FakePlayer()
@@ -196,3 +200,30 @@ class TestFakePlayer:
         player.play(audio, 24000)  # interrupts first
         assert player.outcomes == ["interrupted"]
         assert len(player.plays) == 2
+
+    def test_complete_then_stop_no_double_outcome(self):
+        """complete() then stop() must NOT produce both outcomes."""
+        player = FakePlayer()
+        player.play(np.zeros(100, dtype=np.float32), 24000)
+        player.complete()
+        player.stop()  # already inactive, should produce nothing
+        assert player.outcomes == ["completed"]
+
+    def test_play_a_play_b_complete_b(self):
+        """play(A) → play(B) → complete(B) = A interrupted, B completed."""
+        player = FakePlayer()
+        audio = np.zeros(100, dtype=np.float32)
+        player.play(audio, 24000)  # A
+        player.play(audio, 24000)  # B interrupts A
+        player.complete()  # B completes naturally
+        assert player.outcomes == ["interrupted", "completed"]
+
+    def test_stop_after_complete_no_outcome(self):
+        """stop() after natural completion produces no new outcome."""
+        player = FakePlayer()
+        player.play(np.zeros(100, dtype=np.float32), 24000)
+        player.complete()
+        player.stop()
+        player.stop()
+        player.stop()
+        assert player.outcomes == ["completed"]
