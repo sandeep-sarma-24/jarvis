@@ -43,6 +43,24 @@ class AttentionConfig:
 
 
 @dataclass
+class ReasoningConfig:
+    enabled: bool = True
+    model: str = "gemma4:12b"
+    ollama_url: str = "http://localhost:11434"
+    max_context_messages: int = 8
+    max_context_characters: int = 6000
+    max_output_tokens: int = 256
+    temperature: float = 0.2
+    timeout_seconds: float = 30.0
+    max_concurrent_requests: int = 1
+
+
+@dataclass
+class ResponseConfig:
+    enabled: bool = True
+
+
+@dataclass
 class LoggingConfig:
     level: str = "INFO"
 
@@ -54,6 +72,8 @@ class JarvisConfig:
     asr: ASRConfig = field(default_factory=ASRConfig)
     event_bus: EventBusConfig = field(default_factory=EventBusConfig)
     attention: AttentionConfig = field(default_factory=AttentionConfig)
+    reasoning: ReasoningConfig = field(default_factory=ReasoningConfig)
+    response: ResponseConfig = field(default_factory=ResponseConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
 
 
@@ -76,6 +96,10 @@ def load_config(path: Path | None = None) -> JarvisConfig:
         cfg.event_bus = EventBusConfig(**{k: v for k, v in raw["event_bus"].items() if k in EventBusConfig.__dataclass_fields__})
     if "attention" in raw:
         cfg.attention = AttentionConfig(**{k: v for k, v in raw["attention"].items() if k in AttentionConfig.__dataclass_fields__})
+    if "reasoning" in raw:
+        cfg.reasoning = ReasoningConfig(**{k: v for k, v in raw["reasoning"].items() if k in ReasoningConfig.__dataclass_fields__})
+    if "response" in raw:
+        cfg.response = ResponseConfig(**{k: v for k, v in raw["response"].items() if k in ResponseConfig.__dataclass_fields__})
     if "logging" in raw:
         cfg.logging = LoggingConfig(**{k: v for k, v in raw["logging"].items() if k in LoggingConfig.__dataclass_fields__})
     return cfg

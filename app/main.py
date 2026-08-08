@@ -1,6 +1,7 @@
-"""JARVIS — Microphone → VAD → ASR → SpeechEvent → Attention → Console.
+"""JARVIS — Microphone → VAD → ASR → Attention → Context → LLM → Response Decision.
 
-Entry point and lifecycle orchestrator. Phase 1 audio pipeline + Phase 2 attention.
+Entry point and lifecycle orchestrator.
+Phase 1 audio pipeline + Phase 2 attention + Phase 3 reasoning.
 """
 from __future__ import annotations
 
@@ -33,6 +34,11 @@ _metrics = {
     "events_published": 0,
     "events_dropped": 0,
     "buffer_max_depth": 0,
+    "reasoning_requests": 0,
+    "reasoning_successes": 0,
+    "reasoning_failures": 0,
+    "reasoning_dropped": 0,
+    "responses_generated": 0,
 }
 
 
@@ -67,13 +73,7 @@ async def _audio_pipeline(
     bus: EventBus,
     session_id: str,
 ) -> None:
-    """Async loop: read chunks → VAD → segment → ASR → publish SpeechEvent.
-
-    Phase 1 limitation: ASR runs in a thread via asyncio.to_thread to avoid
-    blocking the event loop.  The PortAudio callback always enqueues into the
-    bounded buffer regardless, so microphone capture is never blocked.
-    """
-    loop = asyncio.get_running_loop()
+    """Async loop: read chunks → VAD → segment → ASR → publish SpeechEvent."""
     while True:
         chunk = await mic.buffer.get()
         _metrics["audio_chunks_received"] = mic.buffer.chunks_received
@@ -131,6 +131,124 @@ async def _audio_pipeline(
         _metrics["events_dropped"] = bus.events_dropped
 
 
+# ── Reasoning pipeline ──────────────────────────────────────────────────
+
+def _build_reasoning_handler(cfg: JarvisConfig, attention: AttentionEngine):
+    """Build the attention→context→reasoning→response handler.
+
+    Returns the async handler and the model instance (for cleanup).
+    Uses a bounded semaphore to limit concurrent reasoning.
+    """
+    from app.context.builder import ContextBuilder
+    from app.reasoning.local_model import OllamaModel
+    from app.reasoning.model import ReasoningModel
+    from app.response.decision import decide
+
+    model: ReasoningModel = OllamaModel(
+        model=cfg.reasoning.model,
+        base_url=cfg.reasoning.ollama_url,
+        timeout_seconds=cfg.reasoning.timeout_seconds,
+    )
+
+    context_builder = ContextBuilder(
+        max_messages=cfg.reasoning.max_context_messages,
+        max_characters=cfg.reasoning.max_context_characters,
+    )
+
+    reasoning_sem = asyncio.Semaphore(cfg.reasoning.max_concurrent_requests)
+    reasoning_logger = logging.getLogger("jarvis.reasoning")
+
+    async def _handler(event: Event) -> None:
+        if not isinstance(event, SpeechEvent):
+            return
+
+        decision = attention.evaluate(event)
+
+        # Console-style attention output
+        if decision.should_reason:
+            print(
+                f"\n[ATTENTION]\n"
+                f"  event_id={event.id[:12]}\n"
+                f"  should_reason=true\n"
+                f"  salience={decision.salience:.2f}\n"
+            )
+        else:
+            print(
+                f"\n[ATTENTION]\n"
+                f"  event_id={event.id[:12]}\n"
+                f"  should_reason=false\n"
+                f"\n[NO RESPONSE]\n"
+            )
+            return
+
+        if not cfg.reasoning.enabled or not cfg.response.enabled:
+            return
+
+        # Bounded concurrency: if semaphore is exhausted, drop the request
+        if reasoning_sem.locked():
+            _metrics["reasoning_dropped"] += 1
+            reasoning_logger.warning(
+                "Reasoning slot full, dropping event %s", event.id[:12]
+            )
+            return
+
+        _metrics["reasoning_requests"] += 1
+
+        async with reasoning_sem:
+            ctx = context_builder.build(event, attention.working_memory)
+            messages = context_builder.to_messages(ctx)
+
+            reasoning_logger.debug(
+                "Context: %d messages, %d chars",
+                len(messages), ctx.total_characters,
+            )
+
+            result = await asyncio.to_thread(
+                model.generate,
+                messages,
+                max_tokens=cfg.reasoning.max_output_tokens,
+                temperature=cfg.reasoning.temperature,
+            )
+
+        if result.success:
+            _metrics["reasoning_successes"] += 1
+        else:
+            _metrics["reasoning_failures"] += 1
+
+        reasoning_logger.info(
+            "REASONING event_id=%s model=%s latency_ms=%.0f success=%s "
+            "context_messages=%d context_chars=%d",
+            event.id[:12], result.model, result.latency_ms, result.success,
+            len(messages), ctx.total_characters,
+        )
+
+        resp = decide(event.id, result)
+
+        if resp.respond and resp.text:
+            _metrics["responses_generated"] += 1
+            print(
+                f"\n[REASONING]\n"
+                f"  model={result.model}\n"
+                f"  latency={result.latency_ms:.0f}ms\n"
+                f"\n[RESPONSE]\n"
+                f"  {resp.text}\n"
+            )
+        else:
+            print(
+                f"\n[RESPONSE_DECISION]\n"
+                f"  event_id={event.id[:12]}\n"
+                f"  respond=false\n"
+                f"  reason=\"{resp.reason}\"\n"
+            )
+
+        reasoning_logger.info(
+            "RESPONSE_DECISION event_id=%s respond=%s reason=%r",
+            event.id[:12], resp.respond, resp.reason,
+        )
+
+    return _handler, model
+
+
 # ── Lifecycle ────────────────────────────────────────────────────────────
 
 async def run(cfg: JarvisConfig | None = None) -> None:
@@ -150,8 +268,10 @@ async def run(cfg: JarvisConfig | None = None) -> None:
     bus = EventBus(queue_size=cfg.event_bus.subscriber_queue_size)
     bus.subscribe(SpeechEvent, _console_handler)
 
-    # 1b. Attention Engine (Phase 2)
+    # 2. Attention + Reasoning pipeline (Phase 2 + 3)
     attention: AttentionEngine | None = None
+    model_cleanup = None
+
     if cfg.attention.enabled:
         working_mem = WorkingMemory(max_size=cfg.attention.working_memory_size)
         attention = AttentionEngine(
@@ -160,32 +280,40 @@ async def run(cfg: JarvisConfig | None = None) -> None:
             working_memory=working_mem,
         )
 
-        async def _attention_handler(event: Event) -> None:
-            if isinstance(event, SpeechEvent) and attention is not None:
-                attention.evaluate(event)
+        if cfg.reasoning.enabled:
+            handler, model_cleanup = _build_reasoning_handler(cfg, attention)
+            bus.subscribe(SpeechEvent, handler)
+            logger.info(
+                "Reasoning pipeline active — model=%s max_concurrent=%d",
+                cfg.reasoning.model, cfg.reasoning.max_concurrent_requests,
+            )
+        else:
+            async def _attention_only_handler(event: Event) -> None:
+                if isinstance(event, SpeechEvent) and attention is not None:
+                    attention.evaluate(event)
+            bus.subscribe(SpeechEvent, _attention_only_handler)
 
-        bus.subscribe(SpeechEvent, _attention_handler)
         logger.info("Attention engine active — names=%s threshold=%.2f",
                      cfg.attention.assistant_names, cfg.attention.reason_threshold)
 
     await bus.start()
 
-    # 2. VAD
+    # 3. VAD
     vad = VoiceActivityDetector(threshold=cfg.vad.threshold)
     vad.load()
 
-    # 3. ASR
+    # 4. ASR
     asr = SpeechRecognizer(cfg.asr)
     asr.load()
 
-    # 4. Segmenter
+    # 5. Segmenter
     segmenter = SpeechSegmenter(
         config=cfg.vad,
         sample_rate=cfg.audio.sample_rate,
         chunk_samples=cfg.audio.chunk_samples,
     )
 
-    # 5. Microphone
+    # 6. Microphone
     mic = MicrophoneCapture(cfg.audio)
     loop = asyncio.get_running_loop()
 
@@ -195,7 +323,7 @@ async def run(cfg: JarvisConfig | None = None) -> None:
 
     mic.start(loop)
 
-    # 6. Run pipeline
+    # 7. Run pipeline
     pipeline_task = asyncio.create_task(
         _audio_pipeline(mic, vad, segmenter, asr, bus, session_id)
     )
@@ -204,7 +332,7 @@ async def run(cfg: JarvisConfig | None = None) -> None:
 
     await shutdown.wait()
 
-    # 7. Graceful shutdown
+    # 8. Graceful shutdown
     logger.info("Shutting down…")
     mic.stop()
     pipeline_task.cancel()
@@ -213,6 +341,9 @@ async def run(cfg: JarvisConfig | None = None) -> None:
     except asyncio.CancelledError:
         pass
     await bus.shutdown()
+
+    if model_cleanup is not None:
+        model_cleanup.close()
 
     logger.info(
         "Session %s ended — chunks=%d dropped=%d segments=%d transcribed=%d failed=%d max_depth=%d",
@@ -226,6 +357,14 @@ async def run(cfg: JarvisConfig | None = None) -> None:
     )
     if attention is not None:
         logger.info("Attention counters: %s", attention.counters)
+    logger.info(
+        "Reasoning: requests=%d success=%d fail=%d dropped=%d responses=%d",
+        _metrics["reasoning_requests"],
+        _metrics["reasoning_successes"],
+        _metrics["reasoning_failures"],
+        _metrics["reasoning_dropped"],
+        _metrics["responses_generated"],
+    )
 
 
 def main() -> None:

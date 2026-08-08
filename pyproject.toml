@@ -14,6 +14,7 @@ dependencies = [
     "silero-vad>=5",
     "onnxruntime>=1.16.1",
     "mlx-qwen3-asr>=0.3",
+    "httpx>=0.27",
 ]
 
 [project.optional-dependencies]
@@ -34,4 +35,5 @@ testpaths = ["tests"]
 markers = [
     "integration: marks tests requiring loaded models (deselect with '-m \"not integration\"')",
     "hardware: marks tests requiring real microphone hardware",
+    "model: marks tests requiring a running Ollama instance with model pulled",
 ]

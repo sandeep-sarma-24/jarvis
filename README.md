@@ -1,6 +1,6 @@
-# JARVIS — Audio Perception + Attention Engine
+# JARVIS — Audio Perception + Attention + Local LLM Reasoning
 
-Continuous microphone capture → VAD → speech segmentation → ASR → SpeechEvent → Attention → AttentionDecision.
+Continuous microphone capture → VAD → speech segmentation → ASR → SpeechEvent → Attention → Context → Local LLM → ResponseDecision.
 
 **Target hardware:** MacBook Air M4, 16 GB RAM, macOS.
 
@@ -18,13 +18,21 @@ Microphone (16kHz mono)
    → Tier 1: deterministic rules (<0.01ms)
    → Tier 2: weighted scorer (<0.03ms)
  → AttentionDecision {should_reason, salience, reason, tier}
- → console subscriber prints transcript
+ → if should_reason = false: STOP (no LLM call)
+ → if should_reason = true:
+     → Context Builder (working memory + system prompt + current event)
+     → Reasoning Model (Gemma 4 12B via Ollama)
+     → ReasoningResult
+     → Response Decision
+     → console output
 ```
 
 **Phase 1** (audio perception) captures and transcribes speech.
-**Phase 2** (attention) decides whether each transcript deserves reasoning resources.
+**Phase 2** (attention) gates which transcripts deserve reasoning.
+**Phase 3** (reasoning) sends attention-positive events through a local LLM and decides whether to respond.
 
-Phase 2 does not generate responses. Phase 2 does not use an LLM. Phase 2 only decides whether an event deserves reasoning. The system remains silent.
+Phase 3 does not implement TTS. Responses are printed to console.
+The LLM never receives attention-negative events.
 
 ## Quick Start
 
@@ -33,10 +41,14 @@ python3 -m venv .venv
 source .venv/bin/activate
 pip install -e ".[dev]"
 
+# Install and start Ollama, then pull the reasoning model
+brew install ollama
+ollama serve &
+ollama pull gemma4:12b
+
 # Run JARVIS (live microphone)
 python -m app.main
-# Speak into the microphone. Transcripts and attention decisions print to console.
-# Ctrl+C to stop.
+# Speak into the microphone. Ctrl+C to stop.
 ```
 
 On first run, the ASR model (~1.2 GB) downloads from HuggingFace.
@@ -51,23 +63,31 @@ On first run, the ASR model (~1.2 GB) downloads from HuggingFace.
 | Attention (Tier 1 rules) | <0.1 ms |
 | Attention (Tier 2 scorer) | <5 ms |
 | Total attention | <10 ms |
+| Context assembly | <50 ms |
+| Model inference (50 tokens) | <2 s |
+| Total reasoning pipeline | <3 s |
 
 Run `python -m scripts.benchmark_audio` for audio pipeline measurements.
 Run `python -m scripts.benchmark_attention` for attention latency measurements.
+Run `python -m scripts.benchmark_reasoning` for reasoning pipeline measurements.
 
 ## Tests
 
 ```bash
-# Unit tests (no model download required)
+# Unit tests (no model download required, no Ollama required)
 python -m pytest tests/ -v
 
 # All tests including model integration
 python -m pytest tests/ -m "integration or not integration" -v
+
+# Reasoning model smoke test (requires Ollama + gemma4:12b)
+python -m pytest tests/test_reasoning/test_local_model.py -m model -v
 ```
 
 Test categories:
 - **Unit tests** — no external dependencies, fast
 - **Integration tests** (`-m integration`) — require Silero VAD + Qwen3-ASR model downloads
+- **Model tests** (`-m model`) — require running Ollama instance with model pulled
 - **Hardware tests** (`-m hardware`) — require real microphone access
 
 ## Benchmarks
@@ -76,6 +96,7 @@ Test categories:
 pip install psutil
 python -m scripts.benchmark_audio
 python -m scripts.benchmark_attention
+python -m scripts.benchmark_reasoning
 ```
 
 ## Stability Test
@@ -86,7 +107,7 @@ python -m scripts.stability_test --minutes 10
 
 ## Configuration
 
-Edit `configs/default.toml`. Key attention settings:
+Edit `configs/default.toml`. Key settings:
 
 ```toml
 [attention]
@@ -94,16 +115,43 @@ enabled = true
 reason_threshold = 0.4
 assistant_names = ["jarvis"]
 working_memory_size = 20
+
+[reasoning]
+enabled = true
+model = "gemma4:12b"
+max_context_messages = 8
+max_context_characters = 6000
+max_output_tokens = 256
+temperature = 0.2
+max_concurrent_requests = 1
+
+[response]
+enabled = true
 ```
+
+System prompt: `configs/system_prompt.txt` (versioned, editable).
 
 ## Architecture
 
 See `docs/architecture/` for the full system design.
 
+### Phase 3 boundaries
+
+```
+Perception (Phase 1) → never calls the LLM
+Attention (Phase 2)  → gates LLM access
+Context Builder      → controls what the LLM sees
+ReasoningModel       → replaceable behind protocol
+Response Decision    → separate from reasoning
+```
+
+Reasoning does not block audio capture. LLM inference runs in a thread via `asyncio.to_thread`. Concurrent reasoning is bounded (`max_concurrent_requests = 1`).
+
 ## Privacy
 
 - All processing is local. No cloud API calls.
 - Raw audio exists only in a bounded in-memory ring buffer.
-- No audio or transcripts are persisted to disk.
+- No audio, transcripts, prompts, or responses are persisted to disk.
 - Working memory is in-process only, cleared on restart.
+- Model prompts are not logged at INFO level.
 - Microphone capture is logged on startup.

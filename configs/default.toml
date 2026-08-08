@@ -23,5 +23,19 @@ reason_threshold = 0.4
 assistant_names = ["jarvis"]
 working_memory_size = 20
 
+[reasoning]
+enabled = true
+model = "gemma4:12b"
+ollama_url = "http://localhost:11434"
+max_context_messages = 8
+max_context_characters = 6000
+max_output_tokens = 256
+temperature = 0.2
+timeout_seconds = 30.0
+max_concurrent_requests = 1
+
+[response]
+enabled = true
+
 [logging]
 level = "INFO"

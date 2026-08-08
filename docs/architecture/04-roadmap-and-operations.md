@@ -215,7 +215,18 @@ SpeechEvent (from Phase 1)
 
 ## Phase 3: Attention → LLM (Reasoning + Response Decision)
 
+**Status:** Complete.
+
 **Objective:** When attention decides to reason (`should_reason = true`), assemble context, run the reasoning model, and explicitly decide whether to respond. This phase implements BOTH reasoning AND response decision — the decision layer separates "I reasoned about this" from "I should respond to this". Text output to console for now (voice output is Phase 4).
+
+**Implementation notes:**
+- Model: Gemma 4 12B Q4 via Ollama (configurable). Behind `ReasoningModel` protocol — swappable.
+- Context builder: bounded by `max_context_messages` (8) and `max_context_characters` (6000). Current event always preserved. Prefers `should_reason=True` entries from working memory.
+- Response decision: deterministic Phase 3 policy — attention-positive + successful reasoning = respond. No second LLM call.
+- Concurrency: bounded by `asyncio.Semaphore(max_concurrent_requests=1)`. Extra events dropped with warning.
+- LLM inference: runs in thread via `asyncio.to_thread` — does not block audio capture.
+- System prompt: versioned in `configs/system_prompt.txt`, not hardcoded.
+- No TTS, no tools, no persistent memory, no cloud inference.
 
 **Requirements:**
 - Context builder assembles relevant information into a compact prompt
