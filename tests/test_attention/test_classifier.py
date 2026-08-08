@@ -67,6 +67,42 @@ class TestRecentInteraction:
         assert features.recent_interaction == 0.0
 
 
+class TestBackgroundPenaltyArithmetic:
+    """Verify that background_signal weight is negative and mathematically
+    lowers the final salience score."""
+
+    def test_background_weight_is_negative(self):
+        w = ScorerWeights()
+        assert w.background_signal < 0
+
+    def test_background_penalty_lowers_score(self):
+        """Same text with background signal injected must score lower."""
+        scorer = AttentionScorer()
+        # "I'll call you tomorrow" has background_signal=1.0
+        bg_score, bg_f = scorer.score("I'll call you tomorrow.")
+        assert bg_f.background_signal == 1.0
+
+        # "Why is the API failing?" has no background signal
+        q_score, q_f = scorer.score("Why is the API failing?")
+        assert q_f.background_signal == 0.0
+
+        assert bg_score < q_score
+
+    def test_background_penalty_arithmetic(self):
+        """Directly verify the penalty contribution is negative."""
+        w = ScorerWeights()
+        scorer = AttentionScorer(weights=w)
+        _, f = scorer.score("I'll call you tomorrow.")
+        contribution = f.background_signal * w.background_signal
+        assert contribution < 0
+
+    def test_question_not_penalized_by_background(self):
+        """A question without background signals must not be penalized."""
+        scorer = AttentionScorer()
+        _, f = scorer.score("What time is it?")
+        assert f.background_signal == 0.0
+
+
 class TestCustomWeights:
 
     def test_zero_weights_zero_score(self):

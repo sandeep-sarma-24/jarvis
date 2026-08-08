@@ -48,11 +48,16 @@ class AttentionRules:
         self._direct_address = re.compile(
             rf"^(?:hey|ok|yo|hi|hello)?\s*(?:{name_alt})\b", re.I
         )
+        # Vocative: name followed by comma — "Jarvis, can you..." is direct address
+        self._vocative = re.compile(
+            rf"^(?:hey|ok|yo|hi|hello)?\s*(?:{name_alt})\s*,", re.I
+        )
         # Name at end: "can you help me, jarvis?"
         self._trailing_address = re.compile(
             rf"\b(?:{name_alt})\s*[?.!]*\s*$", re.I
         )
         # Narrative/third-person usage: "jarvis is a character", "about jarvis"
+        # Only matches name directly followed by a verb/article (no comma).
         self._false_address = re.compile(
             rf"\b(?:{name_alt})\s+(?:is|was|were|has|had|would|will|can|could"
             rf"|the|a|an|from|in|about|like)\b", re.I
@@ -80,12 +85,24 @@ class AttentionRules:
         return None
 
     def _check_address(self, text: str) -> RuleResult | None:
+        has_vocative = self._vocative.search(text) is not None
         has_direct = self._direct_address.search(text) is not None
         has_trailing = self._trailing_address.search(text) is not None
 
         if not has_direct and not has_trailing:
             return None
 
+        # Vocative comma ("Jarvis, can you...") is unambiguously direct address.
+        # Trailing address ("help me, Jarvis?") likewise.
+        # These take priority over false-address patterns.
+        if has_vocative or has_trailing:
+            return RuleResult(
+                should_reason=True, salience=0.95,
+                reason="explicitly addressed assistant"
+            )
+
+        # Name at start without comma — check for narrative usage.
+        # "Jarvis is a character" vs "Jarvis help me" (rare but valid).
         if self._false_address.search(text):
             return RuleResult(
                 should_reason=False, salience=0.2,

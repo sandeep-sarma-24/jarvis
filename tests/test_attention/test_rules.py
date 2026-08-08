@@ -47,6 +47,46 @@ class TestExplicitAddress:
         assert r.should_reason is True
 
 
+class TestDirectAddressWithAux:
+    """'Jarvis, can/could/will/would you...' must be treated as direct address,
+    not as narrative usage. The comma is the vocative marker."""
+
+    def test_jarvis_can_you(self, rules):
+        r = rules.evaluate("Jarvis, can you explain this?")
+        assert r is not None
+        assert r.should_reason is True
+        assert r.salience >= 0.9
+        assert r.reason == "explicitly addressed assistant"
+
+    def test_jarvis_could_you(self, rules):
+        r = rules.evaluate("Jarvis, could you check the API?")
+        assert r is not None
+        assert r.should_reason is True
+        assert r.salience >= 0.9
+
+    def test_jarvis_will_you(self, rules):
+        r = rules.evaluate("Jarvis, will you help me?")
+        assert r is not None
+        assert r.should_reason is True
+
+    def test_jarvis_would_you(self, rules):
+        r = rules.evaluate("Jarvis, would you open this?")
+        assert r is not None
+        assert r.should_reason is True
+
+    def test_hey_jarvis_can_you(self, rules):
+        r = rules.evaluate("Hey Jarvis, can you help?")
+        assert r is not None
+        assert r.should_reason is True
+        assert r.salience >= 0.9
+
+    def test_trailing_jarvis_still_works(self, rules):
+        r = rules.evaluate("Can you help me, Jarvis?")
+        assert r is not None
+        assert r.should_reason is True
+        assert r.salience >= 0.9
+
+
 class TestFalseAddress:
 
     def test_jarvis_fictional_character(self, rules):
@@ -56,13 +96,27 @@ class TestFalseAddress:
 
     def test_jarvis_iron_man(self, rules):
         r = rules.evaluate("I was reading about Jarvis in Iron Man.")
-        # Should not trigger high-confidence attention
+        # Name mid-sentence, not in address position — defers to scorer or is false
         assert r is None or r.should_reason is False
 
     def test_jarvis_the_butler(self, rules):
         r = rules.evaluate("Jarvis was the butler in the comics.")
         assert r is not None
         assert r.should_reason is False
+
+    def test_jarvis_from_the_movie(self, rules):
+        r = rules.evaluate("Jarvis from the movie is cool.")
+        assert r is not None
+        assert r.should_reason is False
+
+    def test_tell_me_about_jarvis(self, rules):
+        """'Tell me about Jarvis.' — Jarvis is in trailing position, so this is
+        treated as addressing the assistant. This is the documented edge case:
+        a request that uses the assistant name as the topic is still a request
+        directed at the assistant."""
+        r = rules.evaluate("Tell me about Jarvis.")
+        assert r is not None
+        assert r.should_reason is True
 
 
 # ── Background speech ───────────────────────────────────────────────────

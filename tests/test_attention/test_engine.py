@@ -57,6 +57,42 @@ class TestCoreDecisions:
         assert d.salience > 0.2
 
 
+class TestDirectAddressAlwaysWins:
+    """Explicit addressing must be resolved by Tier 1 rules with high salience."""
+
+    def test_jarvis_can_you_is_rule_tier(self, engine):
+        d = engine.evaluate(_speech("Jarvis, can you explain this API error?"))
+        assert d.should_reason is True
+        assert d.tier == "rule"
+        assert d.salience >= 0.9
+
+    def test_hey_jarvis_is_rule_tier(self, engine):
+        d = engine.evaluate(_speech("Hey Jarvis!"))
+        assert d.should_reason is True
+        assert d.tier == "rule"
+        assert d.salience >= 0.9
+
+    def test_trailing_jarvis_is_rule_tier(self, engine):
+        d = engine.evaluate(_speech("Can you help me, Jarvis?"))
+        assert d.should_reason is True
+        assert d.tier == "rule"
+
+    def test_jarvis_could_you(self, engine):
+        d = engine.evaluate(_speech("Jarvis, could you check the API?"))
+        assert d.should_reason is True
+        assert d.tier == "rule"
+
+    def test_jarvis_will_you(self, engine):
+        d = engine.evaluate(_speech("Jarvis, will you help me?"))
+        assert d.should_reason is True
+        assert d.tier == "rule"
+
+    def test_jarvis_would_you(self, engine):
+        d = engine.evaluate(_speech("Jarvis, would you open this?"))
+        assert d.should_reason is True
+        assert d.tier == "rule"
+
+
 class TestFalseAddress:
 
     def test_jarvis_fictional(self, engine):
@@ -87,17 +123,71 @@ class TestTiers:
 
 # ── Silence-first policy ────────────────────────────────────────────────
 
-class TestSilenceFirst:
+class TestBackgroundSpeech:
 
-    def test_mundane_speech_silent(self, engine):
+    def test_background_examples_silent(self, engine):
+        for text in [
+            "I'll call you tomorrow.",
+            "See you later.",
+            "Okay, sure.",
+            "Let's go.",
+        ]:
+            d = engine.evaluate(_speech(text))
+            assert d.should_reason is False, f"Expected silence for: {text!r}"
+
+
+class TestAmbiguousSpeech:
+
+    def test_ambiguous_remains_conservative(self, engine):
         for text in [
             "That's interesting.",
+            "Maybe.",
+            "I don't know.",
+            "That's weird.",
             "I see.",
             "Hmm, okay.",
             "Right.",
         ]:
             d = engine.evaluate(_speech(text))
             assert d.should_reason is False, f"Expected silence for: {text!r}"
+
+
+class TestThresholdBehavior:
+
+    def test_below_threshold_is_false(self):
+        engine = AttentionEngine(reason_threshold=0.5)
+        # "That's interesting" scores very low — well below any threshold
+        d = engine.evaluate(_speech("That's interesting."))
+        assert d.should_reason is False
+
+    def test_above_threshold_is_true(self):
+        engine = AttentionEngine(reason_threshold=0.1)
+        # A question should score above 0.1
+        d = engine.evaluate(_speech("What time is it?"))
+        assert d.should_reason is True
+
+    def test_at_threshold_is_true(self):
+        """score >= threshold → should_reason=True.
+
+        Set threshold to the exact score a known case produces, then verify
+        the >= comparison holds."""
+        # "What time is it?" scores ~0.35 with default weights.
+        # Set threshold to that exact value to test the boundary.
+        probe_engine = AttentionEngine(reason_threshold=0.0)
+        probe = probe_engine.evaluate(_speech("What time is it?"))
+        exact_score = probe.salience
+
+        engine = AttentionEngine(reason_threshold=exact_score)
+        d = engine.evaluate(_speech("What time is it?"))
+        assert d.salience == exact_score
+        assert d.should_reason is True
+
+    def test_threshold_deterministic(self):
+        """Same input must produce same decision every time."""
+        engine = AttentionEngine(reason_threshold=0.4)
+        results = [engine.evaluate(_speech("Why is this failing?")) for _ in range(10)]
+        assert all(r.should_reason == results[0].should_reason for r in results)
+        assert all(r.salience == results[0].salience for r in results)
 
 
 # ── Failure handling ────────────────────────────────────────────────────
@@ -176,3 +266,23 @@ class TestWorkingMemoryIntegration:
         for i in range(5):
             engine.evaluate(_speech(f"event {i}"))
         assert len(mem) == 3
+
+    def test_background_speech_does_not_refresh_interaction(self):
+        """Background speech (should_reason=False) must NOT update
+        last_interaction_time. Only meaningful assistant interactions do."""
+        engine = AttentionEngine(assistant_names=["jarvis"], reason_threshold=0.4)
+        mem = engine.working_memory
+
+        engine.evaluate(_speech("I'll call John tomorrow."))
+        assert mem.last_interaction_time is None
+
+        engine.evaluate(_speech("Yeah, that's fine."))
+        assert mem.last_interaction_time is None
+
+        engine.evaluate(_speech("Hey Jarvis, what's the weather?"))
+        assert mem.last_interaction_time is not None
+        interaction_time = mem.last_interaction_time
+
+        engine.evaluate(_speech("See you later."))
+        # Must not have changed
+        assert mem.last_interaction_time == interaction_time
