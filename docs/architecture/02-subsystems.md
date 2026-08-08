@@ -368,7 +368,9 @@ The expensive analysis (LLM-based) only happens when the attention engine reques
 
 ```
 Microphone (16kHz, mono)
-  -> Ring buffer (30s rolling)
+  -> PortAudio/sounddevice callback (OS audio thread)
+  -> Thread-safe bounded ring buffer (configurable, default 30s)
+  -> Asyncio consumer task
   -> VAD (30ms chunks, <1ms CPU)
   -> Speech segments
   -> ASR (~0.5s per utterance)
@@ -378,11 +380,20 @@ Microphone (16kHz, mono)
 
 **Key decisions:**
 - **Continuous listening:** The ring buffer always records. VAD determines when speech starts/stops. Non-speech audio is discarded (never stored, never sent to ASR).
+- **Audio callback isolation:** The sounddevice/PortAudio callback runs on an OS audio thread outside the asyncio event loop. It writes PCM frames to a thread-safe bounded buffer and does nothing else ? no inference, no blocking, no asyncio calls. All processing (VAD, ASR, event publication) runs in asyncio consumer tasks.
 - **Streaming ASR:** Process speech segments as they complete (after end-of-speech detected by VAD). No streaming partial transcripts in V1 ? the added complexity isn't worth it until barge-in is needed.
-- **Buffer strategy:** 30-second rolling buffer means we can retroactively transcribe if something becomes relevant.
+- **Buffer strategy:** Ring buffer size is configurable (default 30 seconds). This allows retroactive transcription if something becomes relevant. Buffer size can be tuned based on speech segmentation requirements, memory usage, and debugging/replay needs.
 - **Question detection:** Simple heuristic on transcript (ends with '?', starts with question word). Not ML-based in V1.
 
-**Latency budget (target):** VAD detection (1ms) + end-of-speech wait (300ms silence threshold) + ASR (500ms) = ~800ms from speech end to event.
+**Ring buffer configuration:**
+```toml
+[audio]
+sample_rate = 16000
+channels = 1
+ring_buffer_seconds = 30  # tunable: longer for debugging, shorter to reduce memory
+```
+
+**Latency budget (initial target):** VAD detection (1ms) + end-of-speech wait (300ms silence threshold) + ASR (500ms) = ~800ms from speech end to event. This is an empirical performance target and must be benchmarked during Phase 1 implementation.
 
 ## Camera Pipeline
 
@@ -425,17 +436,7 @@ Individual perception events are not always independent. Events occurring close 
 
 **Event correlation semantics:**
 
-```python
-@dataclass
-class PerceptionEvent:
-    id: str                     # UUID
-    timestamp: float            # Unix timestamp
-    source: Modality            # AUDIO | VISUAL | SCREEN
-    session_id: str             # Session identifier
-    correlation_id: str | None  # Groups related events into a situation
-    importance_hint: float      # 0.0 - 1.0, from perception layer
-    raw_available: bool         # Whether raw data can be retrieved from buffer
-```
+All events carry a `correlation_id` field from the canonical `Event` envelope (see Event Types below). Events that occur within a short temporal window and relate to the same activity may share a `correlation_id`.
 
 Events that occur within a short temporal window and relate to the same activity may share a `correlation_id`. This allows the context builder to group related observations:
 
@@ -451,41 +452,65 @@ Events that occur within a short temporal window and relate to the same activity
 
 The exact grouping heuristic (temporal proximity, semantic similarity) is an implementation detail deferred to Phase 5+. The architectural requirement is that the event schema supports correlation.
 
-## Event Types (Shared Schema)
+## Event Types (Canonical Envelope)
+
+The canonical event envelope is the contract used by every subsystem. All events carry these base fields:
 
 ```python
 @dataclass
-class PerceptionEvent:
-    id: str                     # UUID
-    timestamp: float            # Unix timestamp
-    source: Modality            # AUDIO | VISUAL | SCREEN
-    session_id: str             # Session identifier
-    correlation_id: str | None  # Relates to same situation/task
-    importance_hint: float      # 0.0 - 1.0, from perception layer
-    raw_available: bool         # Whether raw data can be retrieved from buffer
+class Event:
+    """Base event envelope."""
+    id: str                     # Uniquely identifies this event (UUID)
+    timestamp: float            # When the event occurred (Unix timestamp)
+    session_id: str             # Current JARVIS runtime/session identifier
+    correlation_id: str | None  # Cross-modal grouping (None if uncorrelated)
+    source: Modality            # AUDIO | VISUAL | SCREEN | SYSTEM
+    confidence: float           # Perception confidence (0.0 - 1.0)
+```
 
+**Field semantics:**
+- `id` ? uniquely identifies the event instance
+- `timestamp` ? identifies when the event occurred
+- `session_id` ? identifies the current JARVIS runtime/session
+- `correlation_id` ? allows future cross-modal grouping of related events
+- `source` ? identifies the originating modality
+- `confidence` ? represents perception confidence
+
+Specialized events extend the base:
+
+```python
 @dataclass
-class SpeechEvent(PerceptionEvent):
+class SpeechEvent(Event):
+    """Phase 1 ? the only event type implemented initially."""
     transcript: str
-    confidence: float
     duration_seconds: float
     is_question: bool           # Heuristic
     speaker: str                # "user" or "other" (future: speaker ID)
 
 @dataclass
-class VisualEvent(PerceptionEvent):
+class VisualEvent(Event):
+    """Phase 7+ ? camera perception."""
     description: str
     objects: list[str]
     scene_change_magnitude: float
     frame_available: bool       # Can we retrieve the frame from buffer?
 
 @dataclass
-class ScreenEvent(PerceptionEvent):
+class ScreenEvent(Event):
+    """Phase 9+ ? screen perception."""
     app_name: str
     window_title: str
     visible_text: str           # Excerpt, not full screen
     change_type: str            # "app_switch" | "content_change" | "new_window"
+
+@dataclass
+class SystemEvent(Event):
+    """Internal lifecycle events."""
+    event_type: str             # "startup" | "shutdown" | "error"
+    detail: str
 ```
+
+For Phase 1, only `SpeechEvent` needs to be implemented. `VisualEvent`, `ScreenEvent`, and `SystemEvent` are defined for forward compatibility but are not implemented until their respective phases.
 
 ---
 
@@ -609,7 +634,7 @@ class VisionModel(ABC):
 
 class AttentionClassifier(ABC):
     @abstractmethod
-    def score(self, event: 'PerceptionEvent', context: 'WorldState') -> 'AttentionDecision':
+    def score(self, event: 'Event', context: 'WorldState') -> 'AttentionDecision':
         ...
 ```
 

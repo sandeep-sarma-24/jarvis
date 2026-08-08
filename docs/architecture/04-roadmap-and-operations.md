@@ -12,6 +12,13 @@
 
 **Objective:** Continuous audio capture with voice activity detection and speech recognition. The system listens, detects speech, and produces transcripts. No intelligence yet — just working perception.
 
+**Scope boundary (Phase 1 ONLY implements):**
+```
+Microphone → Audio Capture → VAD → Speech Segmentation → ASR → SpeechEvent → EventBus → Console
+```
+
+Phase 1 does NOT implement: attention, LLM reasoning, world state, persistent memory, working memory, camera, screen capture, TTS, or tools.
+
 **Requirements:**
 - Continuous microphone capture at 16kHz mono
 - VAD classifies 30ms chunks as speech/silence in <1ms
@@ -22,14 +29,27 @@
 
 **Architecture:**
 ```
-Microphone (sounddevice, 16kHz mono)
-  → asyncio audio callback → ring buffer (30s)
-  → VAD task (Silero, ONNX, 30ms chunks)
+PortAudio / sounddevice callback (OS audio thread, NOT asyncio)
+  → thread-safe bounded audio buffer (ring buffer)
+  → asyncio consumer task
+  → VAD (Silero, ONNX, 30ms chunks)
   → Speech segmentation (start/end detection, 300ms silence = end)
-  → ASR task (Qwen3-ASR 0.6B via mlx-qwen3-asr)
+  → ASR (Qwen3-ASR 0.6B via mlx-qwen3-asr)
   → SpeechEvent emission to event bus
   → Console logging (for development visibility)
 ```
+
+**Audio callback constraints:**
+The `sounddevice`/PortAudio callback executes on an OS audio thread, outside the
+asyncio event loop. It must:
+- Receive PCM frames
+- Perform minimal copying
+- Write to a bounded, thread-safe buffer
+- Never perform model inference
+- Never block
+- Never call heavyweight asyncio operations directly
+
+The asyncio side owns all processing: VAD, segmentation, ASR, event publication.
 
 **Interfaces:**
 - `AudioCapture` — provides continuous audio stream
@@ -59,7 +79,7 @@ Microphone (sounddevice, 16kHz mono)
 - `onnxruntime` — Silero VAD inference
 - `silero-vad` — VAD model + utilities
 - `mlx-qwen3-asr` — ASR inference (or `mlx`, `mlx-vlm` if using Gemma 4 for ASR)
-- `tomli` — config parsing
+- `tomllib` — config parsing (Python 3.11+ standard library, no install needed)
 
 **Implementation steps:**
 1. Set up `pyproject.toml` with dependencies, Python 3.11+ requirement
@@ -86,11 +106,13 @@ Microphone (sounddevice, 16kHz mono)
 - CPU usage: <5% when idle (no speech), <30% when processing speech
 - Clean shutdown on Ctrl+C
 
-**Performance criteria:**
+**Performance criteria (initial benchmark targets — must be validated empirically on M4 Air):**
 - VAD: <1ms per 30ms chunk
-- ASR: <800ms from speech-end to transcript
+- ASR: <800ms from speech-end to transcript (target, not guarantee)
 - Memory: <500MB total process (models loaded)
-- Ring buffer: 30 seconds of audio retained
+- Ring buffer: configurable (default 30 seconds)
+
+Failure to initially hit the 800ms ASR target triggers profiling and evaluation, not architectural redesign.
 
 **Failure modes:**
 - Microphone not found → clear error message, exit
@@ -472,7 +494,7 @@ Phase 15 (Integration) ────── depends on all
 
 | Metric | Target | Measurement |
 |--------|--------|-------------|
-| Perception latency (speech end → event) | <800ms | Instrumented |
+| Perception latency (speech end → event) | <800ms (initial target) | Instrumented |
 | Attention decision latency | <10ms (Tier 1+2) | Instrumented |
 | Context assembly latency | <50ms | Instrumented |
 | Model inference latency (50 tokens) | <2s | Instrumented |
@@ -607,15 +629,15 @@ ponytail: at peak, this leaves <1GB headroom. ASR and TTS are never active simul
 
 Phase 0 is complete when:
 
-1. Core architecture is documented (deliverables A–X present).
+1. Architecture is documented (deliverables A–X present).
 2. Phase 1 dependencies are resolved (no blocking questions remain for Phase 1).
-3. World State, Memory, Attention, Context, and Reasoning responsibilities are distinct.
-4. Attention and response decisions are explicitly separated.
-5. Perception events have correlation semantics defined.
-6. Model implementations are documented as replaceable behind interfaces.
-7. Performance numbers are documented as measurable targets, not architectural guarantees.
-8. Non-blocking architectural questions are explicitly deferred to later phases.
-9. Architecture diagrams and repository structure are consistent with written descriptions.
-10. Phase 1 can begin without requiring architectural redesign.
+3. World State is distinct from Memory.
+4. Attention is distinct from Response Decision.
+5. Events have correlation semantics.
+6. Models are replaceable.
+7. Performance values are measurable targets.
+8. Non-blocking questions are deferred explicitly.
+9. Phase 1 audio/event contracts are defined.
+10. Phase 1 can begin without architectural redesign.
 
-**Status: Phase 0 APPROVED. Phase 1 implementation may begin.**
+**Status: PHASE 0 APPROVED — READY FOR PHASE 1 IMPLEMENTATION.**

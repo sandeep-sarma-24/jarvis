@@ -84,7 +84,7 @@ Sources: [Contra Collective comparison](https://contracollective.com/blog/llama-
 | Redis Pub/Sub | ~0.5ms | No (fire-and-forget) | Low-Medium (separate process) | High (author's day job) |
 | ZeroMQ | ~0.1ms | No | Low | Low |
 
-**Current implementation: asyncio queues for V1.** For a single-process Python monolith, in-process async queues are the correct abstraction. Zero infrastructure, zero latency, zero failure modes. The event bus is just a typed async queue with subscriber registration.
+**Current implementation: bounded asyncio queues for V1.** For a single-process Python monolith, in-process async queues are the correct abstraction. Zero infrastructure, zero latency, zero failure modes. The event bus is a typed bounded async queue with subscriber registration. Each subscriber gets a bounded queue (default 256 events); if a subscriber falls behind, the oldest event is dropped and a warning logged. Audio capture must never block because an event consumer is slow.
 
 **When to reconsider NATS:** If the system splits into multiple processes (e.g., a separate perception daemon), NATS becomes the obvious upgrade. The interface (`publish(event)` / `subscribe(pattern, handler)`) is the same shape either way — only the transport changes.
 
@@ -113,7 +113,7 @@ jarvis/
 │   │
 │   ├── audio/
 │   │   ├── __init__.py
-│   │   ├── capture.py             # Microphone capture (pyaudio/sounddevice)
+│   │   ├── capture.py             # Microphone capture (sounddevice callback + bounded buffer)
 │   │   ├── vad.py                 # VAD wrapper (Silero)
 │   │   └── asr.py                 # ASR wrapper (Qwen3-ASR)
 │   │
@@ -133,7 +133,7 @@ jarvis/
 │   ├── events/
 │   │   ├── __init__.py
 │   │   ├── bus.py                 # Event bus (asyncio-based pub/sub)
-│   │   └── types.py               # Event dataclasses (PerceptionEvent, etc.)
+│   │   └── types.py               # Event dataclasses (Event, SpeechEvent, etc.)
 │   │
 │   ├── attention/
 │   │   ├── __init__.py
@@ -238,6 +238,7 @@ class Modality(Enum):
     AUDIO = auto()
     VISUAL = auto()
     SCREEN = auto()
+    SYSTEM = auto()
 
 class Decision(Enum):
     """ResponseDecision action tags (parsed from LLM output)."""
@@ -255,34 +256,46 @@ class PermissionLevel(Enum):
 
 # ─── Events ────────────────────────────────────────────────────────────
 
-@dataclass
-class PerceptionEvent:
-    id: str
-    timestamp: float
-    source: Modality
-    session_id: str
-    correlation_id: str
-    importance_hint: float = 0.5
+# Canonical event envelope — the contract used by every subsystem.
+# All perception events extend this base.
 
 @dataclass
-class SpeechEvent(PerceptionEvent):
+class Event:
+    """Base event envelope. Every event in the system carries these fields."""
+    id: str                     # Uniquely identifies this event (UUID)
+    timestamp: float            # When the event occurred (Unix timestamp)
+    session_id: str             # Current JARVIS runtime/session identifier
+    correlation_id: str | None  # Cross-modal grouping (None if uncorrelated)
+    source: Modality            # Originating modality
+    confidence: float           # Perception confidence (0.0 - 1.0)
+
+@dataclass
+class SpeechEvent(Event):
+    """Phase 1: speech perception event."""
     transcript: str = ""
-    confidence: float = 0.0
     duration_seconds: float = 0.0
     is_question: bool = False
 
 @dataclass
-class VisualEvent(PerceptionEvent):
+class VisualEvent(Event):
+    """Phase 7+: visual perception event."""
     description: str = ""
     objects: list[str] = field(default_factory=list)
     scene_change_magnitude: float = 0.0
 
 @dataclass
-class ScreenEvent(PerceptionEvent):
+class ScreenEvent(Event):
+    """Phase 9+: screen perception event."""
     app_name: str = ""
     window_title: str = ""
     visible_text: str = ""
     change_type: str = ""
+
+@dataclass
+class SystemEvent(Event):
+    """Internal system lifecycle events (startup, shutdown, errors)."""
+    event_type: str = ""
+    detail: str = ""
 
 
 # ─── Attention ──────────────────────────────────────────────────────────
@@ -298,7 +311,7 @@ class AttentionDecision:
 
 class AttentionEngine(ABC):
     @abstractmethod
-    async def evaluate(self, event: PerceptionEvent) -> AttentionDecision:
+    async def evaluate(self, event: Event) -> AttentionDecision:
         ...
 
 
@@ -306,7 +319,7 @@ class AttentionEngine(ABC):
 
 class WorldStateManager(ABC):
     @abstractmethod
-    def update(self, event: PerceptionEvent) -> None:
+    def update(self, event: Event) -> None:
         ...
 
     @abstractmethod
@@ -362,7 +375,7 @@ class AssembledContext:
 
 class ContextBuilder(ABC):
     @abstractmethod
-    async def build(self, event: PerceptionEvent, attention: AttentionDecision, world: 'WorldState') -> AssembledContext:
+    async def build(self, event: Event, attention: AttentionDecision, world: 'WorldState') -> AssembledContext:
         ...
 
 
@@ -448,11 +461,27 @@ class ToolRegistry(ABC):
 
 from typing import Callable, Awaitable
 
-EventHandler = Callable[[PerceptionEvent], Awaitable[None]]
+EventHandler = Callable[[Event], Awaitable[None]]
 
 class EventBus(ABC):
+    """
+    In-process asyncio event bus with bounded queues.
+
+    Backpressure policy:
+    - Each subscriber has a bounded asyncio.Queue (default capacity: 256 events).
+    - Audio capture must NEVER block because a consumer is slow.
+    - publish() is non-blocking: if a subscriber queue is full, the oldest
+      event in that queue is dropped and a warning is logged.
+    - Finalized SpeechEvents must not be silently lost under normal operation.
+      Queue saturation is logged at WARNING level with event id and subscriber name.
+    - The bounded queue prevents unbounded memory growth if a consumer stalls.
+
+    Overflow behavior (Phase 1):
+      Producer faster than consumer → bounded queue → drop oldest + log warning
+    """
+
     @abstractmethod
-    async def publish(self, event: PerceptionEvent) -> None:
+    async def publish(self, event: Event) -> None:
         ...
 
     @abstractmethod

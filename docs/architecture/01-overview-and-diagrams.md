@@ -47,10 +47,10 @@ Tradeoffs explicitly acknowledged:
 ```mermaid
 flowchart TB
     subgraph Perception["Perception Layer"]
-        MIC[Microphone Capture]
+        MIC[Microphone Capture<br/>PortAudio callback ? bounded buffer]
         CAM[Camera Capture]
         SCR[Screen Capture]
-        VAD[Voice Activity Detection]
+        VAD[Voice Activity Detection<br/>asyncio consumer]
         ASR[Speech Recognition]
         FD[Frame Differencing]
         VP[Vision Perception]
@@ -59,7 +59,7 @@ flowchart TB
     end
 
     subgraph Events["Event Bus"]
-        EB[Event Bus<br/>In-Process AsyncIO<br/>Correlation-aware]
+        EB[Event Bus<br/>Bounded AsyncIO Queues<br/>Correlation-aware]
     end
 
     subgraph Attention["Attention Engine"]
@@ -147,13 +147,13 @@ flowchart TB
 ```mermaid
 flowchart LR
     subgraph Input["Raw Input Streams"]
-        A1[Audio<br/>16kHz PCM]
+        A1[Audio<br/>16kHz PCM<br/>callback ? buffer]
         V1[Video<br/>Adaptive FPS]
         S1[Screen<br/>Periodic Capture]
     end
 
     subgraph Processing["Local Processing"]
-        A2[VAD<br/>30ms chunks]
+        A2[VAD<br/>asyncio consumer<br/>30ms chunks]
         A3[ASR]
         V2[Frame Diff<br/>Pixel Delta]
         V3[Scene Description<br/>LLM if needed]
@@ -225,7 +225,9 @@ sequenceDiagram
 
     Note over Mic,TTS: Typical flow: user speaks, system decides whether to reason, then whether to respond
 
-    Mic->>VAD: Continuous 30ms audio chunks
+    Mic->>Mic: PortAudio callback ? bounded buffer
+    Note over Mic: OS thread, no asyncio
+    Mic->>VAD: Asyncio consumer reads 30ms chunks
     VAD->>VAD: Speech detected?
     VAD-->>Obs: No speech -> discard
 
