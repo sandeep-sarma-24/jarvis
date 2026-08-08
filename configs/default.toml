@@ -1,0 +1,21 @@
+[audio]
+sample_rate = 16000
+channels = 1
+dtype = "float32"
+ring_buffer_seconds = 30
+chunk_samples = 512  # Silero VAD requires 512 samples (32ms) at 16kHz
+
+[vad]
+threshold = 0.5
+speech_end_silence_ms = 300
+minimum_speech_ms = 250
+maximum_segment_seconds = 30
+
+[asr]
+model = "Qwen/Qwen3-ASR-0.6B"
+
+[event_bus]
+subscriber_queue_size = 256
+
+[logging]
+level = "INFO"
