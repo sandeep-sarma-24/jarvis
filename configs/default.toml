@@ -51,3 +51,9 @@ volume = 1.0
 
 [logging]
 level = "INFO"
+
+[memory]
+enabled = true
+database_path = "~/.jarvis/jarvis.db"
+max_retrieved_memories = 5
+max_recent_messages = 8

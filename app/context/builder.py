@@ -2,6 +2,9 @@
 
 Selects recent relevant working-memory entries, enforces character and message
 limits, and ensures the current event is always preserved.
+
+Phase 5 extends context with persistent conversation history and relevant memories.
+Priority: current request > recent conversation > relevant memory.
 """
 from __future__ import annotations
 
@@ -22,8 +25,10 @@ class Context:
     system_prompt: str
     current_event: SpeechEvent
     recent_events: tuple[WorkingMemoryEntry, ...]
-    metadata: dict[str, object]
-    total_characters: int
+    conversation_messages: tuple[dict[str, str], ...] = ()
+    memory_context: tuple[str, ...] = ()
+    metadata: dict[str, object] = field(default_factory=dict)
+    total_characters: int = 0
 
 
 def _load_system_prompt(path: Path | None = None) -> str:
@@ -41,6 +46,7 @@ class ContextBuilder:
     - Total context stays within max_characters.
     - At most max_messages recent entries are included.
     - Recent meaningful interactions are preferred.
+    - Persistent conversation and memories are included within budget.
     """
 
     def __init__(
@@ -49,9 +55,11 @@ class ContextBuilder:
         max_messages: int = 8,
         max_characters: int = 6000,
         system_prompt_path: Path | None = None,
+        max_memory_items: int = 5,
     ) -> None:
         self._max_messages = max_messages
         self._max_characters = max_characters
+        self._max_memory_items = max_memory_items
         self._system_prompt = _load_system_prompt(system_prompt_path)
 
     @property
@@ -62,11 +70,35 @@ class ContextBuilder:
         self,
         event: SpeechEvent,
         working_memory: WorkingMemory,
+        *,
+        conversation_messages: list[dict[str, str]] | None = None,
+        memory_context: list[str] | None = None,
     ) -> Context:
         budget = self._max_characters
         budget -= len(self._system_prompt)
         budget -= len(event.transcript)
 
+        # Phase 5: include persistent conversation messages within budget
+        conv_msgs: list[dict[str, str]] = []
+        if conversation_messages:
+            for msg in conversation_messages:
+                cost = len(msg.get("content", ""))
+                if budget - cost < 0:
+                    break
+                conv_msgs.append(msg)
+                budget -= cost
+
+        # Phase 5: include relevant memories within budget
+        mem_ctx: list[str] = []
+        if memory_context:
+            for mem_str in memory_context[: self._max_memory_items]:
+                cost = len(mem_str)
+                if budget - cost < 0:
+                    break
+                mem_ctx.append(mem_str)
+                budget -= cost
+
+        # Phase 1-4 working memory selection with remaining budget
         recent = self._select_recent(
             working_memory, budget, exclude_event_id=event.id,
         )
@@ -74,15 +106,21 @@ class ContextBuilder:
             len(self._system_prompt)
             + len(event.transcript)
             + sum(len(e.transcript) for e in recent)
+            + sum(len(m.get("content", "")) for m in conv_msgs)
+            + sum(len(s) for s in mem_ctx)
         )
 
         return Context(
             system_prompt=self._system_prompt,
             current_event=event,
             recent_events=tuple(recent),
+            conversation_messages=tuple(conv_msgs),
+            memory_context=tuple(mem_ctx),
             metadata={
                 "context_built_at": time.time(),
                 "recent_count": len(recent),
+                "conversation_count": len(conv_msgs),
+                "memory_count": len(mem_ctx),
                 "total_characters": total_chars,
             },
             total_characters=total_chars,
@@ -91,15 +129,28 @@ class ContextBuilder:
     def to_messages(self, ctx: Context) -> list[dict[str, str]]:
         """Convert Context into an OpenAI-style message list for the model.
 
-        All working-memory entries are user speech in Phase 3.
-        ponytail: Phase 5 adds JARVIS response tracking in working memory,
-        which will require explicit conversation role distinction here.
+        Order: system → memories (as system note) → conversation history → working memory → current.
         """
         msgs: list[dict[str, str]] = [
             {"role": "system", "content": ctx.system_prompt},
         ]
+
+        # Relevant persistent memories as context
+        if ctx.memory_context:
+            memory_block = "Relevant information:\n" + "\n".join(
+                f"- {m}" for m in ctx.memory_context
+            )
+            msgs.append({"role": "system", "content": memory_block})
+
+        # Persistent conversation history (already has roles)
+        for msg in ctx.conversation_messages:
+            msgs.append({"role": msg["role"], "content": msg["content"]})
+
+        # Working memory entries (Phase 1-4 compatibility)
         for entry in ctx.recent_events:
             msgs.append({"role": "user", "content": entry.transcript})
+
+        # Current request always last
         msgs.append({"role": "user", "content": ctx.current_event.transcript})
         return msgs
 

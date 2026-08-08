@@ -1,7 +1,7 @@
 """JARVIS — Microphone → VAD → ASR → Attention → Context → LLM → Response Decision → TTS.
 
 Entry point and lifecycle orchestrator.
-Phase 1 audio pipeline + Phase 2 attention + Phase 3 reasoning + Phase 4 TTS.
+Phase 1 audio pipeline + Phase 2 attention + Phase 3 reasoning + Phase 4 TTS + Phase 5 memory.
 """
 from __future__ import annotations
 
@@ -10,6 +10,7 @@ import logging
 import signal
 import time
 import uuid
+from pathlib import Path
 
 from app.config import JarvisConfig, load_config
 from app.events.bus import EventBus
@@ -140,11 +141,12 @@ async def _audio_pipeline(
 
 # ── Reasoning pipeline ──────────────────────────────────────────────────
 
-def _build_reasoning_handler(cfg: JarvisConfig, attention: AttentionEngine, bus: EventBus):
+def _build_reasoning_handler(cfg: JarvisConfig, attention: AttentionEngine, bus: EventBus, memory_manager=None):
     """Build the attention→context→reasoning→response handler.
 
     Returns the async handler and the model instance (for cleanup).
     Uses a bounded semaphore to limit concurrent reasoning.
+    Phase 5: integrates conversation state and memory retrieval.
     """
     from app.context.builder import ContextBuilder
     from app.reasoning.local_model import OllamaModel
@@ -160,6 +162,7 @@ def _build_reasoning_handler(cfg: JarvisConfig, attention: AttentionEngine, bus:
     context_builder = ContextBuilder(
         max_messages=cfg.reasoning.max_context_messages,
         max_characters=cfg.reasoning.max_context_characters,
+        max_memory_items=cfg.memory.max_retrieved_memories,
     )
 
     reasoning_sem = asyncio.Semaphore(cfg.reasoning.max_concurrent_requests)
@@ -199,8 +202,42 @@ def _build_reasoning_handler(cfg: JarvisConfig, attention: AttentionEngine, bus:
 
         _metrics["reasoning_requests"] += 1
 
+        # Phase 5: persist user message
+        conversation = memory_manager.conversation if memory_manager else None
+        if conversation and not conversation.has_message_for_event(event.id):
+            await asyncio.to_thread(
+                conversation.add_user_message, event.transcript, event.id
+            )
+
         async with reasoning_sem:
-            ctx = context_builder.build(event, attention.working_memory)
+            # Phase 5: gather conversation history and relevant memories
+            conv_messages: list[dict[str, str]] | None = None
+            mem_context: list[str] | None = None
+
+            if conversation and cfg.memory.enabled:
+                recent = await asyncio.to_thread(
+                    conversation.recent_messages, cfg.memory.max_recent_messages
+                )
+                # Exclude the current message from history
+                conv_messages = [
+                    {"role": m.role, "content": m.content}
+                    for m in recent
+                    if m.source_event_id != event.id
+                ]
+
+                # Retrieve relevant memories
+                if memory_manager:
+                    memories = await asyncio.to_thread(
+                        memory_manager.search, event.transcript, cfg.memory.max_retrieved_memories
+                    )
+                    if memories:
+                        mem_context = [m.content for m in memories]
+
+            ctx = context_builder.build(
+                event, attention.working_memory,
+                conversation_messages=conv_messages,
+                memory_context=mem_context,
+            )
             messages = context_builder.to_messages(ctx)
 
             reasoning_logger.debug(
@@ -231,6 +268,13 @@ def _build_reasoning_handler(cfg: JarvisConfig, attention: AttentionEngine, bus:
 
         if resp.respond and resp.text:
             _metrics["responses_generated"] += 1
+
+            # Phase 5: persist assistant response before publishing
+            if conversation:
+                await asyncio.to_thread(
+                    conversation.add_assistant_message, resp.text, event.id + "_response"
+                )
+
             print(
                 f"\n[REASONING]\n"
                 f"  model={result.model}\n"
@@ -378,6 +422,22 @@ async def run(cfg: JarvisConfig | None = None) -> None:
     logger.info("JARVIS session %s starting", session_id[:12])
     logger.info("Microphone capture will be active — audio is processed locally, never stored.")
 
+    # 0. Memory (Phase 5)
+    memory_manager = None
+    if cfg.memory.enabled:
+        from app.memory.manager import MemoryManager
+        from app.memory.sqlite_store import SQLiteStore
+
+        db_path = Path(cfg.memory.database_path).expanduser()
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SQLiteStore(db_path)
+        memory_manager = MemoryManager(store)
+        memory_manager.start_session()
+        logger.info(
+            "Memory active — db=%s session=%s",
+            db_path, memory_manager.conversation.session_id[:12],
+        )
+
     # 1. EventBus
     bus = EventBus(queue_size=cfg.event_bus.subscriber_queue_size)
     bus.subscribe(SpeechEvent, _console_handler)
@@ -397,7 +457,7 @@ async def run(cfg: JarvisConfig | None = None) -> None:
         )
 
         if cfg.reasoning.enabled:
-            handler, model_cleanup = _build_reasoning_handler(cfg, attention, bus)
+            handler, model_cleanup = _build_reasoning_handler(cfg, attention, bus, memory_manager)
             bus.subscribe(SpeechEvent, handler)
             logger.info(
                 "Reasoning pipeline active — model=%s max_concurrent=%d",
@@ -473,6 +533,8 @@ async def run(cfg: JarvisConfig | None = None) -> None:
         tts_cleanup.close()
     if model_cleanup is not None:
         model_cleanup.close()
+    if memory_manager is not None:
+        memory_manager.close()
 
     logger.info(
         "Session %s ended — chunks=%d dropped=%d segments=%d transcribed=%d failed=%d max_depth=%d",

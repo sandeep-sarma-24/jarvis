@@ -82,6 +82,14 @@ class LoggingConfig:
 
 
 @dataclass
+class MemoryConfig:
+    enabled: bool = True
+    database_path: str = "~/.jarvis/jarvis.db"
+    max_retrieved_memories: int = 5
+    max_recent_messages: int = 8
+
+
+@dataclass
 class JarvisConfig:
     audio: AudioConfig = field(default_factory=AudioConfig)
     vad: VADConfig = field(default_factory=VADConfig)
@@ -93,6 +101,7 @@ class JarvisConfig:
     tts: TTSConfig = field(default_factory=TTSConfig)
     playback: PlaybackConfig = field(default_factory=PlaybackConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
+    memory: MemoryConfig = field(default_factory=MemoryConfig)
 
 
 def load_config(path: Path | None = None) -> JarvisConfig:
@@ -124,4 +133,6 @@ def load_config(path: Path | None = None) -> JarvisConfig:
         cfg.playback = PlaybackConfig(**{k: v for k, v in raw["playback"].items() if k in PlaybackConfig.__dataclass_fields__})
     if "logging" in raw:
         cfg.logging = LoggingConfig(**{k: v for k, v in raw["logging"].items() if k in LoggingConfig.__dataclass_fields__})
+    if "memory" in raw:
+        cfg.memory = MemoryConfig(**{k: v for k, v in raw["memory"].items() if k in MemoryConfig.__dataclass_fields__})
     return cfg
