@@ -1,4 +1,9 @@
-"""Integration tests: fusion → context builder → LLM messages."""
+"""Integration tests: fusion → context builder → LLM messages.
+
+Tests the corrected Phase 8 architecture where fusion receives events
+independently of attention, and multimodal context (not just visual)
+reaches the ContextBuilder.
+"""
 
 from __future__ import annotations
 
@@ -31,6 +36,16 @@ def _visual(description: str, ts: float = 0.0) -> VisualEvent:
     )
 
 
+def _mm_ctx_from_snap(snap, event_id: str | None = None):
+    """Format multimodal context from snapshot, as main.py does."""
+    parts = []
+    for obs in snap.audio_observations:
+        parts.append(f"[audio] {obs}")
+    for obs in snap.visual_observations:
+        parts.append(f"[visual] {obs}")
+    return parts if parts else None
+
+
 class TestFusionContextIntegration:
     """Verify fused context reaches the reasoning model correctly."""
 
@@ -41,11 +56,14 @@ class TestFusionContextIntegration:
             enabled=True, window_seconds=10.0, max_events=20, max_characters=3000,
         ))
 
-        fusion.ingest(_visual("Python traceback visible.", ts=now))
-        fusion.ingest(_speech("What is wrong with this?", ts=now + 2.0))
+        visual = _visual("Python traceback visible.", ts=now)
+        speech = _speech("What is wrong with this?", ts=now + 2.0)
 
-        snap = fusion.snapshot(reference_time=now + 2.0)
-        vis_ctx = list(snap.visual_observations)
+        fusion.ingest(visual)
+        fusion.ingest(speech)
+
+        snap = fusion.snapshot(reference_time=speech.timestamp, exclude_event_ids={speech.id})
+        mm_ctx = _mm_ctx_from_snap(snap)
 
         builder = ContextBuilder(
             max_characters=6000,
@@ -53,18 +71,16 @@ class TestFusionContextIntegration:
             max_visual_context_characters=500,
         )
         wm = WorkingMemory(max_size=10)
-        event = _speech("What is wrong with this?", ts=now + 2.0)
 
-        ctx = builder.build(event, wm, visual_context=vis_ctx)
+        ctx = builder.build(speech, wm, multimodal_context=mm_ctx)
         messages = builder.to_messages(ctx)
 
-        # Visual context should be in messages
-        visual_msgs = [m for m in messages if "visual context" in m.get("content", "").lower()]
-        assert len(visual_msgs) == 1
-        assert "Python traceback visible." in visual_msgs[0]["content"]
+        obs_msgs = [m for m in messages if "Recent observations" in m.get("content", "")]
+        assert len(obs_msgs) == 1
+        assert "[visual] Python traceback visible." in obs_msgs[0]["content"]
 
     def test_no_visual_when_expired(self):
-        """When visual event has expired, context has no visual block."""
+        """When visual event has expired, context has no observations block."""
         now = time.time()
         fusion = MultimodalFusion(FusionConfig(
             enabled=True, window_seconds=10.0, max_events=20, max_characters=3000,
@@ -72,55 +88,58 @@ class TestFusionContextIntegration:
 
         fusion.ingest(_visual("Old scene", ts=now - 30.0))
 
-        snap = fusion.snapshot(reference_time=now)
-        vis_ctx = list(snap.visual_observations) or None
+        speech = _speech("What is wrong with this?", ts=now)
+        fusion.ingest(speech)
+
+        snap = fusion.snapshot(reference_time=speech.timestamp, exclude_event_ids={speech.id})
+        mm_ctx = _mm_ctx_from_snap(snap)
 
         builder = ContextBuilder(max_characters=6000)
         wm = WorkingMemory(max_size=10)
-        event = _speech("What is wrong with this?", ts=now)
 
-        ctx = builder.build(event, wm, visual_context=vis_ctx)
+        ctx = builder.build(speech, wm, multimodal_context=mm_ctx)
         messages = builder.to_messages(ctx)
 
-        visual_msgs = [m for m in messages if "visual context" in m.get("content", "").lower()]
-        assert len(visual_msgs) == 0
+        obs_msgs = [m for m in messages if "Recent observations" in m.get("content", "")]
+        assert len(obs_msgs) == 0
 
     def test_audio_only_unchanged(self):
-        """When fusion has no visual observations, behavior matches pre-Phase 8."""
+        """When fusion has only the current speech (excluded), no multimodal block appears."""
         now = time.time()
         fusion = MultimodalFusion(FusionConfig(
             enabled=True, window_seconds=10.0, max_events=20, max_characters=3000,
         ))
 
-        fusion.ingest(_speech("Just a question", ts=now))
+        speech = _speech("Just a question", ts=now)
+        fusion.ingest(speech)
 
-        snap = fusion.snapshot(reference_time=now)
-        vis_ctx = list(snap.visual_observations) or None
+        snap = fusion.snapshot(reference_time=speech.timestamp, exclude_event_ids={speech.id})
+        mm_ctx = _mm_ctx_from_snap(snap)
 
         builder = ContextBuilder(max_characters=6000)
         wm = WorkingMemory(max_size=10)
-        event = _speech("Just a question", ts=now)
 
-        ctx = builder.build(event, wm, visual_context=vis_ctx)
+        ctx = builder.build(speech, wm, multimodal_context=mm_ctx)
         messages = builder.to_messages(ctx)
 
-        # No visual block
-        visual_msgs = [m for m in messages if "visual context" in m.get("content", "").lower()]
-        assert len(visual_msgs) == 0
+        obs_msgs = [m for m in messages if "Recent observations" in m.get("content", "")]
+        assert len(obs_msgs) == 0
 
     def test_context_bounded_by_chars(self):
-        """Visual context from fusion respects ContextBuilder character limits."""
+        """Multimodal context from fusion respects ContextBuilder character limits."""
         now = time.time()
         fusion = MultimodalFusion(FusionConfig(
             enabled=True, window_seconds=60.0, max_events=100, max_characters=10000,
         ))
 
-        # Add many visual observations
         for i in range(20):
             fusion.ingest(_visual(f"Visual observation {i} " * 10, ts=now + i * 0.1))
 
-        snap = fusion.snapshot(reference_time=now + 2.0)
-        vis_ctx = list(snap.visual_observations)
+        speech = _speech("Describe what you see", ts=now + 2.0)
+        fusion.ingest(speech)
+
+        snap = fusion.snapshot(reference_time=speech.timestamp, exclude_event_ids={speech.id})
+        mm_ctx = _mm_ctx_from_snap(snap)
 
         builder = ContextBuilder(
             max_characters=6000,
@@ -128,25 +147,19 @@ class TestFusionContextIntegration:
             max_visual_context_characters=200,
         )
         wm = WorkingMemory(max_size=10)
-        event = _speech("Describe what you see", ts=now + 2.0)
 
-        ctx = builder.build(event, wm, visual_context=vis_ctx)
-        # Visual context is bounded by builder limits, not fusion limits
-        assert len(ctx.visual_context) <= 3
-        vis_chars = sum(len(v) for v in ctx.visual_context)
-        assert vis_chars <= 200
+        ctx = builder.build(speech, wm, multimodal_context=mm_ctx)
+        # Multimodal context is bounded by builder limits
+        assert len(ctx.multimodal_context) <= 3
+        mm_chars = sum(len(s) for s in ctx.multimodal_context)
+        assert mm_chars <= 200
 
 
 class TestAttentionIntegration:
-    """Verify fusion does not bypass attention — tested via main.py wiring.
+    """Verify that fusion is independent of attention in the corrected architecture."""
 
-    The visual attention handler gates what enters fusion. We test that
-    non-attention-worthy events don't enter fusion by simulating the
-    main.py flow logic.
-    """
-
-    def test_fusion_receives_only_attention_worthy_visuals(self):
-        """Simulates the gating: only attention-worthy visuals enter fusion."""
+    def test_all_visuals_enter_fusion_regardless_of_attention(self):
+        """Corrected architecture: ALL visual events enter fusion, not just attention-worthy ones."""
         from app.attention.engine import AttentionEngine
 
         now = time.time()
@@ -156,22 +169,23 @@ class TestAttentionIntegration:
 
         engine = AttentionEngine(reason_threshold=0.4)
 
-        # Low-confidence event — attention won't pass it
+        # Low-confidence event — attention rejects it
         low = _visual("Boring scene", ts=now)
         low.confidence = 0.1
         low.event_type = "OBJECT_DETECTED"
         decision = engine.evaluate_visual(low)
-        if decision.should_reason:
-            fusion.ingest(low)
+        assert not decision.should_reason
 
-        # High-confidence scene change — attention passes it
+        # In the corrected architecture, fusion receives it anyway
+        fusion.ingest(low)
+
+        # High-confidence scene change
         high = _visual("Person entering room", ts=now + 1.0)
         high.confidence = 0.9
         high.event_type = "SCENE_CHANGE"
-        decision = engine.evaluate_visual(high)
-        if decision.should_reason:
-            fusion.ingest(high)
+        fusion.ingest(high)
 
         snap = fusion.snapshot(reference_time=now + 1.0)
-        assert "Boring scene" not in snap.visual_observations
+        # Both events are in fusion — attention is not a gate for fusion
+        assert "Boring scene" in snap.visual_observations
         assert "Person entering room" in snap.visual_observations

@@ -721,3 +721,92 @@ Performance figures are engineering targets based on available benchmarks and mu
 | mlx-qwen3-asr | ASR | Mac only | Python API | Speech recognition |
 | Silero VAD | VAD | Both | Python (ONNX) | Voice activity detection |
 | LiteRT-LM | Potential Ollama replacement | Both | OpenAI-compat | Google's runtime; potentially higher throughput but newer |
+
+---
+
+## Multimodal Fusion (Phase 8)
+
+### Architecture
+
+```
+Audio Perception ????????????????
+                                ?
+Visual Perception ?????????????????? Multimodal Fusion
+                                ?           ?
+                                ?           ?
+                                ?       Attention
+                                ?           ?
+                                ?????????????
+                                            ?
+                                     Context Builder
+                                            ?
+                                       Local LLM
+                                            ?
+                                    Response Decision
+                                            ?
+                                           TTS
+```
+
+### Design Principles
+
+- **Fusion is temporal correlation.** It determines which observations belong together in time.
+- **Fusion is not reasoning.** It never invokes an LLM or performs semantic inference.
+- **Fusion is not memory.** It is ephemeral, in-process, and bounded.
+- **Fusion does not persist raw sensory data.** Only structured text observations.
+- **Fusion does not block capture.** Ingest is sub-microsecond; no I/O or network calls.
+
+### Event Flow
+
+```
+SpeechEvent ?????? Fusion (all speech enters)
+                      ?
+VisualEvent ?????? Fusion (all visuals enter, independent of attention)
+                      ?
+                      ?
+              Bounded temporal buffer
+              (window_seconds, max_events, max_characters)
+                      ?
+                      ?
+              snapshot(reference_time=event.timestamp)
+                      ?
+                      ?
+              MultimodalSnapshot
+              (audio_observations, visual_observations, source_event_ids)
+                      ?
+                      ?
+              ContextBuilder.build(multimodal_context=...)
+                      ?
+                      ?
+              LLM receives: "Recent observations:\n- [audio] ...\n- [visual] ..."
+```
+
+### Key Design Decisions
+
+1. **Fusion receives events independently of attention.** Attention gates whether reasoning occurs; fusion provides temporal context regardless of salience.
+2. **Snapshot uses event timestamp, not wall-clock.** The snapshot represents the situation at the time the user spoke, not when the reasoning handler executes.
+3. **Current event is excluded from the snapshot.** The user's current speech is already the user message; fusion provides *context around* it.
+4. **Multimodal context replaces legacy visual_context when enabled.** ContextBuilder prioritizes the fused representation which includes both audio and visual observations.
+5. **Upstream deduplication is trusted.** Fusion does not re-deduplicate visual observations ? the EventDeduplicator prevents repeated identical descriptions.
+
+### Configuration
+
+```toml
+[fusion]
+enabled = true
+window_seconds = 15.0   # temporal correlation window
+max_events = 20         # max observations in buffer
+max_characters = 3000   # max total content characters
+```
+
+### Bounds
+
+| Limit | Scope | Default |
+|-------|-------|---------|
+| `window_seconds` | Fusion storage | 15s |
+| `max_events` | Fusion storage | 20 |
+| `max_characters` | Fusion storage | 3000 |
+| `max_visual_context_characters` | ContextBuilder LLM budget | 500 |
+| `max_visual_events` | ContextBuilder LLM budget | 5 |
+| `max_context_characters` | Total LLM context | 6000 |
+
+Fusion storage limits and ContextBuilder LLM context limits are intentionally distinct. Fusion may buffer more than the LLM receives.

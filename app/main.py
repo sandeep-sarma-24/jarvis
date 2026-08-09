@@ -151,6 +151,27 @@ async def _audio_pipeline(
         _metrics["events_dropped"] = bus.events_dropped
 
 
+# ── Multimodal context formatting ─────────────────────────────────────────
+
+def _format_multimodal_context(snap) -> list[str] | None:
+    """Format a fusion snapshot into context strings for ContextBuilder.
+
+    Returns structured observations tagged by modality. The current event
+    is excluded at the snapshot level (via exclude_event_ids), so all
+    observations here are contextual — prior speech and visual observations
+    that form the temporal situation around the current request.
+    """
+    parts: list[str] = []
+
+    for obs in snap.audio_observations:
+        parts.append(f"[audio] {obs}")
+
+    for obs in snap.visual_observations:
+        parts.append(f"[visual] {obs}")
+
+    return parts if parts else None
+
+
 # ── Reasoning pipeline ──────────────────────────────────────────────────
 
 def _build_reasoning_handler(
@@ -257,10 +278,16 @@ def _build_reasoning_handler(
                         mem_context = [m.content for m in memories]
 
             # Phase 8: use fused multimodal context; Phase 6 fallback to ring
+            multimodal_ctx: list[str] | None = None
             vis_ctx: list[str] | None = None
             if fusion and fusion.enabled:
-                snap = fusion.snapshot()
-                vis_ctx = list(snap.visual_observations) if snap.visual_observations else None
+                # Snapshot relative to the event being reasoned about, not wall-clock.
+                # Exclude the current event — its transcript is already the user message.
+                snap = fusion.snapshot(
+                    reference_time=event.timestamp,
+                    exclude_event_ids={event.id},
+                )
+                multimodal_ctx = _format_multimodal_context(snap)
                 _metrics["fusion_context_characters"] = snap.total_characters
             elif visual_context_ring:
                 vis_ctx = [desc for _, desc in visual_context_ring]
@@ -270,6 +297,7 @@ def _build_reasoning_handler(
                 conversation_messages=conv_messages,
                 memory_context=mem_context,
                 visual_context=vis_ctx,
+                multimodal_context=multimodal_ctx,
             )
             messages = context_builder.to_messages(ctx)
 
@@ -450,8 +478,8 @@ def _build_visual_attention_handler(
 ):
     """Build a handler that routes VisualEvents through the attention engine.
 
-    Relevant visual events are stored in a bounded ring for context inclusion.
-    Phase 8: attention-worthy visuals are also ingested into fusion.
+    Phase 8: ALL visual events enter fusion for temporal context (independent
+    of attention). Attention only gates the legacy visual_context_ring.
     No automatic LLM response — attention decides relevance only.
     Entries older than max_age_seconds are pruned on each event.
     """
@@ -460,6 +488,10 @@ def _build_visual_attention_handler(
             return
 
         _metrics["visual_events_received"] += 1
+
+        # Phase 8: visual events enter fusion independently of attention
+        if fusion:
+            fusion.ingest(event)
 
         # Prune expired entries: (timestamp, description)
         now = time.time()
@@ -471,8 +503,6 @@ def _build_visual_attention_handler(
         if decision.should_reason:
             _metrics["visual_events_attention_worthy"] += 1
             visual_context_ring.append((now, event.description))
-            if fusion:
-                fusion.ingest(event)
 
     return _handler
 

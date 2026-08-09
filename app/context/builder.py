@@ -28,6 +28,7 @@ class Context:
     conversation_messages: tuple[dict[str, str], ...] = ()
     memory_context: tuple[str, ...] = ()
     visual_context: tuple[str, ...] = ()
+    multimodal_context: tuple[str, ...] = ()
     metadata: dict[str, object] = field(default_factory=dict)
     total_characters: int = 0
 
@@ -79,6 +80,7 @@ class ContextBuilder:
         conversation_messages: list[dict[str, str]] | None = None,
         memory_context: list[str] | None = None,
         visual_context: list[str] | None = None,
+        multimodal_context: list[str] | None = None,
     ) -> Context:
         budget = self._max_characters
         budget -= len(self._system_prompt)
@@ -104,9 +106,23 @@ class ContextBuilder:
                 mem_ctx.append(mem_str)
                 budget -= cost
 
-        # Phase 6: include recent visual context within its own sub-budget
+        # Phase 8: multimodal context (fused audio + visual observations)
+        # Takes priority over legacy visual_context when present.
+        # Uses the same sub-budget as visual context.
+        mm_ctx: list[str] = []
         vis_ctx: list[str] = []
-        if visual_context:
+        if multimodal_context:
+            mm_budget = min(self._max_visual_chars, budget)
+            mm_used = 0
+            for obs in multimodal_context[: self._max_visual_events]:
+                cost = len(obs)
+                if mm_used + cost > mm_budget:
+                    break
+                mm_ctx.append(obs)
+                mm_used += cost
+            budget -= mm_used
+        elif visual_context:
+            # Phase 6 fallback: legacy visual-only context
             vis_budget = min(self._max_visual_chars, budget)
             vis_used = 0
             for desc in visual_context[: self._max_visual_events]:
@@ -128,6 +144,7 @@ class ContextBuilder:
             + sum(len(m.get("content", "")) for m in conv_msgs)
             + sum(len(s) for s in mem_ctx)
             + sum(len(s) for s in vis_ctx)
+            + sum(len(s) for s in mm_ctx)
         )
 
         return Context(
@@ -137,12 +154,14 @@ class ContextBuilder:
             conversation_messages=tuple(conv_msgs),
             memory_context=tuple(mem_ctx),
             visual_context=tuple(vis_ctx),
+            multimodal_context=tuple(mm_ctx),
             metadata={
                 "context_built_at": time.time(),
                 "recent_count": len(recent),
                 "conversation_count": len(conv_msgs),
                 "memory_count": len(mem_ctx),
                 "visual_count": len(vis_ctx),
+                "multimodal_count": len(mm_ctx),
                 "total_characters": total_chars,
             },
             total_characters=total_chars,
@@ -151,7 +170,7 @@ class ContextBuilder:
     def to_messages(self, ctx: Context) -> list[dict[str, str]]:
         """Convert Context into an OpenAI-style message list for the model.
 
-        Order: system → memories (as system note) → conversation history → working memory → current.
+        Order: system → memories → multimodal/visual context → conversation → working memory → current.
         """
         msgs: list[dict[str, str]] = [
             {"role": "system", "content": ctx.system_prompt},
@@ -164,8 +183,14 @@ class ContextBuilder:
             )
             msgs.append({"role": "system", "content": memory_block})
 
-        # Phase 6: recent visual context as system note (text descriptions, never raw frames)
-        if ctx.visual_context:
+        # Phase 8: fused multimodal context (audio + visual observations)
+        if ctx.multimodal_context:
+            mm_block = "Recent observations:\n" + "\n".join(
+                f"- {obs}" for obs in ctx.multimodal_context
+            )
+            msgs.append({"role": "system", "content": mm_block})
+        elif ctx.visual_context:
+            # Phase 6 fallback: visual-only context
             visual_block = "Recent visual context:\n" + "\n".join(
                 f"- {v}" for v in ctx.visual_context
             )

@@ -147,14 +147,26 @@ class MultimodalFusion:
             # Enforce max_characters bound
             self._enforce_char_limit()
 
-    def snapshot(self, reference_time: float | None = None) -> MultimodalSnapshot:
+    def snapshot(
+        self,
+        reference_time: float | None = None,
+        exclude_event_ids: set[str] | None = None,
+    ) -> MultimodalSnapshot:
         """Produce a bounded snapshot of the current multimodal state.
 
         Orders observations by timestamp. Returns only observations within
         the active window relative to reference_time (default: now).
+
+        Args:
+            reference_time: Center of the window (default: wall-clock now).
+                For reasoning about a SpeechEvent, pass event.timestamp so
+                the snapshot represents the situation at the time the user spoke.
+            exclude_event_ids: Event IDs to exclude from the snapshot (e.g. the
+                current SpeechEvent whose transcript is already the user message).
         """
         now = reference_time if reference_time is not None else time.time()
         window_start = now - self._window_seconds
+        exclude = exclude_event_ids or set()
 
         with self._lock:
             # Expire before snapshot
@@ -163,8 +175,11 @@ class MultimodalFusion:
             # Sort by timestamp (handles out-of-order arrivals)
             active = sorted(self._observations, key=lambda o: o.timestamp)
 
-            # Filter to window
-            in_window = [o for o in active if o.timestamp >= window_start]
+            # Filter to window and exclude specified events
+            in_window = [
+                o for o in active
+                if o.timestamp >= window_start and o.event_id not in exclude
+            ]
 
             audio = tuple(o.content for o in in_window if o.modality == Modality.AUDIO)
             visual = tuple(o.content for o in in_window if o.modality == Modality.VISUAL)
