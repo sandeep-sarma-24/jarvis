@@ -126,6 +126,14 @@ class PerceptionConfig:
 
 
 @dataclass
+class FusionConfig:
+    enabled: bool = True
+    window_seconds: float = 15.0
+    max_events: int = 20
+    max_characters: int = 3000
+
+
+@dataclass
 class JarvisConfig:
     audio: AudioConfig = field(default_factory=AudioConfig)
     vad: VADConfig = field(default_factory=VADConfig)
@@ -139,6 +147,7 @@ class JarvisConfig:
     logging: LoggingConfig = field(default_factory=LoggingConfig)
     memory: MemoryConfig = field(default_factory=MemoryConfig)
     perception: PerceptionConfig = field(default_factory=PerceptionConfig)
+    fusion: FusionConfig = field(default_factory=FusionConfig)
 
 
 def load_config(path: Path | None = None) -> JarvisConfig:
@@ -183,4 +192,6 @@ def load_config(path: Path | None = None) -> JarvisConfig:
         if "vision" in p:
             vis = VisionConfig(**{k: v for k, v in p["vision"].items() if k in VisionConfig.__dataclass_fields__})
         cfg.perception = PerceptionConfig(camera=cam, vision=vis, **top)
+    if "fusion" in raw:
+        cfg.fusion = FusionConfig(**{k: v for k, v in raw["fusion"].items() if k in FusionConfig.__dataclass_fields__})
     return cfg

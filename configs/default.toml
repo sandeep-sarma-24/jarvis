@@ -58,6 +58,12 @@ database_path = "~/.jarvis/jarvis.db"
 max_retrieved_memories = 5
 max_recent_messages = 8
 
+[fusion]
+enabled = true
+window_seconds = 15.0
+max_events = 20
+max_characters = 3000
+
 [perception]
 enabled = false  # disabled by default — camera requires explicit opt-in
 max_visual_events = 5

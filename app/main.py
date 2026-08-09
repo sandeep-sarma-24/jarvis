@@ -1,8 +1,8 @@
-"""JARVIS — Multimodal perception → Attention → Context → LLM → Response Decision → TTS.
+"""JARVIS — Multimodal perception → Fusion → Attention → Context → LLM → Response Decision → TTS.
 
 Entry point and lifecycle orchestrator.
 Phase 1 audio + Phase 2 attention + Phase 3 reasoning + Phase 4 TTS + Phase 5 memory
-+ Phase 6 visual perception.
++ Phase 6 visual perception + Phase 8 multimodal fusion.
 """
 from __future__ import annotations
 
@@ -22,6 +22,7 @@ from app.audio.vad import VoiceActivityDetector
 from app.audio.segmentation import SpeechSegmenter
 from app.audio.asr import SpeechRecognizer
 from app.attention.engine import AttentionEngine
+from app.fusion.engine import MultimodalFusion
 from app.memory.working import WorkingMemory
 
 logger = logging.getLogger("jarvis")
@@ -51,6 +52,13 @@ _metrics = {
     "playback_interrupted": 0,
     "visual_events_received": 0,
     "visual_events_attention_worthy": 0,
+    "fusion_events_received": 0,
+    "fusion_events_correlated": 0,
+    "fusion_events_expired": 0,
+    "fusion_events_dropped": 0,
+    "fusion_snapshots_created": 0,
+    "fusion_out_of_order_events": 0,
+    "fusion_context_characters": 0,
 }
 
 
@@ -151,6 +159,7 @@ def _build_reasoning_handler(
     bus: EventBus,
     memory_manager=None,
     visual_context_ring: deque | None = None,
+    fusion: MultimodalFusion | None = None,
 ):
     """Build the attention→context→reasoning→response handler.
 
@@ -158,6 +167,7 @@ def _build_reasoning_handler(
     Uses a bounded semaphore to limit concurrent reasoning.
     Phase 5: integrates conversation state and memory retrieval.
     Phase 6: includes recent visual context.
+    Phase 8: uses fused multimodal context when fusion is enabled.
     """
     from app.context.builder import ContextBuilder
     from app.reasoning.local_model import OllamaModel
@@ -246,8 +256,14 @@ def _build_reasoning_handler(
                     if memories:
                         mem_context = [m.content for m in memories]
 
-            # Phase 6: gather recent visual context descriptions (bounded by config)
-            vis_ctx = [desc for _, desc in visual_context_ring] if visual_context_ring else None
+            # Phase 8: use fused multimodal context; Phase 6 fallback to ring
+            vis_ctx: list[str] | None = None
+            if fusion and fusion.enabled:
+                snap = fusion.snapshot()
+                vis_ctx = list(snap.visual_observations) if snap.visual_observations else None
+                _metrics["fusion_context_characters"] = snap.total_characters
+            elif visual_context_ring:
+                vis_ctx = [desc for _, desc in visual_context_ring]
 
             ctx = context_builder.build(
                 event, attention.working_memory,
@@ -430,10 +446,12 @@ def _build_visual_attention_handler(
     attention: AttentionEngine,
     visual_context_ring: deque,
     max_age_seconds: float,
+    fusion: MultimodalFusion | None = None,
 ):
     """Build a handler that routes VisualEvents through the attention engine.
 
     Relevant visual events are stored in a bounded ring for context inclusion.
+    Phase 8: attention-worthy visuals are also ingested into fusion.
     No automatic LLM response — attention decides relevance only.
     Entries older than max_age_seconds are pruned on each event.
     """
@@ -453,6 +471,8 @@ def _build_visual_attention_handler(
         if decision.should_reason:
             _metrics["visual_events_attention_worthy"] += 1
             visual_context_ring.append((now, event.description))
+            if fusion:
+                fusion.ingest(event)
 
     return _handler
 
@@ -495,6 +515,15 @@ async def run(cfg: JarvisConfig | None = None) -> None:
     # 2. Visual context ring (must exist before reasoning handler references it)
     visual_context_ring: deque[tuple[float, str]] = deque(maxlen=cfg.perception.max_visual_events)
 
+    # 2a. Multimodal fusion (Phase 8)
+    fusion: MultimodalFusion | None = None
+    if cfg.fusion.enabled:
+        fusion = MultimodalFusion(cfg.fusion)
+        logger.info(
+            "Fusion active — window=%.1fs max_events=%d max_chars=%d",
+            cfg.fusion.window_seconds, cfg.fusion.max_events, cfg.fusion.max_characters,
+        )
+
     # 3. Attention + Reasoning pipeline (Phase 2 + 3)
     attention: AttentionEngine | None = None
     model_cleanup = None
@@ -512,7 +541,7 @@ async def run(cfg: JarvisConfig | None = None) -> None:
 
         if cfg.reasoning.enabled:
             handler, model_cleanup = _build_reasoning_handler(
-                cfg, attention, bus, memory_manager, visual_context_ring,
+                cfg, attention, bus, memory_manager, visual_context_ring, fusion,
             )
             bus.subscribe(SpeechEvent, handler)
             logger.info(
@@ -527,6 +556,13 @@ async def run(cfg: JarvisConfig | None = None) -> None:
 
         logger.info("Attention engine active — names=%s threshold=%.2f",
                      cfg.attention.assistant_names, cfg.attention.reason_threshold)
+
+    # 3a. Fusion speech ingestion (Phase 8) — all speech enters fusion
+    if fusion:
+        async def _fusion_speech_handler(event: Event) -> None:
+            if isinstance(event, SpeechEvent):
+                fusion.ingest(event)
+        bus.subscribe(SpeechEvent, _fusion_speech_handler)
 
     # 4. TTS pipeline (Phase 4)
     if cfg.tts.enabled and cfg.playback.enabled:
@@ -602,7 +638,7 @@ async def run(cfg: JarvisConfig | None = None) -> None:
         )
 
         vis_handler = _build_visual_attention_handler(
-            attention, visual_context_ring, cfg.perception.max_visual_event_age_seconds,
+            attention, visual_context_ring, cfg.perception.max_visual_event_age_seconds, fusion,
         )
         bus.subscribe(VisualEvent, vis_handler)
         logger.info(
@@ -714,6 +750,10 @@ async def run(cfg: JarvisConfig | None = None) -> None:
         _metrics["visual_events_received"],
         _metrics["visual_events_attention_worthy"],
     )
+    if fusion:
+        fc = fusion.counters
+        _metrics.update({f"fusion_{k}": v for k, v in fc.items()})
+        logger.info("Fusion: %s", fc)
 
 
 def main() -> None:
