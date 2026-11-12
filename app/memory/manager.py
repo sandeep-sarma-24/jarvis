@@ -4,7 +4,6 @@ from __future__ import annotations
 import logging
 import re
 import time
-from difflib import SequenceMatcher
 
 from app.memory.conversation import ConversationState
 from app.memory.sqlite_store import SQLiteStore, normalize
@@ -40,10 +39,6 @@ def _date(ts: float) -> str:
 
 def _clip(text: str) -> str:
     return text if len(text) <= _MAX_MESSAGE_CHARS else text[: _MAX_MESSAGE_CHARS - 1] + "…"
-
-
-def _near_duplicate(a: str, b: str) -> bool:
-    return a == b or SequenceMatcher(None, a, b).ratio() >= 0.9
 
 
 class MemoryManager:
@@ -123,7 +118,8 @@ class MemoryManager:
 
         Stored memories plus, when cross_session is on, messages from earlier
         sessions (never the current one, which the conversation history covers).
-        Near-identical lines are dropped.
+        Lines whose text differs only in case, punctuation or spacing are
+        dropped (a stricter fuzzy match would merge facts differing in a number).
         """
         if limit <= 0:
             return []
@@ -143,12 +139,12 @@ class MemoryManager:
             ]
         scored.sort(key=lambda x: x[0])
         lines: list[str] = []
-        seen: list[str] = []
+        seen: set[str] = set()
         for _, line, text in scored:
             key = normalize(text)
-            if any(_near_duplicate(key, k) for k in seen):
+            if key in seen:
                 continue
-            seen.append(key)
+            seen.add(key)
             lines.append(line)
             if len(lines) == limit:
                 break

@@ -61,7 +61,6 @@ CREATE TABLE IF NOT EXISTS memories (
     metadata_json TEXT NOT NULL DEFAULT '{}'
 );
 
-CREATE INDEX IF NOT EXISTS idx_messages_session_id ON conversation_messages(session_id);
 CREATE INDEX IF NOT EXISTS idx_messages_timestamp ON conversation_messages(timestamp);
 CREATE INDEX IF NOT EXISTS idx_memories_type ON memories(type);
 CREATE INDEX IF NOT EXISTS idx_memories_created ON memories(created_at);
