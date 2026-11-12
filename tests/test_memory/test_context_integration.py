@@ -109,12 +109,13 @@ class TestContextBoundsWithPhase5:
 
     def test_irrelevant_memories_excluded_from_context(self):
         """Only memories that fit budget are included."""
-        builder = ContextBuilder(max_messages=8, max_characters=1000, max_memory_items=5)
+        budget = len(ContextBuilder().system_prompt) + 340
+        builder = ContextBuilder(max_messages=8, max_characters=budget, max_memory_items=5)
         memory = WorkingMemory(max_size=20)
         mem_ctx = ["x" * 200 for _ in range(5)]
         ctx = builder.build(_speech("current"), memory, memory_context=mem_ctx)
         # Budget constrains how many memories can be included
-        assert ctx.total_characters <= 1000
+        assert ctx.total_characters <= budget
         assert len(ctx.memory_context) < 5
 
 

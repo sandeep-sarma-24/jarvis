@@ -1,4 +1,4 @@
-"""TTS benchmark — measures Kokoro-82M synthesis performance.
+"""TTS benchmark — measures Phonon 31m synthesis performance.
 
 Run: python -m scripts.benchmark_tts
 
@@ -34,7 +34,7 @@ def main() -> None:
     logging_module.getLogger("root").setLevel(logging_module.ERROR)
 
     print("=" * 60)
-    print("JARVIS TTS Benchmark — Kokoro-82M via kokoro-mlx")
+    print("JARVIS TTS Benchmark — Phonon 31m via ptts")
     print("=" * 60)
 
     rss_before = _get_rss_mb()
@@ -42,8 +42,8 @@ def main() -> None:
     # Model initialization
     print("\n[1] Model initialization...")
     t0 = time.perf_counter()
-    from app.tts.local_tts import KokoroTTS
-    tts = KokoroTTS()
+    from app.tts.local_tts import PhononTTS
+    tts = PhononTTS()
     tts.load()
     init_ms = (time.perf_counter() - t0) * 1000
     print(f"    Init time: {init_ms:.0f}ms")
@@ -127,7 +127,7 @@ def main() -> None:
     print("\n" + "=" * 60)
     print("SUMMARY")
     print("=" * 60)
-    print(f"  Model:              Kokoro-82M (bf_emma)")
+    print(f"  Model:              Phonon 31m (Easton)")
     print(f"  Sample rate:        24000 Hz")
     print(f"  Init time:          {init_ms:.0f}ms")
     print(f"  Cold latency:       {cold_ms:.0f}ms")

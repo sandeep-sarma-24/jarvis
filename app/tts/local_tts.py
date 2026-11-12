@@ -1,12 +1,12 @@
-"""Local TTS implementation using Kokoro-82M via mlx-audio.
+"""Local TTS implementation using Gradium Phonon 31m (English) via ptts.
 
-Runs entirely on-device via Apple Silicon MLX. No network required
-after initial model download (~327 MB from HuggingFace Hub).
-
-Synchronous — designed to be called via asyncio.to_thread.
+Runs entirely on-device (Rust runtime, no PyTorch). No network required
+after initial model download (~65 MB q8 GGUF from HuggingFace Hub).
 """
 from __future__ import annotations
 
+import asyncio
+import concurrent.futures
 import logging
 import time
 from typing import Iterator
@@ -18,125 +18,95 @@ from app.tts.model import AudioChunk, TTSResult
 logger = logging.getLogger(__name__)
 
 
-class KokoroTTS:
-    """Kokoro-82M TTS via mlx-audio.
-
-    ponytail: wraps mlx_audio Kokoro model. Upgrade path: swap to
-    Qwen3-TTS/Holler for voice cloning if Kokoro voice quality
-    is insufficient.
-    """
+class PhononTTS:
+    """Phonon 31m English TTS via the ptts package."""
 
     def __init__(
         self,
         *,
-        model_id: str = "mlx-community/Kokoro-82M-bf16",
-        voice: str = "bf_emma",
-        speed: float = 1.0,
-        sample_rate: int = 24000,
+        model_id: str = "hf://gradium/phonon-31m-en",
+        voice: str = "Easton",
+        quant: str = "q8",
     ) -> None:
         self._model_id = model_id
         self._voice = voice
-        self._speed = speed
-        self._sample_rate = sample_rate
+        self._quant = quant
+        self._sample_rate = 24000  # overwritten by the model on load
         self._model: object | None = None
+        # single worker serialises synthesis calls on one model instance
+        self._executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="tts"
+        )
 
     @property
     def model_name(self) -> str:
-        return f"kokoro-82m/{self._voice}"
+        return f"phonon-31m-en/{self._voice}"
 
     def load(self) -> None:
         """Load the model. Downloads weights on first call."""
-        from mlx_audio.tts.generate import load_model
+        import ptts
 
-        logger.info("Loading Kokoro TTS model: %s", self._model_id)
+        logger.info("Loading Phonon TTS model: %s", self._model_id)
         t0 = time.perf_counter()
-        self._model = load_model(self._model_id)
-        elapsed = (time.perf_counter() - t0) * 1000
-        logger.info("Kokoro TTS loaded in %.0fms", elapsed)
+        self._model = ptts.TTS(self._model_id, lang="en", quant=self._quant)
+        self._sample_rate = self._model.sample_rate
+        logger.info("Phonon TTS loaded in %.0fms", (time.perf_counter() - t0) * 1000)
 
     def _ensure_loaded(self):
         if self._model is None:
             self.load()
         return self._model
 
+    def _fail(self, t0: float, error: str) -> TTSResult:
+        return TTSResult(
+            success=False, audio=None, sample_rate=self._sample_rate,
+            channels=1, duration_seconds=0.0,
+            latency_ms=round((time.perf_counter() - t0) * 1000, 1),
+            model=self.model_name, error=error,
+        )
+
     def synthesize(self, text: str) -> TTSResult:
         """Synthesize complete audio from text."""
-        model = self._ensure_loaded()
-
         t0 = time.perf_counter()
         try:
-            # lang_code='a' uses American English G2P (works without espeak)
-            # Voice style (bf_emma = British female) is in the model weights
-            results = list(model.generate(  # type: ignore[union-attr]
-                text,
-                voice=self._voice,
-                speed=self._speed,
-                lang_code="a",
-            ))
-            latency = (time.perf_counter() - t0) * 1000
-
-            if not results:
-                return TTSResult(
-                    success=False, audio=None, sample_rate=self._sample_rate,
-                    channels=1, duration_seconds=0.0, latency_ms=round(latency, 1),
-                    model=self.model_name, error="no audio generated",
-                )
-
-            # Concatenate all result chunks
-            audio_arrays = [np.array(r.audio) for r in results if r.audio is not None]
-            if not audio_arrays:
-                return TTSResult(
-                    success=False, audio=None, sample_rate=self._sample_rate,
-                    channels=1, duration_seconds=0.0, latency_ms=round(latency, 1),
-                    model=self.model_name, error="all chunks empty",
-                )
-
-            audio = np.concatenate(audio_arrays) if len(audio_arrays) > 1 else audio_arrays[0]
-            duration = len(audio) / self._sample_rate
-
-            return TTSResult(
-                success=True,
-                audio=audio,
-                sample_rate=self._sample_rate,
-                channels=1,
-                duration_seconds=duration,
-                latency_ms=round(latency, 1),
-                model=self.model_name,
+            audio = np.asarray(
+                self._ensure_loaded().synth(text, voice=self._voice), dtype=np.float32
             )
         except Exception as exc:
-            latency = (time.perf_counter() - t0) * 1000
             logger.error("TTS synthesis failed: %s", exc)
-            return TTSResult(
-                success=False, audio=None, sample_rate=self._sample_rate,
-                channels=1, duration_seconds=0.0, latency_ms=round(latency, 1),
-                model=self.model_name, error=str(exc),
-            )
+            return self._fail(t0, str(exc))
+        if audio.size == 0:
+            return self._fail(t0, "no audio generated")
+        return TTSResult(
+            success=True,
+            audio=audio,
+            sample_rate=self._sample_rate,
+            channels=1,
+            duration_seconds=len(audio) / self._sample_rate,
+            latency_ms=round((time.perf_counter() - t0) * 1000, 1),
+            model=self.model_name,
+        )
 
     def synthesize_stream(self, text: str) -> Iterator[AudioChunk]:
-        """Synthesize text and yield audio chunks per sentence.
-
-        mlx-audio's Kokoro model.generate() yields results per text segment.
-        """
+        """Yield audio chunks as Phonon's decoder produces them."""
         model = self._ensure_loaded()
-
         try:
-            results = list(model.generate(  # type: ignore[union-attr]
-                text,
-                voice=self._voice,
-                speed=self._speed,
-                lang_code="a",
-            ))
-
-            for i, r in enumerate(results):
-                if r.audio is not None:
-                    audio_np = np.array(r.audio)
-                    yield AudioChunk(
-                        audio=audio_np,
-                        sample_rate=self._sample_rate,
-                        is_last=(i == len(results) - 1),
-                    )
+            with model.stream(text, voice=self._voice) as chunks:
+                prev = None
+                for pcm in chunks:
+                    if prev is not None:
+                        yield AudioChunk(audio=prev, sample_rate=self._sample_rate)
+                    prev = np.asarray(pcm, dtype=np.float32)
+                if prev is not None:
+                    yield AudioChunk(audio=prev, sample_rate=self._sample_rate, is_last=True)
         except Exception as exc:
             logger.error("TTS streaming synthesis failed: %s", exc)
 
+    async def synthesize_async(self, text: str) -> TTSResult:
+        """Async wrapper that runs synthesis off the event loop."""
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(self._executor, self.synthesize, text)
+
     def close(self) -> None:
         self._model = None
+        self._executor.shutdown(wait=False)

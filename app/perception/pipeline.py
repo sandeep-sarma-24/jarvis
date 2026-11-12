@@ -208,7 +208,7 @@ class PerceptionPipeline:
 
         await self._bus.publish(event)
         self.visual_events_emitted += 1
-        logger.debug(
-            "VisualEvent emitted: type=%s desc=%r confidence=%.2f",
-            event_type_name, analysis.description[:80], analysis.confidence,
+        logger.info(
+            "VISUAL type=%s conf=%.2f desc=%r",
+            event_type_name, analysis.confidence, analysis.description,
         )

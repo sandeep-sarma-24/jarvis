@@ -53,14 +53,14 @@ class TestResponseDecisionShape:
 
     def test_frozen(self):
         resp = ResponseDecision(
-            respond=True, text="hi", reason="test", event_id="e1",
+            respond=True, text="hi", thinking=None, reason="test", event_id="e1",
         )
         with pytest.raises(AttributeError):
             resp.respond = False
 
     def test_fields(self):
         resp = ResponseDecision(
-            respond=True, text="hello", reason="test reason", event_id="eid",
+            respond=True, text="hello", thinking=None, reason="test reason", event_id="eid",
         )
         assert isinstance(resp.respond, bool)
         assert isinstance(resp.text, str)
