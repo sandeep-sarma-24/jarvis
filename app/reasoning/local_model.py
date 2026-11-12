@@ -254,6 +254,8 @@ class OllamaModel:
             resp = self._client.post(
                 f"{self._base_url}/api/chat",
                 json={"model": self._model, "messages": [], "keep_alive": self._keep_alive, "stream": False},
+                # A cold load can outlast the per-read timeout; a dead host still fails at connect.
+                timeout=httpx.Timeout(120.0, connect=self._client.timeout.connect),
             )
             resp.raise_for_status()
             logger.info("reasoning model %s warm at %s", self._model, self._base_url)

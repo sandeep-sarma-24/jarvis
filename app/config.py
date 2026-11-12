@@ -72,7 +72,7 @@ class TTSConfig:
     enabled: bool = True
     model: str = "hf://gradium/phonon-31m-en"
     voice: str = "Easton"
-    quant: str = "q8"
+    quant: str = "q8_0"
     max_text_length: int = 2000
 
 
