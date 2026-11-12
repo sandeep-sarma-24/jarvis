@@ -3,12 +3,11 @@
 
 Usage: python -m scripts.benchmark_vision
 
-Requires:
-  - Ollama running locally with a vision-capable model installed
-  - numpy, Pillow (already project dependencies)
+Uses [perception.vision] model, ollama_url, timeout_seconds and max_image_size from
+configs/default.toml. Prints a NOT RUN line and exits 2 if the host is unreachable.
 
-Reports preprocessing, inference, and end-to-end latencies with min/avg/p95/max.
-Also verifies the configured model actually supports image input.
+Reports preprocessing, inference, and end-to-end latencies as P50/P95/P99
+(app.contracts.percentiles). Also verifies the model actually supports image input.
 """
 from __future__ import annotations
 
@@ -16,7 +15,6 @@ import asyncio
 import base64
 import io
 import os
-import statistics
 import sys
 import time
 
@@ -24,32 +22,22 @@ import httpx
 import numpy as np
 from PIL import Image
 
+from app.config import load_config
+from app.contracts import percentiles
+
 ITERATIONS = 10
-MODEL = os.environ.get("JARVIS_VISION_MODEL", "gemma4:12b")
-OLLAMA_URL = os.environ.get("JARVIS_OLLAMA_URL", "http://localhost:11434")
-
-
-def _percentile(data: list[float], p: float) -> float:
-    sorted_data = sorted(data)
-    k = (len(sorted_data) - 1) * (p / 100.0)
-    f = int(k)
-    c = f + 1
-    if c >= len(sorted_data):
-        return sorted_data[f]
-    return sorted_data[f] + (k - f) * (sorted_data[c] - sorted_data[f])
+VISION = load_config().perception.vision
+MODEL = VISION.model
+OLLAMA_URL = VISION.ollama_url
 
 
 def _fmt_stats(label: str, values: list[float], unit: str = "ms") -> str:
-    mn = min(values)
-    avg = statistics.mean(values)
-    p95 = _percentile(values, 95)
-    mx = max(values)
+    p = percentiles(values)
+    if not p["n"]:
+        return f"  {label}: no samples"
     return (
-        f"  {label}:\n"
-        f"    min:  {mn:>8.1f} {unit}\n"
-        f"    avg:  {avg:>8.1f} {unit}\n"
-        f"    p95:  {p95:>8.1f} {unit}\n"
-        f"    max:  {mx:>8.1f} {unit}"
+        f"  {label} (n={p['n']}):\n"
+        + "\n".join(f"    {k}:  {p[k]:>8.1f} {unit}" for k in ("min", "p50", "p95", "p99", "max"))
     )
 
 
@@ -127,8 +115,8 @@ def run() -> None:
     # 1. Check Ollama
     print("1. Ollama availability...")
     if not _check_ollama_available():
-        print("   FAIL — Ollama not reachable at", OLLAMA_URL)
-        sys.exit(1)
+        print(f"NOT RUN: Ollama not reachable at {OLLAMA_URL}")
+        sys.exit(2)
     print("   PASS")
 
     # 2. Check model
@@ -154,7 +142,7 @@ def run() -> None:
         def infer(self, image_b64: str, prompt: str) -> str:
             return '{"event_type":"VISUAL_SUMMARY","description":"benchmark","confidence":0.5}'
 
-    analyzer = LocalVisionAnalyzer(backend=NullBackend(), max_image_size=1024)
+    analyzer = LocalVisionAnalyzer(backend=NullBackend(), max_image_size=VISION.max_image_size)
     frame_data = _create_test_image(640, 480)
     frame = Frame(
         timestamp=time.time(), data=frame_data, width=640, height=480, format="rgb24",
@@ -173,10 +161,10 @@ def run() -> None:
     from app.perception.local_vision import OllamaVisionBackend
 
     backend = OllamaVisionBackend(
-        model=MODEL, base_url=OLLAMA_URL, timeout_seconds=120.0,
+        model=MODEL, base_url=OLLAMA_URL, timeout_seconds=VISION.timeout_seconds,
     )
     real_analyzer = LocalVisionAnalyzer(
-        backend=backend, timeout_seconds=120.0, max_image_size=1024,
+        backend=backend, timeout_seconds=VISION.timeout_seconds, max_image_size=VISION.max_image_size,
     )
 
     inference_times: list[float] = []
