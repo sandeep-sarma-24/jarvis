@@ -26,7 +26,7 @@ class VADConfig:
 
 @dataclass
 class ASRConfig:
-    model: str = "Qwen/Qwen3-ASR-0.6B"
+    model: str = "ibm-granite/granite-speech-5.0-470m-turboctc"
 
 
 @dataclass
@@ -63,10 +63,9 @@ class ResponseConfig:
 @dataclass
 class TTSConfig:
     enabled: bool = True
-    model: str = "mlx-community/Kokoro-82M-bf16"
-    voice: str = "bf_emma"
-    speed: float = 1.0
-    sample_rate: int = 24000
+    model: str = "hf://gradium/phonon-31m-en"
+    voice: str = "Easton"
+    quant: str = "q8"
     max_text_length: int = 2000
 
 

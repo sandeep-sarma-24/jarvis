@@ -365,16 +365,16 @@ class TestInterruptionPolicy:
 
 
 class TestRealTTSSmoke:
-    """Smoke test requiring the actual Kokoro TTS model.
+    """Smoke test requiring the actual Phonon TTS model.
 
     Skipped in normal test runs. Run with: pytest -m model
     """
 
     @pytest.mark.model
-    def test_kokoro_synthesize_short_sentence(self):
-        from app.tts.local_tts import KokoroTTS
+    def test_phonon_synthesize_short_sentence(self):
+        from app.tts.local_tts import PhononTTS
 
-        tts = KokoroTTS()
+        tts = PhononTTS()
         result = tts.synthesize("Hello, this is a test.")
 
         assert result.success is True, f"TTS failed: {result.error}"
@@ -390,10 +390,10 @@ class TestRealTTSSmoke:
         tts.close()
 
     @pytest.mark.model
-    def test_kokoro_stream(self):
-        from app.tts.local_tts import KokoroTTS
+    def test_phonon_stream(self):
+        from app.tts.local_tts import PhononTTS
 
-        tts = KokoroTTS()
+        tts = PhononTTS()
         chunks = list(tts.synthesize_stream(
             "This is a longer sentence. It has multiple parts. Let us see if streaming works."
         ))
@@ -409,9 +409,9 @@ class TestRealTTSSmoke:
     @pytest.mark.model
     def test_model_loaded_once_reused(self):
         """Model loads once on first call, reused for subsequent synthesis."""
-        from app.tts.local_tts import KokoroTTS
+        from app.tts.local_tts import PhononTTS
 
-        tts = KokoroTTS()
+        tts = PhononTTS()
         r1 = tts.synthesize("First call.")
         assert r1.success is True
         assert tts._model is not None
@@ -425,12 +425,12 @@ class TestRealTTSSmoke:
 
     @pytest.mark.hardware
     def test_real_playback(self):
-        """Full pipeline: Kokoro → AudioPlayer → speaker."""
-        from app.tts.local_tts import KokoroTTS
+        """Full pipeline: Phonon → AudioPlayer → speaker."""
+        from app.tts.local_tts import PhononTTS
         from app.tts.player import LocalAudioPlayer, PlaybackOutcome
 
         outcomes: list[PlaybackOutcome] = []
-        tts = KokoroTTS()
+        tts = PhononTTS()
         player = LocalAudioPlayer(on_done=lambda o: outcomes.append(o))
 
         result = tts.synthesize("Hello, I am JARVIS.")

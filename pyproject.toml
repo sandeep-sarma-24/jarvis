@@ -13,16 +13,19 @@ dependencies = [
     "numpy>=1.26",
     "silero-vad>=5",
     "onnxruntime>=1.16.1",
-    "mlx-qwen3-asr>=0.3",
     "httpx>=0.27",
-    "mlx-audio>=0.4",
-    "misaki>=0.7",
+    "mlx-audio>=0.5.1",  # Granite Speech 5 ASR
+    "ptts>=0.7",  # Phonon TTS runtime
+    "Pillow>=10",
+    "opencv-python-headless>=4.8",
+    "torch>=2.0",
 ]
 
 [project.optional-dependencies]
 dev = [
     "pytest>=8",
     "pytest-asyncio>=0.24",
+    "psutil>=5.9",
 ]
 
 [project.scripts]

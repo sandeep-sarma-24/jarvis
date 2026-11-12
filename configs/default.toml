@@ -12,26 +12,26 @@ minimum_speech_ms = 250
 maximum_segment_seconds = 30
 
 [asr]
-model = "Qwen/Qwen3-ASR-0.6B"
+model = "ibm-granite/granite-speech-5.0-470m-turboctc"
 
 [event_bus]
 subscriber_queue_size = 256
 
 [attention]
 enabled = true
-reason_threshold = 0.4
+reason_threshold = 0.10
 assistant_names = ["jarvis"]
 working_memory_size = 20
 
 [reasoning]
 enabled = true
-model = "gemma4:12b"
-ollama_url = "http://localhost:11434"
+model = "gemma4:e2b-it-qat"
+ollama_url = "http://100.97.67.75:11434"  # HP Omen GPU via Tailscale
 max_context_messages = 8
 max_context_characters = 6000
-max_output_tokens = 256
+max_output_tokens = 512
 temperature = 0.2
-timeout_seconds = 30.0
+timeout_seconds = 120.0
 max_concurrent_requests = 1
 
 [response]
@@ -39,10 +39,9 @@ enabled = true
 
 [tts]
 enabled = true
-model = "mlx-community/Kokoro-82M-bf16"
-voice = "bf_emma"
-speed = 1.0
-sample_rate = 24000
+model = "hf://gradium/phonon-31m-en"
+voice = "Easton"  # list voices: .venv/bin/ptts --list-voices
+quant = "q8"
 max_text_length = 2000
 
 [playback]
@@ -61,33 +60,33 @@ max_recent_messages = 8
 [fusion]
 enabled = true
 window_seconds = 15.0
-max_events = 20
+max_events = 10
 max_characters = 3000
 
 [perception]
-enabled = false  # disabled by default — camera requires explicit opt-in
+enabled = true
 max_visual_events = 5
-max_visual_context_characters = 500
-max_visual_event_age_seconds = 60.0
+max_visual_context_characters = 3000
+max_visual_event_age_seconds = 120.0
 
 [perception.camera]
-enabled = false
+enabled = true
 device_index = 0
 width = 640
 height = 480
-capture_fps = 10.0
-analysis_fps = 1.0
-max_frame_age_seconds = 2.0
-max_queue_size = 2
+capture_fps = 2.0
+analysis_fps = 0.2  # one frame every 5s — vision runs on HP, won't starve reasoning
+max_frame_age_seconds = 5.0
+max_queue_size = 1
 change_threshold = 0.05
-dedup_window_seconds = 30.0
+dedup_window_seconds = 15.0
 
 [perception.vision]
-enabled = false  # enable to use real local vision model instead of mock
+enabled = true
 provider = "ollama"
-model = "gemma4:12b"
-ollama_url = "http://localhost:11434"
-timeout_seconds = 120.0
-max_image_size = 1024
+model = "gemma4:e2b-it-qat"  # 4.3GB total, fits GTX 1650 Ti 4GB VRAM; vision+text+audio
+ollama_url = "http://100.97.67.75:11434"  # HP Omen GPU via Tailscale
+timeout_seconds = 60.0
+max_image_size = 512
 temperature = 0.1
 prompt = ""  # empty = use default prompt

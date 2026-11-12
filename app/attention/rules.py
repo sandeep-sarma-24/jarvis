@@ -34,6 +34,21 @@ _BACKGROUND_PHRASES = [
 ]
 
 
+def _asr_variants(name: str) -> list[str]:
+    """Generate common ASR mis-transcriptions for an assistant name.
+
+    ponytail: hand-tuned for "jarvis"; extend if more names are added.
+    """
+    variants = {name}
+    if name == "jarvis":
+        variants |= {
+            "jarvis", "jarvus", "javis", "jarves", "jarvie",
+            "java's", "javas", "jarvi", "jarvie's", "jarvis's",
+            "travis", "jervis",
+        }
+    return sorted(variants)
+
+
 class AttentionRules:
     """Tier 1 deterministic rules for attention filtering."""
 
@@ -42,15 +57,18 @@ class AttentionRules:
         self._build_patterns()
 
     def _build_patterns(self) -> None:
-        escaped = [re.escape(n) for n in self._names]
+        all_variants: list[str] = []
+        for n in self._names:
+            all_variants.extend(_asr_variants(n))
+        escaped = [re.escape(v) for v in all_variants]
         name_alt = "|".join(escaped)
         # Explicit address: name at start, optionally preceded by "hey"/"ok"/"yo"
         self._direct_address = re.compile(
             rf"^(?:hey|ok|yo|hi|hello)?\s*(?:{name_alt})\b", re.I
         )
-        # Vocative: name followed by comma — "Jarvis, can you..." is direct address
+        # Vocative: name followed by punctuation — "Jarvis, can you..." / "Jarvis. What..."
         self._vocative = re.compile(
-            rf"^(?:hey|ok|yo|hi|hello)?\s*(?:{name_alt})\s*,", re.I
+            rf"^(?:hey|ok|yo|hi|hello)?,?\s*(?:{name_alt})\s*[,.\-!]", re.I
         )
         # Name at end: "can you help me, jarvis?"
         self._trailing_address = re.compile(

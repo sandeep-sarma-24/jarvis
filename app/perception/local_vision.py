@@ -16,6 +16,7 @@ import base64
 import io
 import json
 import logging
+import re
 import time
 from typing import Protocol, runtime_checkable
 
@@ -38,7 +39,8 @@ _EVENT_TYPE_MAP: dict[str, VisualEventType] = {
 _DEFAULT_PROMPT = (
     "Analyze this image and respond with ONLY a JSON object (no markdown, no explanation):\n"
     '{"event_type": "<one of: SCENE_CHANGE, PERSON_DETECTED, OBJECT_DETECTED, '
-    'TEXT_DETECTED, VISUAL_SUMMARY>", "description": "<1-2 sentence description>", '
+    'TEXT_DETECTED, VISUAL_SUMMARY>", "description": "<detailed 2-4 sentence description '
+    'including people, their actions, posture, clothing, objects, and environment>", '
     '"confidence": <0.0-1.0>, "detections": [{"label": "<object>", "confidence": <0.0-1.0>}]}'
 )
 
@@ -83,8 +85,11 @@ class OllamaVisionBackend:
                     }
                 ],
                 "stream": False,
+                "format": "json",
+                "think": False,
                 "options": {
                     "temperature": self._temperature,
+                    "num_predict": 512,
                 },
             },
         )
@@ -203,6 +208,22 @@ class LocalVisionAnalyzer:
         """Parse model output into VisualAnalysis. Tolerant of messy JSON."""
         text = raw.strip()
 
+        if not text:
+            logger.warning("Vision model returned empty output")
+            return None
+
+        # Strip <think> blocks but keep any JSON that might be inside them as fallback
+        think_match = re.search(r"<think>(.*?)</think>", text, flags=re.DOTALL)
+        text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+
+        # If stripping think blocks left nothing, look for JSON inside the think block
+        if not text and think_match:
+            text = think_match.group(1).strip()
+
+        if not text:
+            logger.warning("Vision model returned no content outside think block")
+            return None
+
         if text.startswith("```"):
             lines = text.split("\n")
             lines = [l for l in lines if not l.strip().startswith("```")]
@@ -217,10 +238,10 @@ class LocalVisionAnalyzer:
                 try:
                     data = json.loads(text[start : end + 1])
                 except json.JSONDecodeError:
-                    logger.warning("Vision model returned unparseable output: %.200s", text)
+                    logger.warning("Vision model returned unparseable output: %r", text[:200])
                     return None
             else:
-                logger.warning("Vision model returned non-JSON output: %.200s", text)
+                logger.warning("Vision model returned non-JSON output: %r", text[:200])
                 return None
 
         if not isinstance(data, dict):

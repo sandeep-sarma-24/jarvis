@@ -43,7 +43,7 @@ class TestContextPriority:
 
     def test_conversation_preferred_over_memory_when_budget_tight(self):
         """Conversation gets budget before memories."""
-        builder = ContextBuilder(max_messages=8, max_characters=1200, max_memory_items=5)
+        builder = ContextBuilder(max_messages=8, max_characters=len(ContextBuilder().system_prompt) + 540, max_memory_items=5)
         memory = WorkingMemory(max_size=20)
         conv = [
             {"role": "user", "content": "conv question"},
@@ -61,14 +61,15 @@ class TestContextPriority:
 
     def test_memory_excluded_when_budget_exhausted_by_conversation(self):
         """If conversation fills the budget, memory gets nothing."""
-        builder = ContextBuilder(max_messages=8, max_characters=900, max_memory_items=5)
+        budget = len(ContextBuilder().system_prompt) + 240
+        builder = ContextBuilder(max_messages=8, max_characters=budget, max_memory_items=5)
         memory = WorkingMemory(max_size=20)
         conv = [{"role": "user", "content": "c" * 150} for _ in range(3)]
         mem_ctx = ["memory data " * 20]
 
         ctx = builder.build(_speech("current"), memory, conversation_messages=conv, memory_context=mem_ctx)
         # Budget may not allow memory
-        assert ctx.total_characters <= 900
+        assert ctx.total_characters <= budget
 
 
 class TestContextOrdering:

@@ -112,9 +112,7 @@ async def _audio_pipeline(
         drops_before = mic.buffer.chunks_dropped
 
         try:
-            asr_result = await asyncio.to_thread(
-                asr.transcribe, segment.audio, segment.sample_rate
-            )
+            asr_result = await asr.transcribe_async(segment.audio, segment.sample_rate)
         except Exception:
             _metrics["speech_segments_failed"] += 1
             logger.exception("ASR failed on segment (%.2fs)", segment.duration_seconds)
@@ -156,18 +154,20 @@ async def _audio_pipeline(
 def _format_multimodal_context(snap) -> list[str] | None:
     """Format a fusion snapshot into context strings for ContextBuilder.
 
-    Returns structured observations tagged by modality. The current event
-    is excluded at the snapshot level (via exclude_event_ids), so all
-    observations here are contextual — prior speech and visual observations
-    that form the temporal situation around the current request.
+    Returns structured observations tagged by modality, most recent last.
+    The final visual observation is marked as current to help the reasoning
+    model prioritize it over older (potentially stale) descriptions.
     """
     parts: list[str] = []
 
     for obs in snap.audio_observations:
         parts.append(f"[audio] {obs}")
 
-    for obs in snap.visual_observations:
+    visuals = snap.visual_observations
+    for obs in visuals[:-1]:
         parts.append(f"[visual] {obs}")
+    if visuals:
+        parts.append(f"[visual — current] {visuals[-1]}")
 
     return parts if parts else None
 
@@ -181,6 +181,7 @@ def _build_reasoning_handler(
     memory_manager=None,
     visual_context_ring: deque | None = None,
     fusion: MultimodalFusion | None = None,
+    on_demand_vision=None,
 ):
     """Build the attention→context→reasoning→response handler.
 
@@ -189,6 +190,9 @@ def _build_reasoning_handler(
     Phase 5: integrates conversation state and memory retrieval.
     Phase 6: includes recent visual context.
     Phase 8: uses fused multimodal context when fusion is enabled.
+
+    on_demand_vision: optional (camera, analyzer) tuple for live frame capture
+    when the user asks a vision question.
     """
     from app.context.builder import ContextBuilder
     from app.reasoning.local_model import OllamaModel
@@ -277,18 +281,46 @@ def _build_reasoning_handler(
                     if memories:
                         mem_context = [m.content for m in memories]
 
-            # Phase 8: use fused multimodal context; Phase 6 fallback to ring
+            # Phase 8: use fused multimodal context; ring as visual fallback
             multimodal_ctx: list[str] | None = None
             vis_ctx: list[str] | None = None
+
+            # On-demand vision: if user asks about what they see, grab a fresh frame
+            _VISION_KEYWORDS = ("see", "look", "watch", "visual", "camera", "showing")
+            is_vision_request = any(kw in event.transcript.lower() for kw in _VISION_KEYWORDS)
+
+            if is_vision_request and on_demand_vision is not None and on_demand_vision[0] is not None:
+                camera, analyzer = on_demand_vision[0]
+                frame = await camera.capture()
+                if frame is not None:
+                    analysis = await analyzer.analyze(frame)
+                    if analysis is not None:
+                        multimodal_ctx = [f"[visual — live] {analysis.description}"]
+                        reasoning_logger.info(
+                            "ON_DEMAND_VISION desc=%r", analysis.description
+                        )
+
             if fusion and fusion.enabled:
-                # Snapshot relative to the event being reasoned about, not wall-clock.
-                # Exclude the current event — its transcript is already the user message.
                 snap = fusion.snapshot(
-                    reference_time=event.timestamp,
                     exclude_event_ids={event.id},
                 )
-                multimodal_ctx = _format_multimodal_context(snap)
+                fusion_ctx = _format_multimodal_context(snap)
+                if fusion_ctx:
+                    multimodal_ctx = (multimodal_ctx or []) + fusion_ctx
+                # Fusion snapshot may have visual=0 if vision analysis is still
+                # in-flight. Fall back to the ring which captures attention-worthy
+                # visual events as they complete (independent of snapshot timing).
+                if not snap.visual_observations and visual_context_ring:
+                    for desc in visual_context_ring:
+                        multimodal_ctx = multimodal_ctx or []
+                        multimodal_ctx.append(f"[visual] {desc[1]}")
                 _metrics["fusion_context_characters"] = snap.total_characters
+                reasoning_logger.info(
+                    "FUSION_SNAPSHOT audio=%d visual=%d chars=%d",
+                    len(snap.audio_observations),
+                    len(snap.visual_observations),
+                    snap.total_characters,
+                )
             elif visual_context_ring:
                 vis_ctx = [desc for _, desc in visual_context_ring]
 
@@ -336,10 +368,15 @@ def _build_reasoning_handler(
                     conversation.add_assistant_message, resp.text, event.id + "_response"
                 )
 
+            thinking_block = ""
+            if resp.thinking:
+                thinking_block = f"\n[THINKING]\n  {resp.thinking}\n"
+
             print(
                 f"\n[REASONING]\n"
                 f"  model={result.model}\n"
                 f"  latency={result.latency_ms:.0f}ms\n"
+                f"{thinking_block}"
                 f"\n[RESPONSE]\n"
                 f"  {resp.text}\n"
             )
@@ -372,26 +409,31 @@ def _build_reasoning_handler(
 
 # ── TTS pipeline ──────────────────────────────────────────────────────
 
-def _build_tts_handler(cfg: JarvisConfig):
+def _build_tts_handler(cfg: JarvisConfig, mic: MicrophoneCapture | None = None):
     """Build the TTS subscriber: ResponseEvent → synthesize → play.
 
     Returns the async handler, TTS engine, and player (for cleanup).
     Text exceeding max_text_length is split at sentence boundaries.
+    When mic is provided, suppresses capture during playback to prevent
+    the ASR from transcribing TTS output (feedback loop).
     """
-    from app.tts.local_tts import KokoroTTS
+    from app.tts.local_tts import PhononTTS
     from app.tts.player import LocalAudioPlayer, PlaybackOutcome
 
+    mic_ref: list[MicrophoneCapture | None] = [mic]
+
     def _on_playback_done(outcome: PlaybackOutcome) -> None:
+        if mic_ref[0] is not None:
+            mic_ref[0].suppressed = False
         if outcome == PlaybackOutcome.COMPLETED:
             _metrics["playback_completed"] += 1
         elif outcome == PlaybackOutcome.INTERRUPTED:
             _metrics["playback_interrupted"] += 1
 
-    tts_engine = KokoroTTS(
+    tts_engine = PhononTTS(
         model_id=cfg.tts.model,
         voice=cfg.tts.voice,
-        speed=cfg.tts.speed,
-        sample_rate=cfg.tts.sample_rate,
+        quant=cfg.tts.quant,
     )
 
     player = LocalAudioPlayer(volume=cfg.playback.volume, on_done=_on_playback_done)
@@ -422,7 +464,7 @@ def _build_tts_handler(cfg: JarvisConfig):
         tts_logger.info("TTS event_id=%s text_len=%d", event.event_id[:12], len(text))
 
         t0 = time.time()
-        result = await asyncio.to_thread(tts_engine.synthesize, text)
+        result = await tts_engine.synthesize_async(text)
         tts_latency = (time.time() - t0) * 1000
         _metrics["tts_latency_ms"] = round(tts_latency, 1)
 
@@ -454,6 +496,8 @@ def _build_tts_handler(cfg: JarvisConfig):
         )
 
         _metrics["playback_started"] += 1
+        if mic_ref[0] is not None:
+            mic_ref[0].suppressed = True
         player.play(result.audio, result.sample_rate)
 
         print(
@@ -465,7 +509,7 @@ def _build_tts_handler(cfg: JarvisConfig):
             f"  model={result.model}\n"
         )
 
-    return _handler, tts_engine, player
+    return _handler, tts_engine, player, mic_ref
 
 
 # ── Visual attention handler ──────────────────────────────────────────────
@@ -561,6 +605,9 @@ async def run(cfg: JarvisConfig | None = None) -> None:
     player_cleanup = None
     vision_analyzer_cleanup = None
 
+    # Mutable ref for on-demand vision (populated after camera/analyzer are created)
+    on_demand_vision_ref: list = [None]
+
     if cfg.attention.enabled:
         working_mem = WorkingMemory(max_size=cfg.attention.working_memory_size)
         attention = AttentionEngine(
@@ -572,6 +619,7 @@ async def run(cfg: JarvisConfig | None = None) -> None:
         if cfg.reasoning.enabled:
             handler, model_cleanup = _build_reasoning_handler(
                 cfg, attention, bus, memory_manager, visual_context_ring, fusion,
+                on_demand_vision=on_demand_vision_ref,
             )
             bus.subscribe(SpeechEvent, handler)
             logger.info(
@@ -595,12 +643,13 @@ async def run(cfg: JarvisConfig | None = None) -> None:
         bus.subscribe(SpeechEvent, _fusion_speech_handler)
 
     # 4. TTS pipeline (Phase 4)
+    tts_mic_ref = None
     if cfg.tts.enabled and cfg.playback.enabled:
-        tts_handler, tts_cleanup, player_cleanup = _build_tts_handler(cfg)
+        tts_handler, tts_cleanup, player_cleanup, tts_mic_ref = _build_tts_handler(cfg)
         bus.subscribe(ResponseEvent, tts_handler)
         logger.info(
-            "TTS pipeline active — model=%s voice=%s sample_rate=%d",
-            cfg.tts.model, cfg.tts.voice, cfg.tts.sample_rate,
+            "TTS pipeline active — model=%s voice=%s",
+            cfg.tts.model, cfg.tts.voice,
         )
 
     # 5. Visual perception pipeline (Phase 6)
@@ -647,6 +696,7 @@ async def run(cfg: JarvisConfig | None = None) -> None:
                 max_image_size=vis_cfg.max_image_size,
             )
             vision_analyzer_cleanup = analyzer
+            on_demand_vision_ref[0] = (camera, analyzer)
             logger.info("Vision analyzer: LocalVisionAnalyzer (model=%s)", vis_cfg.model)
         else:
             analyzer = MockVisualAnalyzer()
@@ -682,23 +732,11 @@ async def run(cfg: JarvisConfig | None = None) -> None:
     if perception_pipeline is not None:
         await perception_pipeline.start()
 
-    # 6. VAD
-    vad = VoiceActivityDetector(threshold=cfg.vad.threshold)
-    vad.load()
-
-    # 7. ASR
-    asr = SpeechRecognizer(cfg.asr)
-    asr.load()
-
-    # 8. Segmenter
-    segmenter = SpeechSegmenter(
-        config=cfg.vad,
-        sample_rate=cfg.audio.sample_rate,
-        chunk_samples=cfg.audio.chunk_samples,
-    )
-
-    # 9. Microphone
+    # 6. Microphone — must open before MLX model loads (ASR/TTS) to avoid
+    # PortAudio device conflict on macOS Core Audio.
     mic = MicrophoneCapture(cfg.audio)
+    if tts_mic_ref is not None:
+        tts_mic_ref[0] = mic
     loop = asyncio.get_running_loop()
 
     shutdown = asyncio.Event()
@@ -706,6 +744,25 @@ async def run(cfg: JarvisConfig | None = None) -> None:
         loop.add_signal_handler(sig, shutdown.set)
 
     mic.start(loop)
+
+    # 7. VAD
+    vad = VoiceActivityDetector(threshold=cfg.vad.threshold)
+    vad.load()
+
+    # 8. ASR (MLX — loads on dedicated thread)
+    asr = SpeechRecognizer(cfg.asr)
+    asr.load()
+
+    # 8a. Pre-load TTS model on its dedicated thread
+    if tts_cleanup is not None:
+        tts_cleanup.load()
+
+    # 9. Segmenter
+    segmenter = SpeechSegmenter(
+        config=cfg.vad,
+        sample_rate=cfg.audio.sample_rate,
+        chunk_samples=cfg.audio.chunk_samples,
+    )
 
     # 10. Run audio pipeline
     pipeline_task = asyncio.create_task(
@@ -730,6 +787,7 @@ async def run(cfg: JarvisConfig | None = None) -> None:
     except asyncio.CancelledError:
         pass
     await bus.shutdown()
+    asr.close()
 
     if vision_analyzer_cleanup is not None:
         vision_analyzer_cleanup.close()

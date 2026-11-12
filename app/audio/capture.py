@@ -79,6 +79,15 @@ class MicrophoneCapture:
         )
         self.buffer = BoundedAudioBuffer(max_chunks)
         self._stream: sd.InputStream | None = None
+        self._suppressed = False
+
+    @property
+    def suppressed(self) -> bool:
+        return self._suppressed
+
+    @suppressed.setter
+    def suppressed(self, value: bool) -> None:
+        self._suppressed = value
 
     def _callback(
         self,
@@ -87,6 +96,8 @@ class MicrophoneCapture:
         time_info: object,
         status: sd.CallbackFlags,
     ) -> None:
+        if self._suppressed:
+            return
         if status:
             logger.warning("sounddevice status: %s", status)
         self.buffer.put(indata[:, 0].copy())
