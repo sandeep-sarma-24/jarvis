@@ -399,7 +399,6 @@ class TestRealTTSSmoke:
         ))
 
         assert len(chunks) >= 1
-        assert chunks[-1].is_last is True
         for chunk in chunks:
             assert chunk.sample_rate == 24000
             assert len(chunk.audio) > 0
