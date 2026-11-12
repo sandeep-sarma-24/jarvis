@@ -1,4 +1,5 @@
 import asyncio
+import time
 
 import numpy as np
 import pytest
@@ -13,10 +14,18 @@ def buffer():
 
 def test_put_and_get_nowait(buffer: BoundedAudioBuffer):
     chunk = np.ones(512, dtype=np.float32)
-    buffer.put(chunk)
+    buffer.put(chunk, 123.0)
     got = buffer.get_nowait()
     assert got is not None
-    np.testing.assert_array_equal(got, chunk)
+    np.testing.assert_array_equal(got[0], chunk)
+    assert got[1] == 123.0
+
+
+def test_put_stamps_capture_time_by_default(buffer: BoundedAudioBuffer):
+    before = time.time()
+    buffer.put(np.zeros(512, dtype=np.float32))
+    _, t = buffer.get_nowait()
+    assert before <= t <= time.time()
 
 
 def test_get_nowait_empty(buffer: BoundedAudioBuffer):
@@ -34,7 +43,7 @@ def test_bounded_capacity(buffer: BoundedAudioBuffer):
         c = buffer.get_nowait()
         if c is None:
             break
-        values.append(c[0])
+        values.append(c[0][0])
     assert values == [5.0, 6.0, 7.0, 8.0, 9.0]
 
 
@@ -58,7 +67,7 @@ async def test_async_get():
         buf.put(np.ones(512, dtype=np.float32))
 
     asyncio.create_task(producer())
-    chunk = await asyncio.wait_for(buf.get(), timeout=1.0)
+    chunk, _ = await asyncio.wait_for(buf.get(), timeout=1.0)
     assert chunk is not None
     assert chunk[0] == 1.0
 

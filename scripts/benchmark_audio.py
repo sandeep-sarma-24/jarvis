@@ -1,136 +1,149 @@
 #!/usr/bin/env python3
-"""Phase 1 benchmark — measures actual VAD, ASR, and pipeline latencies.
+"""Audio benchmark: VAD per-chunk cost, ASR latency / real-time factor, endpointing delay.
 
-Usage: python -m scripts.benchmark_audio
+Usage:
+    python -m scripts.benchmark_audio [--wav speech.wav] [--asr-runs 10] [--vad-chunks 2000]
+    python -m scripts.benchmark_audio --skip-models   # endpointing only, no model loads
 
-Reports target vs actual for each metric.
+No microphone is opened. Without --wav, ASR runs on synthetic audio (latency
+and RTF are meaningful; the transcript is not).
 """
 from __future__ import annotations
 
-import os
+import argparse
+import asyncio
 import time
+import wave
 
 import numpy as np
-import psutil  # type: ignore[import-untyped]
 
-TARGETS = {
-    "vad_latency_ms": 1.0,
-    "asr_latency_ms": 800.0,
-}
+from app.config import load_config
+from app.contracts import percentiles
 
-
-def _fmt(label: str, actual: float, target: float, unit: str = "ms") -> str:
-    status = "PASS" if actual <= target else "FAIL"
-    return f"  {label:30s}  target={target:>8.1f}{unit}  actual={actual:>8.1f}{unit}  [{status}]"
+SR = 16000
 
 
-def run() -> None:
-    proc = psutil.Process(os.getpid())
-    rss_start = proc.memory_info().rss / (1024 * 1024)
-    print(f"RSS at start: {rss_start:.1f} MB\n")
+def _print(label: str, stats: dict[str, float], unit: str = "ms") -> None:
+    if not stats.get("n"):
+        print(f"  {label:28s} n=0")
+        return
+    cols = "  ".join(f"{k}={stats[k]:.3f}" for k in ("p50", "p95", "p99", "max"))
+    print(f"  {label:28s} n={stats['n']:<5d} {cols} {unit}")
 
-    # ── VAD ──────────────────────────────────────────────────────────────
+
+def load_wav(path: str) -> np.ndarray:
+    """16-bit PCM WAV → float32 mono at 16 kHz (linear resample if needed)."""
+    with wave.open(path, "rb") as w:
+        if w.getsampwidth() != 2:
+            raise SystemExit("--wav must be 16-bit PCM")
+        rate, channels = w.getframerate(), w.getnchannels()
+        data = np.frombuffer(w.readframes(w.getnframes()), dtype=np.int16)
+    audio = data.reshape(-1, channels).mean(axis=1).astype(np.float32) / 32768.0
+    if rate != SR:
+        audio = np.interp(np.arange(0, len(audio), rate / SR), np.arange(len(audio)), audio)
+    return audio.astype(np.float32)
+
+
+def synthetic_speech(seconds: float, seed: int = 0) -> np.ndarray:
+    """Voice-like signal: harmonic stack with a syllable-rate envelope plus noise."""
+    rng = np.random.default_rng(seed)
+    t = np.arange(int(seconds * SR)) / SR
+    f0 = 140 + 20 * np.sin(2 * np.pi * 0.7 * t)
+    phase = 2 * np.pi * np.cumsum(f0) / SR
+    voiced = sum(np.sin(k * phase) / k for k in range(1, 8))
+    envelope = 0.5 * (1 + np.sin(2 * np.pi * 4 * t))
+    return (0.2 * voiced * envelope + 0.01 * rng.standard_normal(len(t))).astype(np.float32)
+
+
+def bench_vad(audio: np.ndarray, n_chunks: int, threshold: float) -> None:
     from app.audio.vad import VoiceActivityDetector
 
+    vad = VoiceActivityDetector(threshold=threshold)
     t0 = time.perf_counter()
-    vad = VoiceActivityDetector(threshold=0.5)
     vad.load()
-    vad_load_ms = (time.perf_counter() - t0) * 1000
-    print(f"VAD model load: {vad_load_ms:.0f} ms")
-
-    chunk = np.zeros(512, dtype=np.float32)
-    for _ in range(10):
-        vad.process_chunk(chunk)
+    print(f"\nVAD (Silero ONNX) load: {(time.perf_counter() - t0) * 1000:.0f} ms")
+    chunks = [audio[i:i + 512] for i in range(0, len(audio) - 511, 512)]
+    for c in chunks[:20]:
+        vad.process_chunk(c)  # warm-up
     vad.reset()
+    lat = [vad.process_chunk(chunks[i % len(chunks)]).latency_ms for i in range(n_chunks)]
+    print("VAD per-chunk inference (512 samples = 32 ms):")
+    _print("latency", percentiles(lat))
+    print("  > 2 ms per chunk would block the event loop; AudioFrontend runs VAD on its own thread.")
 
-    latencies = []
-    for _ in range(100):
-        r = vad.process_chunk(chunk)
-        latencies.append(r.latency_ms)
-    vad.reset()
 
-    vad_mean = sum(latencies) / len(latencies)
-    vad_p99 = sorted(latencies)[98]
-    print("\nVAD latency (100 chunks):")
-    print(_fmt("mean", vad_mean, TARGETS["vad_latency_ms"]))
-    print(_fmt("p99", vad_p99, TARGETS["vad_latency_ms"]))
-
-    rss_after_vad = proc.memory_info().rss / (1024 * 1024)
-
-    # ── ASR ──────────────────────────────────────────────────────────────
+def bench_asr(audio: np.ndarray, runs: int, model: str) -> None:
     from app.audio.asr import SpeechRecognizer
     from app.config import ASRConfig
 
+    asr = SpeechRecognizer(ASRConfig(model=model))
     t0 = time.perf_counter()
-    asr = SpeechRecognizer(ASRConfig())
     asr.load()
-    asr_load_ms = (time.perf_counter() - t0) * 1000
-    print(f"\nASR model load: {asr_load_ms:.0f} ms")
+    print(f"\nASR ({model}) load: {(time.perf_counter() - t0) * 1000:.0f} ms")
+    seconds = len(audio) / SR
 
-    test_audio = np.random.randn(32000).astype(np.float32) * 0.01
-    asr.transcribe(test_audio)  # warm up
+    async def once() -> tuple[float, str]:
+        # transcribe_async runs on the thread that loaded the model (MLX affinity).
+        r = await asr.transcribe_async(audio, SR)
+        return r.latency_ms, r.text
 
-    asr_latencies = []
-    for _ in range(5):
-        r = asr.transcribe(test_audio)
-        asr_latencies.append(r.latency_ms)
+    try:
+        cold_ms, text = asyncio.run(once())
+        warm = [asyncio.run(once())[0] for _ in range(runs)]
+    finally:
+        asr.close()
+    print(f"ASR on {seconds:.2f} s of audio:")
+    print(f"  cold (first call)            latency={cold_ms:.1f} ms  RTF={cold_ms / 1000 / seconds:.3f}")
+    _print("warm latency", percentiles(warm))
+    _print("warm RTF", percentiles([ms / 1000 / seconds for ms in warm]), unit="")
+    print(f'  transcript: "{text}"')
 
-    asr_mean = sum(asr_latencies) / len(asr_latencies)
-    print("\nASR latency (5 runs, 2s audio):")
-    print(_fmt("mean", asr_mean, TARGETS["asr_latency_ms"]))
 
-    rss_after_asr = proc.memory_info().rss / (1024 * 1024)
-
-    # ── Speech-end → event (simulated) ───────────────────────────────────
-    from app.audio.vad import VADResult
+def bench_endpointing(trials: int = 50) -> None:
+    """Speech-then-silence through the segmenter with scripted VAD decisions."""
     from app.audio.segmentation import SpeechSegmenter
-    from app.audio.capture import BoundedAudioBuffer
-    from app.config import VADConfig
+    from app.audio.vad import VADResult
 
-    segmenter = SpeechSegmenter(config=VADConfig(), sample_rate=16000, chunk_samples=512)
-    buf = BoundedAudioBuffer(max_chunks=1000)
+    cfg = load_config()
+    chunk_s = cfg.audio.chunk_samples / cfg.audio.sample_rate
+    speech = VADResult(is_speech=True, confidence=0.9, latency_ms=0.0)
+    silence = VADResult(is_speech=False, confidence=0.1, latency_ms=0.0)
+    chunk = np.zeros(cfg.audio.chunk_samples, dtype=np.float32)
 
-    speech_audio = np.random.randn(512).astype(np.float32) * 0.01
-    speech_n = 32
+    delays, per_chunk = [], []
+    for trial in range(trials):
+        seg = SpeechSegmenter(cfg.vad, cfg.audio.sample_rate, cfg.audio.chunk_samples)
+        n_speech = 10 + trial  # 320 ms … ~1.9 s of speech
+        pattern = [silence] * 5 + [speech] * n_speech + [silence] * 40
+        for i, vr in enumerate(pattern):
+            t0 = time.perf_counter()
+            out = seg.process(chunk, vr, 1000.0 + (i + 1) * chunk_s)
+            per_chunk.append((time.perf_counter() - t0) * 1000)
+            if out is not None:
+                delays.append((out.end_time - out.speech_end_time) * 1000)
+                break
+    print(f"\nEndpointing (speech_end_silence_ms={cfg.vad.speech_end_silence_ms}, "
+          f"chunk={chunk_s * 1000:.0f} ms), capture-time delay from last speech chunk:")
+    _print("endpoint delay", percentiles(delays))
+    _print("segmenter cost per chunk", percentiles(per_chunk))
 
-    # Fill buffer to simulate background capture during ASR
-    for _ in range(speech_n):
-        buf.put(speech_audio.copy())
 
-    # Simulate: segment finalized, then measure ASR + publish
-    for _ in range(speech_n):
-        vr = VADResult(is_speech=True, confidence=0.9, latency_ms=0.1)
-        segmenter.process(speech_audio, vr)
-    segment = None
-    for _ in range(15):
-        vr = VADResult(is_speech=False, confidence=0.1, latency_ms=0.1)
-        segment = segmenter.process(speech_audio, vr)
-        if segment is not None:
-            break
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--wav", help="16-bit PCM WAV of speech to use for VAD and ASR")
+    parser.add_argument("--asr-runs", type=int, default=10)
+    parser.add_argument("--vad-chunks", type=int, default=2000)
+    parser.add_argument("--skip-models", action="store_true", help="only the model-free endpointing benchmark")
+    args = parser.parse_args()
 
-    if segment is not None:
-        depth_before = buf.depth
-        t_start = time.perf_counter()
-        asr_r = asr.transcribe(segment.audio, segment.sample_rate)
-        t_asr = time.perf_counter()
-        speech_to_event_ms = (t_asr - t_start) * 1000
-
-        print(f"\nSpeech-end → event (simulated):")
-        print(f"  ASR latency:       {asr_r.latency_ms:.1f} ms")
-        print(f"  speech→event:      {speech_to_event_ms:.1f} ms")
-        print(f"  buffer depth before ASR: {depth_before}")
-        print(f"  buffer depth after ASR:  {buf.depth}")
-        print(f"  buffer max depth:        {buf.max_depth}")
-        print(f"  total chunks received:   {buf.chunks_received}")
-        print(f"  total chunks dropped:    {buf.chunks_dropped}")
-
-    rss_end = proc.memory_info().rss / (1024 * 1024)
-    print(f"\n── Memory summary ──")
-    print(f"  RSS start:     {rss_start:.1f} MB")
-    print(f"  RSS after VAD: {rss_after_vad:.1f} MB")
-    print(f"  RSS after ASR: {rss_after_asr:.1f} MB")
-    print(f"  RSS end:       {rss_end:.1f} MB")
+    bench_endpointing()
+    if args.skip_models:
+        return
+    cfg = load_config()
+    audio = load_wav(args.wav) if args.wav else synthetic_speech(3.0)
+    bench_vad(audio, args.vad_chunks, cfg.vad.threshold)
+    bench_asr(audio, args.asr_runs, cfg.asr.model)
 
 
 if __name__ == "__main__":
-    run()
+    main()
