@@ -51,8 +51,10 @@ class MemoryManager:
         manager.close()
 
     Retrieval is lexical (FTS5/BM25 blended with recency and importance).
-    shortcut: no embeddings; measured as not worth it at this scale (see
-    scripts/benchmark_memory.py notes), add them if paraphrase recall matters.
+    shortcut: no embeddings. bge-small measured ~9 s load, ~7 ms per query
+    embed and several hundred MB RSS against ~1 ms lexical retrieval at 10k
+    rows; add them if paraphrase recall ("internet code" vs "wifi password")
+    turns out to matter in practice.
     """
 
     def __init__(self, store: SQLiteStore, *, cross_session: bool = True) -> None:
