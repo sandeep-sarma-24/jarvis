@@ -7,9 +7,10 @@ chunk_samples = 512  # Silero VAD requires 512 samples (32ms) at 16kHz
 
 [vad]
 threshold = 0.5
-speech_end_silence_ms = 300
+speech_end_silence_ms = 192  # 6 chunks; endpointing target is under 200 ms
 minimum_speech_ms = 250
 maximum_segment_seconds = 30
+pre_roll_ms = 96
 
 [asr]
 model = "ibm-granite/granite-speech-5.0-470m-turboctc"
@@ -31,8 +32,16 @@ max_context_messages = 8
 max_context_characters = 6000
 max_output_tokens = 512
 temperature = 0.2
-timeout_seconds = 120.0
+timeout_seconds = 30.0  # read timeout; connect has its own below
 max_concurrent_requests = 1
+connect_timeout_seconds = 2.0
+keep_alive = "30m"
+think = false
+# Used when the primary host is unreachable. Empty fallback_model disables it.
+# Needs `ollama serve` running locally with the model pulled.
+fallback_url = "http://127.0.0.1:11434"
+fallback_model = "gemma4:12b"
+fallback_cooldown_seconds = 30.0
 
 [response]
 enabled = true
@@ -47,6 +56,15 @@ max_text_length = 2000
 [playback]
 enabled = true
 volume = 1.0
+max_queue_seconds = 2.0
+tail_ms = 200
+
+[barge_in]
+# Off by default: without echo cancellation the mic hears JARVIS's own voice.
+# Enable only with headphones. While off, the mic is suppressed during playback.
+enabled = false
+vad_threshold = 0.8
+min_speech_ms = 256
 
 [logging]
 level = "INFO"
@@ -56,6 +74,9 @@ enabled = true
 database_path = "~/.jarvis/jarvis.db"
 max_retrieved_memories = 5
 max_recent_messages = 8
+cross_session = true
+semantic_enabled = false
+embedding_model = "BAAI/bge-small-en-v1.5"
 
 [fusion]
 enabled = true
@@ -68,6 +89,8 @@ enabled = true
 max_visual_events = 5
 max_visual_context_characters = 3000
 max_visual_event_age_seconds = 120.0
+on_demand_timeout_seconds = 3.0
+pause_during_turn = true
 
 [perception.camera]
 enabled = true

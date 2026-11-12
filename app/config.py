@@ -22,6 +22,7 @@ class VADConfig:
     speech_end_silence_ms: int = 300
     minimum_speech_ms: int = 250
     maximum_segment_seconds: int = 30
+    pre_roll_ms: int = 96  # audio kept from before speech onset
 
 
 @dataclass
@@ -53,6 +54,12 @@ class ReasoningConfig:
     temperature: float = 0.2
     timeout_seconds: float = 30.0
     max_concurrent_requests: int = 1
+    connect_timeout_seconds: float = 2.0
+    keep_alive: str = "30m"
+    think: bool = False
+    fallback_url: str = "http://127.0.0.1:11434"
+    fallback_model: str = ""  # empty = no fallback backend
+    fallback_cooldown_seconds: float = 30.0
 
 
 @dataclass
@@ -73,6 +80,15 @@ class TTSConfig:
 class PlaybackConfig:
     enabled: bool = True
     volume: float = 1.0
+    max_queue_seconds: float = 2.0  # bound on synthesized-but-unplayed audio
+    tail_ms: int = 200  # keep the mic suppressed this long after playback ends
+
+
+@dataclass
+class BargeInConfig:
+    enabled: bool = False  # needs headphones or echo cancellation; see docs
+    vad_threshold: float = 0.8
+    min_speech_ms: int = 256
 
 
 @dataclass
@@ -86,6 +102,9 @@ class MemoryConfig:
     database_path: str = "~/.jarvis/jarvis.db"
     max_retrieved_memories: int = 5
     max_recent_messages: int = 8
+    cross_session: bool = True
+    semantic_enabled: bool = False
+    embedding_model: str = "BAAI/bge-small-en-v1.5"
 
 
 @dataclass
@@ -122,6 +141,8 @@ class PerceptionConfig:
     max_visual_events: int = 5
     max_visual_context_characters: int = 500
     max_visual_event_age_seconds: float = 60.0
+    on_demand_timeout_seconds: float = 3.0
+    pause_during_turn: bool = True
 
 
 @dataclass
@@ -143,6 +164,7 @@ class JarvisConfig:
     response: ResponseConfig = field(default_factory=ResponseConfig)
     tts: TTSConfig = field(default_factory=TTSConfig)
     playback: PlaybackConfig = field(default_factory=PlaybackConfig)
+    barge_in: BargeInConfig = field(default_factory=BargeInConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
     memory: MemoryConfig = field(default_factory=MemoryConfig)
     perception: PerceptionConfig = field(default_factory=PerceptionConfig)
@@ -176,6 +198,8 @@ def load_config(path: Path | None = None) -> JarvisConfig:
         cfg.tts = TTSConfig(**{k: v for k, v in raw["tts"].items() if k in TTSConfig.__dataclass_fields__})
     if "playback" in raw:
         cfg.playback = PlaybackConfig(**{k: v for k, v in raw["playback"].items() if k in PlaybackConfig.__dataclass_fields__})
+    if "barge_in" in raw:
+        cfg.barge_in = BargeInConfig(**{k: v for k, v in raw["barge_in"].items() if k in BargeInConfig.__dataclass_fields__})
     if "logging" in raw:
         cfg.logging = LoggingConfig(**{k: v for k, v in raw["logging"].items() if k in LoggingConfig.__dataclass_fields__})
     if "memory" in raw:

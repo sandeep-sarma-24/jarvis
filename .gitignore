@@ -7,3 +7,5 @@ build/
 *.onnx
 data/
 .env
+.DS_Store
+.claude/worktrees/

@@ -40,5 +40,5 @@ testpaths = ["tests"]
 markers = [
     "integration: marks tests requiring loaded models (deselect with '-m \"not integration\"')",
     "hardware: marks tests requiring real microphone/speaker hardware",
-    "model: marks tests requiring a running model (Ollama or Kokoro TTS)",
+    "model: marks tests requiring a running model (Ollama or Phonon TTS)",
 ]
