@@ -1,144 +1,110 @@
-"""TTS benchmark — measures Phonon 31m synthesis performance.
+"""TTS benchmark: Phonon streaming synthesis with the real model and no audio output.
 
-Run: python -m scripts.benchmark_tts
+Run: python -m scripts.benchmark_tts [--runs 5]
 
-Measures:
-- Model initialization time
-- Cold synthesis latency
-- Warm synthesis latency (p50, p95)
-- Audio duration
-- Real-time factor (synthesis_time / audio_duration)
-- Memory usage (RSS)
+Measures cold load time, first-chunk latency (cold first call, then warm) and
+real-time factor (synthesis time / audio duration) for short, medium and long
+sentences, as P50/P95/P99, plus process RSS before and after load.
 """
 from __future__ import annotations
 
-import statistics
+import argparse
+import asyncio
 import time
 
-import numpy as np
+from app.contracts import percentiles
+
+SENTENCES = {
+    "short": [
+        "Done.",
+        "Let me check.",
+        "Sure, one moment.",
+    ],
+    "medium": [
+        "According to the logs, the issue is probably caused by a timeout.",
+        "I've found three relevant documents in your recent files.",
+        "The build completed with two warnings and no errors.",
+    ],
+    "long": [
+        "Based on the metrics from the last hour, memory usage has increased by fifteen "
+        "percent, mostly in the indexing service, so a restart would likely help.",
+        "The weather today is clear with temperatures around twenty degrees, rising to "
+        "twenty five in the afternoon, and there is no rain expected until the weekend.",
+    ],
+}
 
 
-def _get_rss_mb() -> float:
+def _rss_mb() -> float | None:
     try:
         import psutil
-        return psutil.Process().memory_info().rss / (1024 * 1024)
     except ImportError:
-        return 0.0
+        return None
+    return psutil.Process().memory_info().rss / (1024 * 1024)
+
+
+def _fmt(stats: dict[str, float], unit: str) -> str:
+    if not stats.get("n"):
+        return "n=0"
+    return (f"n={stats['n']} p50={stats['p50']:.3f}{unit} p95={stats['p95']:.3f}{unit} "
+            f"p99={stats['p99']:.3f}{unit} min={stats['min']:.3f}{unit} max={stats['max']:.3f}{unit}")
+
+
+async def _measure(tts, text: str) -> tuple[float | None, float]:
+    """One streamed synthesis with audio discarded. Returns (first_chunk_ms, rtf)."""
+    stats = await tts.stream_to(text, lambda chunk: True)
+    rtf = (stats.synth_ms / 1000) / stats.audio_seconds if stats.audio_seconds else float("nan")
+    return stats.first_chunk_ms, rtf
+
+
+async def _run(runs: int) -> None:
+    from app.config import load_config
+    from app.tts.local_tts import PhononTTS
+
+    cfg = load_config().tts
+    tts = PhononTTS(model_id=cfg.model, voice=cfg.voice, quant=cfg.quant)
+
+    rss_before = _rss_mb()
+    t0 = time.perf_counter()
+    await asyncio.get_running_loop().run_in_executor(None, tts.load)
+    load_ms = (time.perf_counter() - t0) * 1000
+    rss_after = _rss_mb()
+
+    print(f"Model: {tts.model_name}  quant={cfg.quant}  sample_rate={tts.sample_rate}")
+    print(f"Cold load: {load_ms:.0f} ms")
+    if rss_before is None:
+        print("RSS: psutil not installed")
+    else:
+        print(f"RSS: before={rss_before:.0f} MB after load={rss_after:.0f} MB "
+              f"delta={rss_after - rss_before:.0f} MB")
+
+    cold_first, cold_rtf = await _measure(tts, SENTENCES["medium"][0])
+    print(f"Cold first call: first_chunk={cold_first:.0f} ms rtf={cold_rtf:.3f}")
+
+    all_first: list[float] = []
+    for group, texts in SENTENCES.items():
+        firsts: list[float] = []
+        rtfs: list[float] = []
+        for _ in range(runs):
+            for text in texts:
+                first, rtf = await _measure(tts, text)
+                if first is not None:
+                    firsts.append(first)
+                rtfs.append(rtf)
+        all_first += firsts
+        print(f"[{group}] first_chunk_ms {_fmt(percentiles(firsts), '')}")
+        print(f"[{group}] rtf           {_fmt(percentiles(rtfs), '')}")
+    print(f"[all] warm first_chunk_ms {_fmt(percentiles(all_first), '')}")
+
+    if rss_after is not None:
+        print(f"RSS final: {_rss_mb():.0f} MB")
+    tts.close()
 
 
 def main() -> None:
-    import warnings
-    warnings.filterwarnings("ignore", message=".*Language mismatch.*")
-    warnings.filterwarnings("ignore", message=".*EspeakFallback.*")
-    logging_module = __import__("logging")
-    logging_module.getLogger("root").setLevel(logging_module.ERROR)
-
-    print("=" * 60)
-    print("JARVIS TTS Benchmark — Phonon 31m via ptts")
-    print("=" * 60)
-
-    rss_before = _get_rss_mb()
-
-    # Model initialization
-    print("\n[1] Model initialization...")
-    t0 = time.perf_counter()
-    from app.tts.local_tts import PhononTTS
-    tts = PhononTTS()
-    tts.load()
-    init_ms = (time.perf_counter() - t0) * 1000
-    print(f"    Init time: {init_ms:.0f}ms")
-
-    rss_after_load = _get_rss_mb()
-    print(f"    RSS after load: {rss_after_load:.1f}MB (delta: {rss_after_load - rss_before:.1f}MB)")
-
-    # Cold synthesis
-    print("\n[2] Cold synthesis (first call)...")
-    test_text = "Hello, this is JARVIS. I'm ready to assist you."
-    t0 = time.perf_counter()
-    result = tts.synthesize(test_text)
-    cold_ms = (time.perf_counter() - t0) * 1000
-    assert result.success, f"Cold synthesis failed: {result.error}"
-    print(f"    Latency: {cold_ms:.0f}ms")
-    print(f"    Duration: {result.duration_seconds:.2f}s")
-    print(f"    RTF: {cold_ms / (result.duration_seconds * 1000):.3f}x")
-
-    # Warm synthesis — multiple iterations
-    test_sentences = [
-        "According to the logs, the issue is probably caused by a timeout.",
-        "The weather today is clear with temperatures around twenty degrees.",
-        "I've found three relevant documents in your recent files.",
-        "That command has been executed successfully.",
-        "Let me check the latest status for you.",
-        "The build completed with two warnings and no errors.",
-        "Based on the metrics, memory usage has increased by fifteen percent.",
-        "I'll set a reminder for your meeting at three o'clock.",
-    ]
-
-    print(f"\n[3] Warm synthesis ({len(test_sentences)} sentences)...")
-    latencies: list[float] = []
-    durations: list[float] = []
-
-    for sentence in test_sentences:
-        t0 = time.perf_counter()
-        result = tts.synthesize(sentence)
-        lat = (time.perf_counter() - t0) * 1000
-        assert result.success, f"Synthesis failed: {result.error}"
-        latencies.append(lat)
-        durations.append(result.duration_seconds)
-
-    p50 = statistics.median(latencies)
-    p95 = sorted(latencies)[int(len(latencies) * 0.95)]
-    mean_lat = statistics.mean(latencies)
-    mean_dur = statistics.mean(durations)
-    mean_rtf = mean_lat / (mean_dur * 1000) if mean_dur > 0 else 0
-
-    print(f"    Mean latency: {mean_lat:.0f}ms")
-    print(f"    P50 latency:  {p50:.0f}ms")
-    print(f"    P95 latency:  {p95:.0f}ms")
-    print(f"    Min latency:  {min(latencies):.0f}ms")
-    print(f"    Max latency:  {max(latencies):.0f}ms")
-    print(f"    Mean audio duration: {mean_dur:.2f}s")
-    print(f"    Mean RTF: {mean_rtf:.3f}x (< 1.0 = real-time)")
-
-    # Streaming test
-    print("\n[4] Streaming synthesis...")
-    stream_text = "This is a streaming test. Multiple sentences allow chunked synthesis. Each chunk can start playing immediately."
-    t0 = time.perf_counter()
-    chunks = list(tts.synthesize_stream(stream_text))
-    stream_ms = (time.perf_counter() - t0) * 1000
-    total_samples = sum(len(c.audio) for c in chunks)
-    stream_duration = total_samples / 24000
-
-    first_chunk_samples = len(chunks[0].audio) if chunks else 0
-    print(f"    Total chunks: {len(chunks)}")
-    print(f"    Total latency: {stream_ms:.0f}ms")
-    print(f"    Total duration: {stream_duration:.2f}s")
-    print(f"    First chunk samples: {first_chunk_samples}")
-
-    # Memory
-    rss_final = _get_rss_mb()
-    print(f"\n[5] Memory")
-    print(f"    RSS before: {rss_before:.1f}MB")
-    print(f"    RSS after load: {rss_after_load:.1f}MB")
-    print(f"    RSS final: {rss_final:.1f}MB")
-    print(f"    TTS model delta: {rss_after_load - rss_before:.1f}MB")
-
-    # Summary
-    print("\n" + "=" * 60)
-    print("SUMMARY")
-    print("=" * 60)
-    print(f"  Model:              Phonon 31m (Easton)")
-    print(f"  Sample rate:        24000 Hz")
-    print(f"  Init time:          {init_ms:.0f}ms")
-    print(f"  Cold latency:       {cold_ms:.0f}ms")
-    print(f"  Warm P50:           {p50:.0f}ms")
-    print(f"  Warm P95:           {p95:.0f}ms")
-    print(f"  Mean RTF:           {mean_rtf:.3f}x")
-    print(f"  Memory (model):     {rss_after_load - rss_before:.1f}MB")
-    print(f"  Streaming chunks:   {len(chunks)}")
-    print("=" * 60)
-
-    tts.close()
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--runs", type=int, default=5, help="repetitions per sentence")
+    args = parser.parse_args()
+    asyncio.run(_run(args.runs))
 
 
 if __name__ == "__main__":
