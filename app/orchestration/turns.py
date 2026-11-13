@@ -1,6 +1,6 @@
 """TurnManager — one Turn per attention-positive utterance, latest wins.
 
-Transcript → SpeechEvent + attention → [persist ‖ history ‖ memory ‖ vision]
+Transcript → SpeechEvent + attention → [persist ‖ history ‖ memory ‖ camera frame]
 → context → streaming reasoning → sentence splitter → bounded queue → TTS → player.
 
 Every blocking call runs off the event loop. `turn.cancel` is the single stop
@@ -10,6 +10,7 @@ See docs/architecture/06-engineering-contracts.md, section 6.
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
 import logging
 import re
@@ -22,6 +23,7 @@ from typing import AsyncIterator
 from app.contracts import STAGES, LatencyRecorder, Transcript, Turn
 from app.events.types import Modality, ResponseEvent, SpeechEvent
 from app.orchestration.sentences import SentenceSplitter
+from app.perception.jpeg import frame_to_jpeg
 from app.reasoning.model import StreamingReasoningModel
 from app.response.decision import decide
 
@@ -33,6 +35,15 @@ SENTENCE_QUEUE_SIZE = 8   # sentences waiting for TTS
 _VISION_RE = re.compile(
     r"\b(see|seeing|look|looking|watch|watching|visual|camera|showing)\b", re.IGNORECASE
 )
+
+
+class TurnObserver:
+    """Receives turn progress for a UI. Every method is a no-op; called on the event loop."""
+
+    def user(self, turn_id: str, text: str, source: str, image_b64: str | None) -> None: ...
+    def status(self, state: str) -> None: ...   # idle | thinking | speaking
+    def delta(self, turn_id: str, text: str) -> None: ...
+    def assistant(self, turn_id: str, text: str, outcome: str, latency_ms: float | None) -> None: ...
 
 
 def is_vision_request(text: str) -> bool:
@@ -64,6 +75,9 @@ class _TurnState:
     playback_done: asyncio.Future | None = None
     tts_failed: bool = False
     recorded: bool = False
+    source: str = "voice"                             # voice | text
+    image_b64: str | None = None                      # uploaded photo
+    use_camera: bool = False
 
 
 class TurnManager:
@@ -81,7 +95,8 @@ class TurnManager:
         fusion=None,
         frontend=None,
         recorder: LatencyRecorder,
-        on_demand_vision=None,       # (camera, analyzer) or None
+        camera=None,                 # Camera: frames for vision turns
+        observer: TurnObserver | None = None,
         session_id: str = "",
         visual_context_ring=None,    # deque[(timestamp, description)] fallback for fusion
     ) -> None:
@@ -96,7 +111,8 @@ class TurnManager:
         self._fusion = fusion
         self._frontend = frontend
         self._recorder = recorder
-        self._vision = on_demand_vision
+        self._camera = camera
+        self.observer = observer or TurnObserver()
         self._session_id = session_id
         self._ring = visual_context_ring
         self._speech = (
@@ -111,7 +127,22 @@ class TurnManager:
 
     # ── Entry points ───────────────────────────────────────────────────
 
-    async def handle_transcript(self, transcript: Transcript) -> None:
+    async def handle_text(self, text: str, image_b64: str | None = None, use_camera: bool = False) -> None:
+        """A typed message: always addressed to JARVIS, so it skips the wake-word check."""
+        now = time.time()
+        await self.handle_transcript(
+            Transcript(text=text, speech_start_time=now, speech_end_time=now, segment_emitted_time=now,
+                       asr_latency_ms=0.0, audio_seconds=0.0),
+            addressed=True, image_b64=image_b64, use_camera=use_camera,
+        )
+
+    def stop(self) -> None:
+        self._cancel_active()
+
+    async def handle_transcript(
+        self, transcript: Transcript, *, addressed: bool = False,
+        image_b64: str | None = None, use_camera: bool = False,
+    ) -> None:
         self._loop = asyncio.get_running_loop()
         received = time.time()
         event = SpeechEvent(
@@ -133,7 +164,8 @@ class TurnManager:
         if self._attention is None:
             return
         decision = self._attention.evaluate(event)
-        if not decision.should_reason:
+        if not (decision.should_reason or addressed):
+            self._notify("user", event.correlation_id, event.transcript, "text" if addressed else "voice", None)
             print(
                 f"\n[ATTENTION]\n"
                 f"  event_id={event.id[:12]}\n"
@@ -155,7 +187,9 @@ class TurnManager:
         turn.mark("segment_emitted", transcript.segment_emitted_time)
         turn.mark("asr_done", received)
         turn.mark("attention_done")
-        st = _TurnState(turn=turn, event=event)
+        st = _TurnState(turn=turn, event=event, source="text" if addressed else "voice",
+                        image_b64=image_b64, use_camera=use_camera)
+        self._notify("status", "thinking")
         prev = self._last_task
         self._active = st
         if self._cfg.perception.pause_during_turn:
@@ -243,8 +277,8 @@ class TurnManager:
                 self._memory.retrieve_context, text, limit=cfg.memory.max_retrieved_memories
             )
             jobs["remember"] = asyncio.to_thread(self._memory.maybe_remember, text, event.id)
-        if self._vision is not None and is_vision_request(text):
-            jobs["vision"] = self._live_vision()
+        if st.image_b64 is None and self._camera is not None and (st.use_camera or is_vision_request(text)):
+            jobs["camera"] = self._capture_jpeg()
 
         results = dict(zip(jobs, await asyncio.gather(*jobs.values(), return_exceptions=True)))
         for name, r in results.items():
@@ -261,11 +295,12 @@ class TurnManager:
             ]
         mem_context = results.get("memories") or None
 
+        image = st.image_b64 or results.get("camera")
+        self._notify("user", st.turn.turn_id, text, st.source, image)
+
         multimodal_ctx: list[str] | None = None
         vis_ctx: list[str] | None = None
-        if results.get("vision"):
-            multimodal_ctx = [f"[visual — live] {results['vision']}"]
-        elif is_vision_request(text):
+        if not image and (st.use_camera or is_vision_request(text)):
             # Without this the system prompt's "you have a camera" makes the model invent a view.
             multimodal_ctx = ["[visual — live] unavailable: no camera image right now. "
                               "If asked what you can see, say you cannot see at the moment."]
@@ -293,28 +328,29 @@ class TurnManager:
             multimodal_context=multimodal_ctx,
         )
         messages = self._context_builder.to_messages(ctx)
+        if image:
+            # Ollama reads "images" off the user message; Gemma 4 sees the pixels directly.
+            source = "an uploaded photo" if st.image_b64 else "your live camera view"
+            messages.insert(-1, {"role": "system", "content": f"The image attached to the user's message is {source}."})
+            messages[-1]["images"] = [image]
         logger.debug("Context: %d messages, %d chars", len(messages), ctx.total_characters)
         return messages
 
-    async def _live_vision(self) -> str | None:
-        camera, analyzer = self._vision
-
-        async def look() -> str | None:
-            frame = await camera.capture()
-            if frame is None:
-                return None
-            analysis = await analyzer.analyze(frame)
-            return None if analysis is None else analysis.description
-
+    async def _capture_jpeg(self) -> str | None:
+        """Base64 JPEG of the current camera frame, or None if the camera gives nothing in time."""
         timeout = self._cfg.perception.on_demand_timeout_seconds
         try:
-            desc = await asyncio.wait_for(look(), timeout)
+            frame = await asyncio.wait_for(self._camera.capture(), timeout)
+            if frame is None:
+                return None
+            jpeg = await asyncio.to_thread(frame_to_jpeg, frame, max_side=768, quality=85)
         except TimeoutError:
-            logger.warning("ON_DEMAND_VISION timed out after %.1fs", timeout)
+            logger.warning("CAMERA_CAPTURE timed out after %.1fs", timeout)
             return None
-        if desc:
-            logger.info("ON_DEMAND_VISION desc=%r", desc)
-        return desc
+        except Exception:
+            logger.exception("CAMERA_CAPTURE failed")
+            return None
+        return base64.b64encode(jpeg).decode()
 
     async def _respond(self, st: _TurnState, messages: list[dict[str, str]]) -> str:
         cfg = self._cfg
@@ -353,6 +389,7 @@ class TurnManager:
                         async for delta in deltas:
                             turn.mark("llm_first_token")
                             st.text += delta
+                            self._notify("delta", turn.turn_id, delta)
                             if not await emit(splitter.feed(delta)):
                                 more = False
                                 break
@@ -369,6 +406,7 @@ class TurnManager:
                     if resp.respond and resp.text:
                         turn.mark("llm_first_token")
                         st.text = resp.text
+                        self._notify("delta", turn.turn_id, resp.text)
                         more = await emit(splitter.feed(resp.text))
                 turn.mark("llm_done")
                 if more and (tail := splitter.flush()):
@@ -538,8 +576,21 @@ class TurnManager:
             return
         st.recorded = True
         row = self._recorder.record(st.turn, outcome)
+        latency = st.turn.elapsed_ms("first_audio") or st.turn.elapsed_ms("llm_first_token")
+        self._notify("assistant", st.turn.turn_id, st.text.strip(),
+                     "failed" if outcome == "no_response" else outcome,
+                     None if latency is None else round(latency, 1))
+        if self._active is None:
+            self._notify("status", "idle")
         stages = " ".join(f"{k}={row[k]:.0f}" for k in STAGES if k in row)
         logger.info("TURN turn=%s outcome=%s %s", st.turn.turn_id[:12], outcome, stages)
+
+    def _notify(self, name: str, *args) -> None:
+        """A UI problem must never break a turn."""
+        try:
+            getattr(self.observer, name)(*args)
+        except Exception:
+            logger.exception("Turn observer %s failed", name)
 
     def _call_on_loop(self, fn, *args) -> None:
         if self._loop is None:
@@ -554,6 +605,7 @@ class TurnManager:
         if st is None or st.turn.turn_id != turn_id:
             return
         st.turn.mark("first_audio")
+        self._notify("status", "speaking")
         print(
             f"\n[TTS]\n"
             f"  event_id={st.event.id[:12]}\n"

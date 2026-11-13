@@ -118,6 +118,7 @@ def _cfg():
     cfg = JarvisConfig()
     cfg.memory.enabled = False
     cfg.perception.enabled = False
+    cfg.ui.enabled = False
     return cfg
 
 
