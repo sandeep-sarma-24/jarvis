@@ -19,7 +19,7 @@ class AudioConfig:
 @dataclass
 class VADConfig:
     threshold: float = 0.5
-    speech_end_silence_ms: int = 300
+    speech_end_silence_ms: int = 192
     minimum_speech_ms: int = 250
     maximum_segment_seconds: int = 30
     pre_roll_ms: int = 96  # audio kept from before speech onset
@@ -72,7 +72,7 @@ class TTSConfig:
     enabled: bool = True
     model: str = "hf://gradium/phonon-31m-en"
     voice: str = "Easton"
-    quant: str = "q8"
+    quant: str = "q8_0"
     max_text_length: int = 2000
 
 

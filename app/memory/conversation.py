@@ -32,13 +32,14 @@ class ConversationState:
     def add_user_message(
         self, content: str, source_event_id: str | None = None
     ) -> ConversationMessage:
+        """Persist a user turn; a repeated source_event_id returns the stored row."""
         msg = ConversationMessage.create(
             session_id=self._session.id,
             role="user",
             content=content,
             source_event_id=source_event_id,
         )
-        self._store.add_message(msg)
+        msg = self._store.add_message(msg)
         logger.debug(
             "CONVERSATION_MESSAGE session=%s role=user len=%d source=%s",
             self._session.id[:12], len(content), source_event_id[:12] if source_event_id else None,
@@ -54,7 +55,7 @@ class ConversationState:
             content=content,
             source_event_id=source_event_id,
         )
-        self._store.add_message(msg)
+        msg = self._store.add_message(msg)
         logger.debug(
             "CONVERSATION_MESSAGE session=%s role=assistant len=%d source=%s",
             self._session.id[:12], len(content), source_event_id[:12] if source_event_id else None,

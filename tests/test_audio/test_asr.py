@@ -13,7 +13,9 @@ def test_asr_loads_and_transcribes():
 
     # 2 seconds of silence — should produce empty or minimal transcript
     audio = np.zeros(32000, dtype=np.float32)
-    result = asr.transcribe(audio, sample_rate=16000)
+    # MLX affinity: inference must run on the thread that loaded the model.
+    result = asr._executor.submit(asr.transcribe, audio, 16000).result()
+    asr.close()
     assert isinstance(result, ASRResult)
     assert result.latency_ms >= 0
 

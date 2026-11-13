@@ -7,6 +7,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import threading
+import time
 from collections import deque
 
 import numpy as np
@@ -20,12 +21,13 @@ logger = logging.getLogger(__name__)
 class BoundedAudioBuffer:
     """Thread-safe bounded ring buffer bridging the PortAudio callback to asyncio.
 
-    Overflow policy: drop oldest unprocessed chunk, increment counter, log warning.
+    Items are (chunk, capture_time) with capture_time in time.time() seconds.
+    Overflow policy: drop oldest unprocessed chunk, increment counter.
     """
 
     def __init__(self, max_chunks: int) -> None:
         self._max = max_chunks
-        self._buf: deque[np.ndarray] = deque(maxlen=max_chunks)
+        self._buf: deque[tuple[np.ndarray, float]] = deque(maxlen=max_chunks)
         self._lock = threading.Lock()
         self._event = asyncio.Event()
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -41,30 +43,32 @@ class BoundedAudioBuffer:
     def bind_loop(self, loop: asyncio.AbstractEventLoop) -> None:
         self._loop = loop
 
-    def put(self, chunk: np.ndarray) -> None:
+    def put(self, chunk: np.ndarray, capture_time: float | None = None) -> None:
         """Called from PortAudio thread — must not block."""
+        if capture_time is None:
+            capture_time = time.time()
         with self._lock:
             self.chunks_received += 1
             if len(self._buf) == self._max:
                 self.chunks_dropped += 1
-            self._buf.append(chunk)
+            self._buf.append((chunk, capture_time))
             current = len(self._buf)
             if current > self.max_depth:
                 self.max_depth = current
         if self._loop is not None:
             self._loop.call_soon_threadsafe(self._event.set)
 
-    def get_nowait(self) -> np.ndarray | None:
+    def get_nowait(self) -> tuple[np.ndarray, float] | None:
         with self._lock:
             if self._buf:
                 return self._buf.popleft()
             return None
 
-    async def get(self) -> np.ndarray:
+    async def get(self) -> tuple[np.ndarray, float]:
         while True:
-            chunk = self.get_nowait()
-            if chunk is not None:
-                return chunk
+            item = self.get_nowait()
+            if item is not None:
+                return item
             self._event.clear()
             await self._event.wait()
 
@@ -100,7 +104,10 @@ class MicrophoneCapture:
             return
         if status:
             logger.warning("sounddevice status: %s", status)
-        self.buffer.put(indata[:, 0].copy())
+        # time_info.inputBufferAdcTime is on PortAudio's stream clock, not wall
+        # time; time.time() here is within one block of the ADC and matches the
+        # clock used by every latency mark.
+        self.buffer.put(indata[:, 0].copy(), time.time())
 
     def start(self, loop: asyncio.AbstractEventLoop) -> None:
         self.buffer.bind_loop(loop)
