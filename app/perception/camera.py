@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import threading
 import time
 from enum import Enum, auto
 from typing import Protocol, runtime_checkable
@@ -56,6 +57,9 @@ class OpenCVCamera:
         self._height = height
         self._state = CameraState.STOPPED
         self._cap = None  # cv2.VideoCapture, lazily imported
+        # Serialises cap.read/release across the capture loop and on-demand
+        # vision; held in the worker thread so a cancelled await can't leak it.
+        self._io_lock = threading.Lock()
 
     @property
     def state(self) -> CameraState:
@@ -93,8 +97,8 @@ class OpenCVCamera:
         self._state = CameraState.STOPPING
         try:
             if self._cap is not None:
-                await asyncio.to_thread(self._cap.release)
-                self._cap = None
+                cap, self._cap = self._cap, None
+                await asyncio.to_thread(self._locked, cap.release)
         finally:
             self._state = CameraState.STOPPED
             logger.info("Camera stopped")
@@ -106,7 +110,7 @@ class OpenCVCamera:
         try:
             import cv2
 
-            ret, frame = await asyncio.to_thread(self._cap.read)
+            ret, frame = await asyncio.to_thread(self._locked, self._cap.read)
             if not ret or frame is None:
                 return None
 
@@ -122,6 +126,11 @@ class OpenCVCamera:
         except Exception:
             logger.exception("Frame capture failed")
             return None
+
+
+    def _locked(self, fn):
+        with self._io_lock:
+            return fn()
 
 
 class FakeCamera:
