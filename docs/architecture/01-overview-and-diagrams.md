@@ -8,7 +8,7 @@ JARVIS is a persistent, multimodal personal AI assistant that continuously perce
 
 ## Architecture in One Paragraph
 
-Audio flows continuously through a VAD ? ASR pipeline. Video flows through adaptive frame sampling ? change detection. Screen capture flows through diff detection ? OCR. All three produce typed **perception events** (which carry correlation IDs for cross-modal grouping) that feed into a shared **attention engine** ? a tiered system of deterministic rules, a lightweight classifier, and (for genuinely ambiguous cases) the LLM itself. The attention engine answers one question: *should the system spend reasoning resources on this?* When yes, events update the **world state** (the system's model of what is happening *right now*), and the **context builder** assembles world state, retrieved persistent memories, and the current event into a compact prompt for the **reasoning model** (currently Gemma 4 12B, running locally via Ollama). The model produces a response, and a separate **response decision** determines the action: respond via TTS, store to memory, execute a tool, or remain silent. Reasoning does not automatically mean responding. The system runs as a single Python process (modular monolith) on the primary development machine (M4 MacBook Air, 16GB).
+Audio flows continuously through a VAD ? ASR pipeline. Video flows through adaptive frame sampling ? change detection. Screen capture flows through diff detection ? OCR. All three produce typed **perception events** (which carry correlation IDs for cross-modal grouping) that feed into a shared **attention engine** ? a tiered system of deterministic rules, a lightweight classifier, and (for genuinely ambiguous cases) the LLM itself. The attention engine answers one question: *should the system spend reasoning resources on this?* When yes, events update the **world state** (the system's model of what is happening *right now*), and the **context builder** assembles world state, retrieved persistent memories, and the current event into a compact prompt for the **reasoning model** (currently `gemma4:e2b-it-qat` via Ollama on a GPU host on the local network, with `gemma4:12b` on local Ollama as fallback). The model produces a response, and a separate **response decision** determines the action: respond via TTS, store to memory, execute a tool, or remain silent. Reasoning does not automatically mean responding. The system runs as a single Python process (modular monolith) on the primary development machine (M4 MacBook Air, 16GB).
 
 ## Conceptual Flow
 
@@ -22,7 +22,7 @@ Response Decision ("should respond?") --> Action (TTS / Store / Tool / Silent)
 
 1. **Python monolith** ? single language, single process, asyncio for concurrency. No microservices.
 2. **Local-only inference** ? all models run on-device. Cloud fallback deferred to a future reassessment.
-3. **Models are replaceable behind interfaces** ? the current implementation uses Gemma 4 12B Unified (Q4, ~7.6GB) as the reasoning model, Qwen3-ASR for speech recognition, Kokoro for TTS, and Silero for VAD. None of these are architectural dependencies; all sit behind abstract interfaces and are swappable via configuration.
+3. **Models are replaceable behind interfaces** ? the current implementation uses `gemma4:e2b-it-qat` via Ollama as the reasoning model (local `gemma4:12b` as fallback), Granite Speech 5 for speech recognition, Phonon for TTS, and Silero for VAD. None of these are architectural dependencies; all sit behind abstract interfaces and are swappable via configuration.
 4. **Tiered attention** ? rules first, classifier second, LLM last. Most input never touches the LLM. Attention determines whether to *reason*, not whether to *respond*.
 5. **Response decision is separate from attention** ? the reasoning model may determine that an event is worth understanding but not worth responding to. "Should reason?" and "should respond?" are distinct questions answered by different components.
 6. **World State is distinct from memory** ? world state represents what is happening *now* (transient, in-process). Memory represents what happened *before* (persistent, queryable). Both inform the context builder but serve different purposes.
@@ -35,10 +35,10 @@ Response Decision ("should respond?") --> Action (TTS / Store / Tool / Silent)
 
 Tradeoffs explicitly acknowledged:
 
-- **Local-first vs. capability**: The current reasoning model (Gemma 4 12B Q4) is capable but not frontier-class. Complex multi-step reasoning will be weaker than a cloud model. Accepted: reassess when quality becomes the bottleneck.
+- **Local-first vs. capability**: The current reasoning model (Gemma 4 E2B, with 12B as local fallback) is capable but not frontier-class. Complex multi-step reasoning will be weaker than a cloud model. Accepted: reassess when quality becomes the bottleneck.
 - **Privacy vs. memory richness**: All memory is local, which limits cross-device sync and backup. Accepted: single-machine system for now.
 - **Modular monolith vs. isolation**: A single process means a crash in the vision pipeline could take down audio. Mitigation: asyncio task isolation + supervisor pattern for critical loops.
-- **M4 Air (base) vs. model size**: 16GB constrains context window and concurrent model loading. The current 12B model at Q4 leaves ~8GB for OS + applications + KV cache. Context must be kept compact (~2-4K tokens for typical interactions). This makes the context builder's job critical.
+- **M4 Air (base) vs. model size**: 16GB constrains context window and concurrent model loading. The 12B fallback model at Q4 leaves ~8GB for OS + applications + KV cache when it runs on the Mac; the primary model runs on a separate host. Context must be kept compact (~2-4K tokens for typical interactions). This makes the context builder's job critical.
 
 ---
 
@@ -79,7 +79,7 @@ flowchart TB
     end
 
     subgraph Reasoning["Reasoning Layer"]
-        LLM[Reasoning Model<br/>Currently: Gemma 4 12B Q4]
+        LLM[Reasoning Model<br/>Currently: gemma4:e2b-it-qat via Ollama]
     end
 
     subgraph ResponseDec["Response Decision"]

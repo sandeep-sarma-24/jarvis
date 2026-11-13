@@ -1,5 +1,15 @@
 # §M — Phase-by-Phase Roadmap
 
+> **Current stack.** Phase records below describe the models used when each phase
+> was built and keep their measurements as history. Since then: ASR is Granite
+> Speech 5 (`ibm-granite/granite-speech-5.0-470m-turboctc`, mlx-audio) instead of
+> Qwen3-ASR; TTS is Phonon (`hf://gradium/phonon-31m-en`, voice Easton, `ptts`)
+> instead of Kokoro; reasoning and vision use `gemma4:e2b-it-qat` on a remote Ollama
+> host, with `gemma4:12b` on local Ollama as the reasoning fallback; memory retrieval
+> is SQLite FTS5. The streaming low-latency pipeline is specified in
+> [06-engineering-contracts.md](06-engineering-contracts.md) and measured as
+> described in [07-performance.md](07-performance.md).
+
 ## Phase 0: Architecture (This Document)
 
 **Status:** Complete.
@@ -322,7 +332,7 @@ AttentionDecision {should_reason = true}
 
 **Objective:** Synthesize JARVIS responses as spoken audio using local TTS. Primary deliverable: JARVIS speaks.
 
-**Primary deliverable:** Response text → Kokoro TTS → audio playback. JARVIS has a voice.
+**Primary deliverable:** Response text → TTS (Kokoro at the time; now Phonon) → audio playback. JARVIS has a voice.
 
 **Hard dependencies:** Phase 3 (needs response text to speak).
 
@@ -632,6 +642,10 @@ Activation: Keyboard shortcut (global hotkey), voice command ("Jarvis, privacy m
 
 # §R — Performance/Latency Budget
 
+> **Superseded for the streaming pipeline** by [07-performance.md](07-performance.md),
+> which lists the current latency stages, targets and benchmarks. The tables below
+> are the original Phase 0 budget for the Qwen3-ASR / Gemma 4 12B / Kokoro stack.
+
 > Performance figures are engineering targets based on available benchmarks and must be validated on the target M4 Air hardware during implementation. Failure to initially meet a target triggers profiling and evaluation; it does not automatically invalidate the architecture.
 
 ## End-to-End Pipeline (Speech → Voice Response)
@@ -685,7 +699,7 @@ ponytail: at peak, this leaves <1GB headroom. ASR and TTS are never active simul
 | **16GB memory too tight** for concurrent models | High | Degraded latency (swapping) | Load ASR/TTS on-demand; reduce KV cache; use E4B fallback |
 | **Gemma 4 12B quality insufficient** for complex reasoning at Q4 | Medium | Poor response quality | Cloud fallback (deferred); E4B for simple tasks, 12B for complex; tune prompts |
 | **Attention false positives** annoy user | High (initially) | User disables system | Conservative defaults (silence-biased); feedback loop; easy threshold adjustment |
-| **ASR accuracy** insufficient for natural speech | Low (Qwen3-ASR is strong) | Misunderstood requests | Confirmation heuristic; ask for repetition; 1.7B upgrade path |
+| **ASR accuracy** insufficient for natural speech | Low (Granite Speech 5; originally Qwen3-ASR) | Misunderstood requests | Confirmation heuristic; ask for repetition; 1.7B upgrade path |
 | **TTS voice** doesn't match JARVIS personality | Medium | Breaks immersion | Evaluate multiple voices; Qwen3-TTS voice cloning as upgrade |
 | **Ollama stability** under continuous use | Low | Service crashes | Supervisor pattern; auto-restart; health checks |
 | **macOS permissions** block mic/camera/screen | Low (one-time) | Can't start | Clear setup instructions; test permissions on launch |

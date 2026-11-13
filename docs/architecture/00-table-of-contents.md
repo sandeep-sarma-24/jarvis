@@ -9,6 +9,8 @@
 | `03-technology-and-structure.md` | J, K, L | Technology evaluation/recommendations, repository structure, interface definitions |
 | `04-roadmap-and-operations.md` | M, N, O, P, Q, R, S, Exit Gate | Phase roadmap, dependencies, testing, evaluation metrics, privacy/security, performance budget, risks, Phase 0 exit gate |
 | `05-vision-and-questions.md` | T, U, V, W, X | Open questions (classified), MVP definition, V1/V2/fully-realized definitions, principles self-check |
+| `06-engineering-contracts.md` | — | Frozen interfaces for the low-latency streaming pipeline: turn lifecycle and cancellation, audio frontend, streaming reasoning, streaming TTS/playback, memory, orchestration, file ownership |
+| `07-performance.md` | — | Latency stages, how each is measured, targets, benchmark scripts, results |
 
 ## Deliverable Cross-Reference
 
@@ -47,9 +49,9 @@ All deliverables A–X are accounted for, plus World State (E.1) and Phase 0 Exi
 | Concept | Responsibility | Location |
 |---------|---------------|----------|
 | **Attention** | "Should JARVIS spend reasoning resources on this?" | `attention/` |
-| **World State** | "What is happening right now?" (transient) | `state/` |
+| **World State** | "What is happening right now?" (transient) | planned `state/` (not built) |
 | **Memory** | "What happened previously?" (persistent) | `memory/` |
 | **Working Memory** | Recent conversation turns (session-scoped) | `memory/working.py` |
 | **Context Builder** | Assembles world state + memories + event for LLM | `context/` |
 | **Reasoning** | LLM generates understanding/response | `reasoning/` |
-| **Response Decision** | "Should JARVIS actually respond?" (post-reasoning) | `reasoning/decision.py` |
+| **Response Decision** | "Should JARVIS actually respond?" (post-reasoning) | `response/decision.py` |

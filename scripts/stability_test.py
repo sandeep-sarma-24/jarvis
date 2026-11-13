@@ -1,35 +1,45 @@
 #!/usr/bin/env python3
 """Synthetic pipeline stability test.
 
-Feeds simulated audio through VAD + segmentation + ASR + EventBus and measures
-memory stability over time.  Does NOT use a real microphone.
+Default mode feeds simulated audio through VAD + segmentation + ASR + EventBus and
+measures memory stability over time (loads the VAD and ASR models).
 
-This is NOT a substitute for a real microphone hardware test.
+--simulated runs N turns, a third of them cancelled by barge-in, through
+app.orchestration.turns.TurnManager with the fakes in scripts/e2e_fakes.py and
+fails if live asyncio tasks or threads grow or RSS drifts. No models, no devices.
 
-Usage: python -m scripts.stability_test [--minutes 10]
+Neither mode uses a real microphone; this is NOT a substitute for a hardware test.
+
+Usage:
+  python -m scripts.stability_test [--minutes 10]
+  python -m scripts.stability_test --simulated [--turns 300]
 """
 from __future__ import annotations
 
+import argparse
 import asyncio
+import gc
 import os
 import sys
+import threading
 import time
 
 import numpy as np
 import psutil  # type: ignore[import-untyped]
 
-from app.audio.vad import VoiceActivityDetector, VADResult
-from app.audio.segmentation import SpeechSegmenter
-from app.audio.asr import SpeechRecognizer
-from app.config import ASRConfig, VADConfig
 from app.events.bus import EventBus
-from app.events.types import Modality, SpeechEvent
 
 SR = 16000
 CHUNK = 512
 
 
 async def run(minutes: int = 10) -> None:
+    from app.audio.asr import SpeechRecognizer
+    from app.audio.segmentation import SpeechSegmenter
+    from app.audio.vad import VADResult, VoiceActivityDetector
+    from app.config import ASRConfig, VADConfig
+    from app.events.types import Modality, SpeechEvent
+
     proc = psutil.Process(os.getpid())
 
     print(f"Synthetic pipeline stability test: {minutes} minutes")
@@ -85,7 +95,7 @@ async def run(minutes: int = 10) -> None:
                 if seg is not None:
                     segments_count += 1
                     try:
-                        r = asr.transcribe(seg.audio, seg.sample_rate)
+                        r = await asr.transcribe_async(seg.audio, seg.sample_rate)
                         transcripts_count += 1
                         event = SpeechEvent(
                             session_id="stability",
@@ -105,7 +115,7 @@ async def run(minutes: int = 10) -> None:
                 if seg is not None:
                     segments_count += 1
                     try:
-                        r = asr.transcribe(seg.audio, seg.sample_rate)
+                        r = await asr.transcribe_async(seg.audio, seg.sample_rate)
                         transcripts_count += 1
                         event = SpeechEvent(
                             session_id="stability",
@@ -155,8 +165,77 @@ async def run(minutes: int = 10) -> None:
     print(f"\n  Memory stable: {'YES' if stable else 'NO — investigate leak'}")
 
 
+RSS_DRIFT_LIMIT_MB = 30.0
+
+
+async def run_simulated(turns: int = 300, batch: int = 15) -> dict[str, float]:
+    """Simulated turns through TurnManager; returns growth figures and an `ok` flag."""
+    from argparse import Namespace
+
+    from app.config import load_config
+    from scripts.benchmark_e2e import _transcripts, build_simulated, drive_turns
+    from scripts.e2e_fakes import CountingRecorder
+
+    proc = psutil.Process(os.getpid())
+    cfg = load_config()
+    cfg.perception.enabled = False
+    cfg.memory.enabled = False
+    cfg.barge_in.enabled = True
+    fake = Namespace(ttft_ms=20.0, tps=400.0, tts_first_chunk_ms=10.0, tts_rtf=0.05, fail_rate=0.0)
+    recorder = CountingRecorder(maxlen=100)
+    bus = EventBus(queue_size=cfg.event_bus.subscriber_queue_size)
+    await bus.start()
+    tm, player, closers = build_simulated(cfg, fake, bus, recorder)
+
+    async def batch_of(n: int, cancel: bool):
+        return await drive_turns(tm, player, recorder, _transcripts(n), gap_s=0.0,
+                                 barge_in_after_s=0.05 if cancel else None)
+
+    def snapshot() -> tuple[int, int, float]:
+        gc.collect()
+        return len(asyncio.all_tasks()), threading.active_count(), proc.memory_info().rss / 2**20
+
+    timeouts = 0
+    try:
+        timeouts += (await batch_of(batch, False)).timeouts  # warm-up: executors and caches fill here
+        tasks0, threads0, rss0 = snapshot()
+        done = 0
+        while done < turns:
+            n = min(batch, turns - done)
+            timeouts += (await batch_of(n, cancel=(done // batch) % 3 == 2)).timeouts
+            done += n
+        tasks1, threads1, rss1 = snapshot()
+    finally:
+        await tm.shutdown()
+        for close in closers:
+            close()
+        await bus.shutdown()
+
+    result = {"turns": turns, "recorded": recorder.count, "timeouts": timeouts,
+              "task_growth": tasks1 - tasks0, "thread_growth": threads1 - threads0,
+              "rss_drift_mb": round(rss1 - rss0, 1), "stale_chunks_played": player.stale_played}
+    result["ok"] = (result["task_growth"] <= 0 and result["thread_growth"] <= 0
+                    and result["rss_drift_mb"] < RSS_DRIFT_LIMIT_MB and timeouts == 0
+                    and player.stale_played == 0)
+    return result
+
+
 if __name__ == "__main__":
-    minutes = 10
-    if len(sys.argv) > 2 and sys.argv[1] == "--minutes":
-        minutes = int(sys.argv[2])
-    asyncio.run(run(minutes))
+    parser = argparse.ArgumentParser(description="Synthetic stability test (no microphone).")
+    parser.add_argument("--minutes", type=int, default=10, help="audio mode duration")
+    parser.add_argument("--simulated", action="store_true", help="TurnManager with fakes, no models")
+    parser.add_argument("--turns", type=int, default=300, help="simulated mode turn count")
+    a = parser.parse_args()
+    if not a.simulated:
+        asyncio.run(run(a.minutes))
+        sys.exit(0)
+    try:
+        import app.orchestration.turns  # noqa: F401
+    except ImportError:
+        print("NOT RUN: app.orchestration.turns is not in this tree yet")
+        sys.exit(2)
+    r = asyncio.run(run_simulated(a.turns))
+    print("Simulated turn stability (SIMULATED, fake models):")
+    for k, v in r.items():
+        print(f"  {k:<20} {v}")
+    sys.exit(0 if r["ok"] else 1)

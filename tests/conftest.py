@@ -1,13 +1,17 @@
 import pytest
 
+# Every marker declared in pyproject.toml. Each needs a model, a remote host or
+# real hardware, so a plain `pytest` skips it; select it with `-m <marker>`.
+OPT_IN_MARKERS = ("integration", "hardware", "model")
+
 
 def pytest_collection_modifyitems(config, items):
-    """Auto-skip integration/hardware tests unless explicitly selected."""
-    run_integration = config.getoption("-m", default="") and "integration" in config.getoption("-m", default="")
-    run_hardware = config.getoption("-m", default="") and "hardware" in config.getoption("-m", default="")
-
-    for item in items:
-        if "integration" in item.keywords and not run_integration:
-            item.add_marker(pytest.mark.skip(reason="needs -m integration"))
-        if "hardware" in item.keywords and not run_hardware:
-            item.add_marker(pytest.mark.skip(reason="needs -m hardware"))
+    """Auto-skip opt-in tests unless their marker appears in the -m expression."""
+    expr = config.getoption("-m", default="") or ""
+    for marker in OPT_IN_MARKERS:
+        if marker in expr:
+            continue
+        skip = pytest.mark.skip(reason=f"needs -m {marker}")
+        for item in items:
+            if marker in item.keywords:
+                item.add_marker(skip)

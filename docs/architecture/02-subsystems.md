@@ -117,7 +117,7 @@ ponytail: ceiling is ~100K memories before in-process numpy search becomes notic
 
 **Architectural requirement:** An embedding model capable of producing dense vector representations for semantic search.
 
-**Current implementation:** `nomic-embed-text` via Ollama (137M params, 768-dim, runs on CPU in <10ms per embedding). Alternatives: `all-MiniLM-L6-v2` (faster, less capable), `mxbai-embed-large` (better quality, larger). Swappable behind the `EmbeddingModel` interface.
+**Not implemented yet.** Retrieval is SQLite FTS5/BM25 blended with recency; `memory.semantic_enabled` and `memory.embedding_model` are unused. Evaluated for a future semantic layer: `nomic-embed-text` via Ollama (137M params, 768-dim). Alternatives: `all-MiniLM-L6-v2` (faster, less capable), `mxbai-embed-large` (better quality, larger). Swappable behind the `EmbeddingModel` interface.
 
 ## Memory Flow Diagram
 
@@ -393,7 +393,7 @@ channels = 1
 ring_buffer_seconds = 30  # tunable: longer for debugging, shorter to reduce memory
 ```
 
-**Latency budget (initial target):** VAD detection (1ms) + end-of-speech wait (300ms silence threshold) + ASR (500ms) = ~800ms from speech end to event. This is an empirical performance target and must be benchmarked during Phase 1 implementation.
+**Latency budget (initial target):** VAD detection (1ms) + end-of-speech wait (300ms silence threshold) + ASR (500ms) = ~800ms from speech end to event. The streaming pipeline lowers the end-of-speech wait to 192 ms (`vad.speech_end_silence_ms`); current targets are in 07-performance.md. This is an empirical performance target and must be benchmarked during Phase 1 implementation.
 
 ## Camera Pipeline (Phase 6 + 7 ? implemented)
 
@@ -525,13 +525,13 @@ Every model in the system sits behind an abstract interface. The architecture do
 
 ```
 ReasoningModel (interface)
-    |-- Current: Gemma 4 12B Unified (Q4)
-    |-- Alternative: Gemma 4 E4B (smaller, faster)
+    |-- Current: gemma4:e2b-it-qat on a remote Ollama host (streaming)
+    |-- Fallback: gemma4:12b on local Ollama (when the primary fails before its first token)
     |-- Future: any model matching the interface
 
 SpeechRecognizer (interface)
-    |-- Current: Qwen3-ASR 0.6B
-    |-- Alternative: Qwen3-ASR 1.7B, Whisper, Parakeet
+    |-- Current: Granite Speech 5 (granite-speech-5.0-470m-turboctc, mlx-audio)
+    |-- Alternative: Qwen3-ASR (original choice), Whisper, Parakeet
     |-- Future: any model matching the interface
 
 VoiceActivityDetector (interface)
@@ -540,17 +540,17 @@ VoiceActivityDetector (interface)
     |-- Future: any model matching the interface
 
 TextToSpeech (interface)
-    |-- Current: Kokoro-82M
-    |-- Alternative: Qwen3-TTS, Holler
+    |-- Current: Phonon TTS (phonon-31m-en, voice Easton, ptts runtime, streaming)
+    |-- Alternative: Kokoro-82M (original choice), Qwen3-TTS, Holler
     |-- Future: any model matching the interface
 
 EmbeddingModel (interface)
-    |-- Current: nomic-embed-text
-    |-- Alternative: all-MiniLM-L6-v2, mxbai-embed-large
+    |-- Current: none (memory retrieval is SQLite FTS5/BM25 + recency)
+    |-- Evaluated: nomic-embed-text, all-MiniLM-L6-v2, BAAI/bge-small-en-v1.5
     |-- Future: any model matching the interface
 
 VisionBackend (interface)
-    |-- Current: OllamaVisionBackend (Gemma 4 12B via Ollama)
+    |-- Current: OllamaVisionBackend (gemma4:e2b-it-qat on the remote Ollama host)
     |-- Testing: FakeVisionBackend (canned responses)
     |-- Future: any model matching the interface
 ```
@@ -560,13 +560,14 @@ VisionBackend (interface)
 | Tier | Role | Current Model | Size | Runtime | Target Latency | Memory |
 |------|------|---------------|------|---------|----------------|--------|
 | **Perception** | VAD | Silero VAD v5 | 2MB (JIT) | ONNX/CPU | <1ms/chunk | ~50MB |
-| **Perception** | ASR | Qwen3-ASR 0.6B | 1.2GB (fp16) | MLX | ~500ms/utterance | ~1.5GB |
-| **Perception** | Vision | Gemma 4 12B (same as reasoning) | 7.6GB | Ollama (shared) | ~39s/frame (M4 Air) | shared |
+| **Perception** | ASR | Granite Speech 5 470M (turboctc) | not measured | MLX (mlx-audio) | see 07-performance.md | not measured |
+| **Perception** | Vision | gemma4:e2b-it-qat (same as reasoning) | — | Ollama, remote host | not measured | on remote host |
 | **Perception** | OCR | Apple Vision | System | CoreML | ~100ms | 0 (system) |
 | **Attention** | Classifier | Weighted scoring (initial) | <10MB | CPU | ~5ms | ~50MB |
-| **Reasoning** | Primary LLM | Gemma 4 12B Unified (Q4) | 7.6GB | Ollama (llama.cpp Metal) | ~1.5-2s per response | ~9GB |
-| **Embeddings** | Memory search | nomic-embed-text | ~500MB | Ollama/CPU | <10ms | ~700MB |
-| **Output** | TTS | Kokoro-82M (bf16) | 327MB | MLX | ~200ms short utterance | ~500MB |
+| **Reasoning** | Primary LLM | gemma4:e2b-it-qat | — | Ollama, remote GPU host | see 07-performance.md | on remote host |
+| **Reasoning** | Fallback LLM | gemma4:12b (Q4) | 7.6GB | Ollama on the Mac | see 07-performance.md | ~9GB when loaded |
+| **Memory** | Retrieval | SQLite FTS5/BM25 (no embedding model) | — | SQLite | <50ms at 10k rows | small |
+| **Output** | TTS | Phonon 31M (q8_0) | ~65MB | ptts (Rust) | see 07-performance.md | not measured |
 
 **Total memory pressure (peak, all models hot):** ~12GB target. On 16GB system, this leaves ~4GB for OS + apps. In practice, ASR and TTS won't be simultaneously active, and embeddings are loaded on-demand.
 
@@ -647,7 +648,9 @@ class AttentionClassifier(ABC):
         ...
 ```
 
-## Why Gemma 4 12B (Current Selection)?
+## Why Gemma 4 12B (Original Selection)?
+
+> Superseded: the primary model is now `gemma4:e2b-it-qat` on a remote Ollama host; Gemma 4 12B is the optional local fallback (§J in 03-technology-and-structure.md). The comparison below records the original reasoning.
 
 | Criterion | Gemma 4 12B | Llama 3.x 8B | Phi-4 14B | Qwen3 14B |
 |-----------|-------------|--------------|-----------|-----------|
@@ -677,7 +680,7 @@ This is an *implementation choice*, not an architectural dependency. The `Reason
 | Microphone | Built-in array | Adequate for solo desk use. External mic optional. |
 | Camera | Built-in 12MP | Adequate for desk/room monitoring |
 
-**Target performance for reasoning model (Gemma 4 12B Q4):**
+**Original target performance for the local reasoning model (Gemma 4 12B Q4, now the fallback):**
 - Decode: ~25-35 tok/s (extrapolated ? M4 Max achieves 101 tok/s via LiteRT-LM with 40 GPU cores; M4 Air has 10 cores and 120 GB/s bandwidth. No published benchmark exists for 12B on base M4 Air specifically. **This estimate must be validated empirically.**)
 - Prefill: ~800-1200 tok/s (less GPU-bound)
 - Time to first token: ~0.5-1s
@@ -692,14 +695,14 @@ Performance figures are engineering targets based on available benchmarks and mu
 4. Community model library (important for swapping/experimenting)
 5. Slightly lower peak throughput than raw MLX (~10-15%) but dramatically better developer experience
 
-**Alternative runtime for TTS/ASR:** Direct MLX via `mlx-vlm` (for multimodal queries) and `kokoro-mlx` (for TTS). These use MLX directly because they need streaming and fine-grained control that Ollama's API doesn't expose.
+**Runtime for TTS/ASR:** ASR uses MLX directly via `mlx-audio`; TTS uses the `ptts` Rust runtime. Both run in-process because they need streaming and fine-grained control that Ollama's API doesn't expose.
 
 ## Secondary Machine: HP Omen (Ryzen 5 4600H, 8GB RAM, GTX 1650 Ti 4GB)
 
 | Component | Spec | Implication |
 |-----------|------|-------------|
 | CPU | 6-core/12-thread Ryzen 5 | Adequate for orchestration + CPU models |
-| GPU | GTX 1650 Ti, 4GB VRAM | Too small for 12B. Can run smaller models. |
+| GPU | GTX 1650 Ti, 4GB VRAM | Too small for 12B. Runs gemma4:e2b-it-qat; this is the current remote reasoning and vision host. |
 | RAM | 8GB DDR4 | Severely limiting. 12B Q4 (7.6GB) won't fit with OS. |
 | Storage | SSD | Fine |
 
@@ -717,8 +720,8 @@ Performance figures are engineering targets based on available benchmarks and mu
 |---------|---------|----------|-----|-------|
 | Ollama | Reasoning model, embeddings | Both | OpenAI-compat | Primary inference server |
 | MLX (mlx-vlm) | Multimodal queries | Mac only | Python API | For image/audio understanding |
-| kokoro-mlx | TTS | Mac only | Python API | Low-latency voice synthesis |
-| mlx-qwen3-asr | ASR | Mac only | Python API | Speech recognition |
+| ptts | TTS | Mac (Rust runtime) | Python API | Phonon streaming voice synthesis |
+| mlx-audio | ASR | Mac only | Python API | Granite Speech 5 recognition |
 | Silero VAD | VAD | Both | Python (ONNX) | Voice activity detection |
 | LiteRT-LM | Potential Ollama replacement | Both | OpenAI-compat | Google's runtime; potentially higher throughput but newer |
 
