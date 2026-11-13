@@ -19,6 +19,7 @@ def segmenter():
         speech_end_silence_ms=96,   # ceil(96/32) = 3 silence chunks
         minimum_speech_ms=64,       # ceil(64/32) = 2 chunks
         maximum_segment_seconds=1,
+        short_utterance_ms=0,
     )
     return SpeechSegmenter(config=cfg, sample_rate=SR, chunk_samples=CHUNK)
 
@@ -134,6 +135,7 @@ def test_chunk_conversion_uses_ceil():
         speech_end_silence_ms=50,   # 50/32 = 1.5625 → ceil = 2
         minimum_speech_ms=50,       # 50/32 = 1.5625 → ceil = 2
         maximum_segment_seconds=5,
+        short_utterance_ms=0,
     )
     seg = SpeechSegmenter(config=cfg, sample_rate=SR, chunk_samples=CHUNK)
     assert seg._silence_end_chunks == math.ceil(50 / CHUNK_MS)
@@ -143,7 +145,7 @@ def test_chunk_conversion_uses_ceil():
 # ── Return type correctness ───────────────────────────────────────────
 
 def test_emit_returns_none_for_too_short():
-    cfg = VADConfig(minimum_speech_ms=500, speech_end_silence_ms=96, maximum_segment_seconds=5)
+    cfg = VADConfig(minimum_speech_ms=500, speech_end_silence_ms=96, maximum_segment_seconds=5, short_utterance_ms=0)
     seg = SpeechSegmenter(config=cfg, sample_rate=SR, chunk_samples=CHUNK)
     # 3 speech chunks = 96ms, well below 500ms minimum
     results = [_speech()] * 3 + [_silence()] * 5
@@ -173,27 +175,27 @@ def _feed(seg: SpeechSegmenter, pattern: list[tuple[float, bool]], t0: float = 1
 def test_default_endpoint_delay_is_six_chunks():
     seg = _default_segmenter()
     assert seg._silence_end_chunks == 6
-    segments = _feed(seg, [(1.0, True)] * 10 + [(0.0, False)] * 6)
+    segments = _feed(seg, [(1.0, True)] * 40 + [(0.0, False)] * 6)
     assert len(segments) == 1
     s = segments[0]
     assert s.end_time - s.speech_end_time == pytest.approx(6 * CHUNK / SR)
     # 5 silence chunks are not enough
-    assert _feed(_default_segmenter(), [(1.0, True)] * 10 + [(0.0, False)] * 5) == []
+    assert _feed(_default_segmenter(), [(1.0, True)] * 40 + [(0.0, False)] * 5) == []
 
 
 def test_default_minimum_speech_counts_speech_chunks_only():
     # 64 ms click followed by a full endpoint of silence: must not reach ASR
     assert _feed(_default_segmenter(), [(1.0, True)] * 2 + [(0.0, False)] * 20) == []
     # 250 ms → 8 speech chunks is the minimum
-    assert _feed(_default_segmenter(), [(1.0, True)] * 7 + [(0.0, False)] * 6) == []
-    assert len(_feed(_default_segmenter(), [(1.0, True)] * 8 + [(0.0, False)] * 6)) == 1
+    assert _feed(_default_segmenter(), [(1.0, True)] * 7 + [(0.0, False)] * 15) == []
+    assert len(_feed(_default_segmenter(), [(1.0, True)] * 8 + [(0.0, False)] * 15)) == 1
 
 
 def test_speech_end_time_is_capture_time_of_last_speech_chunk():
     t0 = 5000.0
-    pattern = [(0.0, False)] * 4 + [(1.0, True)] * 10 + [(0.0, False)] * 2 + [(1.0, True)] * 3 + [(0.0, False)] * 6
+    pattern = [(0.0, False)] * 4 + [(1.0, True)] * 40 + [(0.0, False)] * 2 + [(1.0, True)] * 3 + [(0.0, False)] * 6
     s = _feed(_default_segmenter(), pattern, t0)[0]
-    last_speech = 4 + 10 + 2 + 3  # 1-based index of the last speech chunk
+    last_speech = 4 + 40 + 2 + 3  # 1-based index of the last speech chunk
     assert s.speech_end_time == pytest.approx(t0 + last_speech * CHUNK / SR)
     assert s.start_time == pytest.approx(t0 + 4 * CHUNK / SR)  # start of first speech chunk
     assert s.end_time == pytest.approx(t0 + len(pattern) * CHUNK / SR)
@@ -201,22 +203,37 @@ def test_speech_end_time_is_capture_time_of_last_speech_chunk():
 
 def test_pre_roll_kept_and_trailing_silence_trimmed():
     # pre-roll 96 ms = 3 chunks; values tag where each chunk came from
-    pattern = [(0.1, False)] * 2 + [(0.2, False)] * 3 + [(1.0, True)] * 10 + [(0.3, False)] * 6
+    pattern = [(0.1, False)] * 2 + [(0.2, False)] * 3 + [(1.0, True)] * 40 + [(0.3, False)] * 6
     s = _feed(_default_segmenter(), pattern)[0]
     values = s.audio.reshape(-1, CHUNK)[:, 0]
     assert list(values[:3]) == pytest.approx([0.2] * 3)  # exactly pre_roll before onset
-    assert list(values[3:]) == pytest.approx([1.0] * 10)  # no trailing silence
-    assert s.duration_seconds == pytest.approx(13 * CHUNK / SR)
+    assert list(values[3:]) == pytest.approx([1.0] * 40)  # no trailing silence
+    assert s.duration_seconds == pytest.approx(43 * CHUNK / SR)
 
 
 def test_reset_drops_partial_utterance():
     seg = _default_segmenter()
     _feed(seg, [(1.0, True)] * 10)
     seg.reset()
-    s = _feed(seg, [(2.0, True)] * 8 + [(0.0, False)] * 6)[0]
+    s = _feed(seg, [(2.0, True)] * 8 + [(0.0, False)] * 15)[0]
     assert set(s.audio.reshape(-1, CHUNK)[:, 0]) == {2.0}
 
 
 def test_segment_constructor_without_speech_end_time():
     s = SpeechSegment(audio=np.zeros(1), sample_rate=SR, duration_seconds=0, start_time=1, end_time=2)
     assert s.speech_end_time == 2
+
+
+def test_short_utterance_waits_longer_so_wake_word_pause_does_not_split():
+    # "Jarvis" (0.5 s) + 256 ms pause + command: measured to split at a flat 192 ms endpoint.
+    pattern = [(1.0, True)] * 16 + [(0.0, False)] * 8 + [(1.0, True)] * 50 + [(0.0, False)] * 6
+    segments = _feed(_default_segmenter(), pattern)
+    assert len(segments) == 1
+    assert segments[0].end_time - segments[0].speech_end_time == pytest.approx(6 * CHUNK / SR)
+
+
+def test_lone_short_utterance_ends_after_short_utterance_silence():
+    seg = _default_segmenter()
+    assert seg._short_silence_chunks == 15  # 480 ms
+    assert _feed(seg, [(1.0, True)] * 16 + [(0.0, False)] * 14) == []
+    assert len(_feed(_default_segmenter(), [(1.0, True)] * 16 + [(0.0, False)] * 15)) == 1

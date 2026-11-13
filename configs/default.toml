@@ -11,6 +11,10 @@ speech_end_silence_ms = 192  # 6 chunks; endpointing target is under 200 ms
 minimum_speech_ms = 250
 maximum_segment_seconds = 30
 pre_roll_ms = 96
+# Utterances with less than short_utterance_ms of speech (a wake word, "Jarvis,")
+# wait this long instead, so the pause before the command does not split them.
+short_utterance_ms = 1000
+short_utterance_silence_ms = 480
 
 [asr]
 model = "ibm-granite/granite-speech-5.0-470m-turboctc"

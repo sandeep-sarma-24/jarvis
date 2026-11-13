@@ -10,6 +10,8 @@ from app.audio.capture import BoundedAudioBuffer
 from app.audio.frontend import AudioFrontend
 from app.audio.segmentation import SpeechSegmenter
 from app.audio.vad import VADResult
+from dataclasses import replace
+
 from app.config import BargeInConfig, load_config
 
 CHUNK = 512
@@ -73,7 +75,7 @@ async def _until(cond, timeout: float = 2.0) -> None:
 @pytest.fixture
 async def rig():
     mic, vad, asr = FakeMic(), FakeVAD(), FakeASR()
-    seg = SpeechSegmenter(load_config().vad, sample_rate=SR, chunk_samples=CHUNK)
+    seg = SpeechSegmenter(replace(load_config().vad, short_utterance_ms=0), sample_rate=SR, chunk_samples=CHUNK)
     out, barges = [], []
 
     def make(barge_in: BargeInConfig = BargeInConfig(), tail_ms: int = 0, asr_=None):

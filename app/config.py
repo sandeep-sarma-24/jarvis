@@ -23,6 +23,8 @@ class VADConfig:
     minimum_speech_ms: int = 250
     maximum_segment_seconds: int = 30
     pre_roll_ms: int = 96  # audio kept from before speech onset
+    short_utterance_ms: int = 1000  # below this much speech, use the longer silence below
+    short_utterance_silence_ms: int = 480
 
 
 @dataclass

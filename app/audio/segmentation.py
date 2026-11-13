@@ -56,6 +56,13 @@ class SpeechSegmenter:
         self._min_speech_chunks = math.ceil(config.minimum_speech_ms / self._chunk_duration_ms)
         self._silence_end_chunks = math.ceil(config.speech_end_silence_ms / self._chunk_duration_ms)
         self._max_chunks = int(config.maximum_segment_seconds * sample_rate / chunk_samples)
+        # A wake word is often followed by a pause longer than the fast endpoint
+        # ("Jarvis, ... what time is it"), so short utterances wait longer.
+        self._short_speech_chunks = math.ceil(config.short_utterance_ms / self._chunk_duration_ms)
+        self._short_silence_chunks = max(
+            self._silence_end_chunks,
+            math.ceil(config.short_utterance_silence_ms / self._chunk_duration_ms),
+        )
         pre_roll_chunks = math.ceil(config.pre_roll_ms / self._chunk_duration_ms)
 
         self._state = _State.SILENCE
@@ -107,7 +114,12 @@ class SpeechSegmenter:
         else:
             self._consecutive_silence += 1
             self._state = _State.TRAILING_SILENCE
-            if self._consecutive_silence >= self._silence_end_chunks:
+            limit = (
+                self._short_silence_chunks
+                if self._speech_count < self._short_speech_chunks
+                else self._silence_end_chunks
+            )
+            if self._consecutive_silence >= limit:
                 return self._emit(t)
         if len(self._chunks) >= self._max_chunks:
             return self._emit(t)
