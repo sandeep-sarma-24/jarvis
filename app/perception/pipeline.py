@@ -51,6 +51,7 @@ class PerceptionPipeline:
         capture_interval_ms: float = 100.0,
         analysis_interval_ms: float = 1000.0,
         idle: asyncio.Event | None = None,
+        scene=None,
     ) -> None:
         self._camera = camera
         self._sampler = sampler
@@ -64,6 +65,10 @@ class PerceptionPipeline:
         # When given, ambient analysis only starts while this is set (no voice
         # turn in flight), so it never competes with reasoning for the GPU.
         self._idle = idle
+        # A loaded SceneWatcher replaces the capture/analysis loops: the detector gates the VLM.
+        self._scene = scene
+        if scene is not None:
+            scene.describe = self._describe
         self._capture_task: asyncio.Task | None = None
         self._analysis_task: asyncio.Task | None = None
 
@@ -86,6 +91,7 @@ class PerceptionPipeline:
             "capture_errors": self.capture_errors,
             "analysis_errors": self.analysis_errors,
             **self._sampler.metrics,
+            **(self._scene.metrics if self._scene is not None else {}),
         }
 
     async def start(self) -> None:
@@ -99,6 +105,10 @@ class PerceptionPipeline:
             logger.warning("Camera unavailable — perception pipeline disabled")
             return
 
+        if self._scene is not None and self._scene.available:
+            self._analysis_task = asyncio.create_task(self._scene.run())
+            logger.info("Perception pipeline started (detector-gated VLM)")
+            return
         self._capture_task = asyncio.create_task(self._capture_loop())
         self._analysis_task = asyncio.create_task(self._analysis_loop())
         logger.info("Perception pipeline started (capture + analysis)")
@@ -175,10 +185,13 @@ class PerceptionPipeline:
         except asyncio.CancelledError:
             return
 
-    async def _analyze_and_emit(self, frame) -> None:
+    async def _describe(self, frame, hint: str) -> None:
+        await self._analyze_and_emit(frame, hint)
+
+    async def _analyze_and_emit(self, frame, hint: str = "") -> None:
         t0 = time.time()
         try:
-            analysis = await self._analyzer.analyze(frame)
+            analysis = await (self._analyzer.analyze(frame, hint=hint) if hint else self._analyzer.analyze(frame))
         except Exception:
             self.analysis_errors += 1
             logger.exception("Visual analysis error")

@@ -4,7 +4,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from typing import Iterator
+from typing import Callable, Iterator
 
 from app.reasoning.model import ReasoningError, ReasoningResult, StreamingReasoningModel
 
@@ -65,8 +65,12 @@ class FallbackModel:
         max_tokens: int = 256,
         temperature: float = 0.2,
         cancel: threading.Event | None = None,
+        tools: list[dict] | None = None,
+        on_tool_calls: Callable[[list[dict]], None] | None = None,
     ) -> Iterator[str]:
         kwargs = {"max_tokens": max_tokens, "temperature": temperature, "cancel": cancel}
+        if tools:  # each backend drops tools itself if it lacks the capability
+            kwargs |= {"tools": tools, "on_tool_calls": on_tool_calls}
         if self._primary_due():
             gen = self._primary.stream(messages, **kwargs)
             try:

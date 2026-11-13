@@ -157,6 +157,20 @@ class PerceptionConfig:
 
 
 @dataclass
+class DetectorConfig:
+    """Local YOLOE detection + tracking in front of the VLM (needs the `vision` extra)."""
+    enabled: bool = True
+    model: str = "yoloe-11s-seg.pt"
+    classes: list[str] = field(default_factory=lambda: [
+        "person", "cup", "mug", "bottle", "phone", "laptop", "keyboard", "mouse", "book", "pen",
+        "chair", "monitor", "headphones", "bag", "glasses", "plant", "dog", "cat"])
+    fps: float = 5.0
+    conf: float = 0.25
+    device: str = "mps"  # falls back to cpu if mps fails
+    imgsz: int = 640
+
+
+@dataclass
 class FusionConfig:
     enabled: bool = True
     window_seconds: float = 15.0
@@ -169,6 +183,13 @@ class UIConfig:
     enabled: bool = True
     host: str = "127.0.0.1"
     port: int = 8765
+
+
+@dataclass
+class ToolsConfig:
+    enabled: bool = True   # macOS only; elsewhere tools are skipped
+    router: bool = True    # regex fast path that skips the LLM for common commands
+    max_calls: int = 3     # tool calls executed per turn
 
 
 @dataclass
@@ -187,8 +208,10 @@ class JarvisConfig:
     logging: LoggingConfig = field(default_factory=LoggingConfig)
     memory: MemoryConfig = field(default_factory=MemoryConfig)
     perception: PerceptionConfig = field(default_factory=PerceptionConfig)
+    detector: DetectorConfig = field(default_factory=DetectorConfig)
     fusion: FusionConfig = field(default_factory=FusionConfig)
     ui: UIConfig = field(default_factory=UIConfig)
+    tools: ToolsConfig = field(default_factory=ToolsConfig)
 
 
 def is_loopback(url: str) -> bool:
@@ -261,9 +284,13 @@ def load_config(path: Path | None = None) -> JarvisConfig:
         if "vision" in p:
             vis = VisionConfig(**{k: v for k, v in p["vision"].items() if k in VisionConfig.__dataclass_fields__})
         cfg.perception = PerceptionConfig(camera=cam, vision=vis, **top)
+    if "detector" in raw:
+        cfg.detector = DetectorConfig(**{k: v for k, v in raw["detector"].items() if k in DetectorConfig.__dataclass_fields__})
     if "fusion" in raw:
         cfg.fusion = FusionConfig(**{k: v for k, v in raw["fusion"].items() if k in FusionConfig.__dataclass_fields__})
     if "ui" in raw:
         cfg.ui = UIConfig(**{k: v for k, v in raw["ui"].items() if k in UIConfig.__dataclass_fields__})
+    if "tools" in raw:
+        cfg.tools = ToolsConfig(**{k: v for k, v in raw["tools"].items() if k in ToolsConfig.__dataclass_fields__})
     enforce_local_only(cfg)
     return cfg

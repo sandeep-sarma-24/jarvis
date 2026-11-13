@@ -136,8 +136,9 @@ class LocalVisionAnalyzer:
         self.preprocessing_latency_ms = 0.0
         self.inference_latency_ms = 0.0
 
-    async def analyze(self, frame: Frame) -> VisualAnalysis | None:
+    async def analyze(self, frame: Frame, hint: str = "") -> VisualAnalysis | None:
         self.inference_count += 1
+        prompt = f"{hint}\n\n{self._prompt}" if hint else self._prompt
 
         t_pre = time.perf_counter()
         image_b64 = self._preprocess(frame)
@@ -151,7 +152,7 @@ class LocalVisionAnalyzer:
         t_infer = time.perf_counter()
         try:
             raw = await asyncio.wait_for(
-                asyncio.to_thread(self._backend.infer, image_b64, self._prompt),
+                asyncio.to_thread(self._backend.infer, image_b64, prompt),
                 timeout=self._timeout,
             )
         except TimeoutError:

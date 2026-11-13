@@ -3,62 +3,98 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>JARVIS</title>
+<title>JARVIS // terminal</title>
 <link rel="stylesheet" href="/static/app.css">
 </head>
 <body>
+<canvas id="rain" aria-hidden="true"></canvas>
 <div class="app">
-  <header class="top">
-    <div class="brand">J.A.R.V.I.S.</div>
-    <div class="telemetry" aria-label="System status">
-      <span id="conn" class="chip off">OFFLINE</span>
-      <span id="model" class="chip">model —</span>
-      <span id="camflag" class="chip">cam —</span>
-      <span id="visflag" class="chip">vision —</span>
-    </div>
+  <header class="metrics" aria-label="System metrics">
+    <div class="brand">J.A.R.V.I.S<span class="cur">_</span></div>
+    <div class="m state"><i id="orb" class="orb" data-state="idle"></i><b id="statelabel">IDLE</b><small>state</small></div>
+    <div class="m"><b id="last">--</b><small>last ms</small></div>
+    <div class="m"><b id="avg">--</b><small>avg ms</small></div>
+    <div class="m"><b id="turns">0</b><small>turns</small></div>
+    <div class="m"><b id="model">--</b><small>model</small></div>
+    <div class="m"><b id="detstat" class="off">--</b><small>det fps / ms</small></div>
+    <div class="m"><b id="camflag" class="off">OFF</b><small>cam</small></div>
+    <div class="m"><b id="visflag" class="off">OFF</b><small>vision</small></div>
+    <div class="m"><b id="conn" class="off">OFFLINE</b><small>link</small></div>
+    <div class="m"><b id="uptime">00:00:00</b><small>uptime</small></div>
   </header>
 
-  <section class="left" aria-label="Camera and status">
-    <div class="cam" id="cam">
+  <section class="pane cam" id="cam" aria-label="Camera">
+    <h2>CAM</h2>
+    <div class="viewport">
       <img id="video" alt="Live camera feed" src="/video.mjpg">
-      <div class="offline" id="camoff" hidden>CAMERA OFFLINE<small>retrying…</small></div>
-      <i class="br tl"></i><i class="br tr"></i><i class="br bl"></i><i class="br brr"></i>
-      <div class="live" id="live"><span class="dot"></span>LIVE</div>
-      <div class="caption" id="caption" hidden></div>
-    </div>
-
-    <div class="orbwrap">
-      <div class="orb" id="orb" data-state="idle" role="img" aria-label="Assistant state: idle">
-        <span class="ring r1"></span><span class="ring r2"></span><span class="ring r3"></span>
-        <span class="core"></span>
-        <span class="wave"><b></b><b></b><b></b><b></b><b></b></span>
+      <canvas id="boxes" aria-hidden="true"></canvas>
+      <div class="hud">
+        <span class="live"><i></i>REC</span>
+        <span id="hudflags">CAM -- / VIS --</span>
+        <span id="hudents"></span>
+        <div class="caption" id="caption" hidden></div>
       </div>
-      <div class="state" id="statelabel">IDLE</div>
+      <div class="offline" id="camoff" hidden>NO SIGNAL<small>retrying...</small></div>
     </div>
-
-    <details class="vlog" id="vlog">
-      <summary>Vision feed <span id="vcount">0</span></summary>
-      <ul id="vlist"></ul>
-    </details>
   </section>
 
-  <main class="right">
-    <div class="chat" id="chat" role="log" aria-live="polite" aria-label="Conversation"></div>
-    <div class="chip-row" id="attachrow" hidden>
-      <span class="attach"><img id="attachimg" alt="Attached photo"><button type="button" id="attachrm" aria-label="Remove attached photo">&times;</button></span>
+  <section class="pane tools" aria-label="Tool calls">
+    <h2>TOOLS</h2>
+    <ul class="body" id="toollist"><li class="empty">no tool calls yet</li></ul>
+  </section>
+
+  <main class="pane chatpane" aria-label="Conversation">
+    <h2>CHAT</h2>
+    <div class="chat body" id="chat" role="log" aria-live="polite"></div>
+    <div id="attachrow" class="attachrow" hidden>
+      <img id="attachimg" alt="Attached photo"><button type="button" id="attachrm" aria-label="Remove attached photo">&times;</button>
     </div>
     <form class="composer" id="form" autocomplete="off">
-      <button type="button" id="attachbtn" class="icon" aria-label="Attach photo" title="Attach photo">&#128206;</button>
+      <button type="button" id="attachbtn" aria-label="Attach photo" title="Attach photo">[+img]</button>
       <input type="file" id="file" accept="image/*" hidden>
-      <button type="button" id="cambtn" class="icon" aria-pressed="false" aria-label="Use camera frame" title="Send current camera frame">&#128247;</button>
-      <input id="input" type="text" placeholder="Message JARVIS…" aria-label="Message" maxlength="4000">
-      <button type="submit" id="send" class="primary" aria-label="Send">Send</button>
-      <button type="button" id="stop" class="stop" aria-label="Stop">Stop</button>
+      <button type="button" id="cambtn" aria-pressed="false" aria-label="Use camera frame" title="Send current camera frame">[cam]</button>
+      <span class="prompt" aria-hidden="true">&gt;</span>
+      <input id="input" type="text" placeholder="message jarvis" aria-label="Message" maxlength="4000">
+      <button type="submit" id="send" aria-label="Send">[send]</button>
+      <button type="button" id="stop" class="stop" aria-label="Stop">[stop]</button>
     </form>
   </main>
+
+  <section class="pane screen" id="screen" aria-label="Screen accessibility tree">
+    <h2 id="scrhead">SCREEN</h2>
+    <div class="scrbar">
+      <span id="scrinfo">no snapshot yet</span>
+      <input id="scrapp" type="text" placeholder="app (blank = frontmost)" aria-label="App to scan" maxlength="200">
+      <button type="button" id="scrscan" aria-label="Scan app">[scan]</button>
+    </div>
+    <div class="scrbody">
+      <div class="scrtree" id="scrtree" role="tree" aria-label="Accessibility tree"></div>
+      <div class="scrwire" id="scrwire" aria-label="Element wireframe"></div>
+      <div class="scrinsp">
+        <div id="scrattrs" class="attrs">select an element</div>
+        <div class="scracts">
+          <button type="button" id="act-press">[press]</button>
+          <button type="button" id="act-focus">[focus]</button>
+          <button type="button" id="act-menu">[menu]</button>
+        </div>
+        <form id="scrtypeform" class="scrtype" autocomplete="off" hidden>
+          <input id="scrvalue" type="text" placeholder="text to type" aria-label="Value to type" maxlength="2000">
+          <button type="submit">[type]</button>
+        </form>
+        <div id="scrstatus" class="scrstatus" role="status"></div>
+      </div>
+    </div>
+  </section>
+
+  <div class="logs">
+    <section class="pane"><h2>STT</h2><div class="body log" id="log-stt" tabindex="0" role="log" aria-label="STT log"></div></section>
+    <section class="pane"><h2>LLM</h2><div class="body log" id="log-llm" tabindex="0" role="log" aria-label="LLM log"></div></section>
+    <section class="pane"><h2>TTS</h2><div class="body log" id="log-tts" tabindex="0" role="log" aria-label="TTS log"></div></section>
+    <section class="pane"><h2>SYS / VISION / TOOL</h2><div class="body log" id="log-sys" tabindex="0" role="log" aria-label="System log"></div></section>
+  </div>
 </div>
 <div class="toasts" id="toasts" role="alert"></div>
-<div class="dropmask" id="drop" hidden>Drop image to attach</div>
+<div class="dropmask" id="drop" hidden>DROP IMAGE TO ATTACH</div>
 <script src="/static/app.js"></script>
 </body>
 </html>

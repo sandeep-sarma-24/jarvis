@@ -10,7 +10,7 @@ import logging
 import socket
 import threading
 import time
-from typing import Iterator
+from typing import Callable, Iterator
 
 import httpx
 
@@ -134,6 +134,7 @@ class OllamaModel:
         self._last_stats: dict[str, float] = {}
         self._lock = threading.Lock()
         self._socks: set = set()  # sockets of in-flight streams, so close() can abort them
+        self._tools_ok: bool | None = None  # cached /api/show capability check
 
     @property
     def model_name(self) -> str:
@@ -149,8 +150,22 @@ class OllamaModel:
             options["num_ctx"] = self._num_ctx
         return options
 
-    def _payload(self, messages: list[dict[str, str]], max_tokens: int, temperature: float, stream: bool) -> dict:
-        return {
+    def supports_tools(self) -> bool:
+        """Whether /api/show lists the "tools" capability. Asked once; False if the host is unreachable."""
+        if self._tools_ok is None:
+            try:
+                resp = self._client.post(f"{self._base_url}/api/show", json={"model": self._model})
+                resp.raise_for_status()
+                self._tools_ok = "tools" in (resp.json().get("capabilities") or [])
+            except Exception as exc:
+                logger.warning("tool capability check failed for %s: %s", self._model, exc)
+                return False  # not cached: retry on the next turn
+            logger.info("model %s tool calling: %s", self._model, self._tools_ok)
+        return self._tools_ok
+
+    def _payload(self, messages: list[dict[str, str]], max_tokens: int, temperature: float, stream: bool,
+                 tools: list[dict] | None = None) -> dict:
+        payload = {
             "model": self._model,
             "messages": messages,
             "stream": stream,
@@ -158,6 +173,9 @@ class OllamaModel:
             "think": self._think,
             "options": self._options(num_predict=max_tokens, temperature=temperature),
         }
+        if tools:
+            payload["tools"] = tools
+        return payload
 
     def _unreachable(self, exc: Exception) -> ReasoningError:
         return ReasoningError(
@@ -172,8 +190,12 @@ class OllamaModel:
         max_tokens: int = 256,
         temperature: float = 0.2,
         cancel: threading.Event | None = None,
+        tools: list[dict] | None = None,
+        on_tool_calls: Callable[[list[dict]], None] | None = None,
     ) -> Iterator[str]:
         self._last_stats = {}
+        if tools and not self.supports_tools():
+            tools = None
         t0 = time.perf_counter()
         ttft_ms: float | None = None
         think = _ThinkFilter()
@@ -184,7 +206,7 @@ class OllamaModel:
             # which aborts the request on the server side.
             with self._client.stream(
                 "POST", f"{self._base_url}/api/chat",
-                json=self._payload(messages, max_tokens, temperature, True),
+                json=self._payload(messages, max_tokens, temperature, True, tools),
             ) as resp:
                 sock = _socket_of(resp)
                 if sock is not None:
@@ -210,7 +232,10 @@ class OllamaModel:
                     if frame.get("error"):
                         raise ReasoningError(f"{self._model}: {frame['error']}")
                     # message.thinking is deliberately ignored.
-                    text = think.feed((frame.get("message") or {}).get("content") or "")
+                    msg = frame.get("message") or {}
+                    if msg.get("tool_calls") and on_tool_calls is not None:
+                        on_tool_calls(msg["tool_calls"])  # whole calls, one per frame; text path untouched
+                    text = think.feed(msg.get("content") or "")
                     if frame.get("done"):
                         text += think.flush()
                     if ttft_ms is None:
@@ -221,6 +246,10 @@ class OllamaModel:
                         yield text
                     if frame.get("done"):
                         self._last_stats = _stats(frame, ttft_ms)
+                        logger.info("%s ttft %s ms, total %.0f ms, %s tokens%s", self._model,
+                                    f"{ttft_ms:.0f}" if ttft_ms is not None else "-",
+                                    (time.perf_counter() - t0) * 1000, frame.get("eval_count", "?"),
+                                    " +tools" if tools else "")
                         return
             if cancel is not None and cancel.is_set():
                 return

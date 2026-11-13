@@ -26,11 +26,14 @@ from app.orchestration.sentences import SentenceSplitter
 from app.perception.jpeg import frame_to_jpeg
 from app.reasoning.model import StreamingReasoningModel
 from app.response.decision import decide
+from app.tools.registry import ToolResult
+from app.tools.router import route
 
 logger = logging.getLogger("jarvis.turns")
 
 DELTA_QUEUE_SIZE = 32     # LLM deltas between the worker thread and the loop
 SENTENCE_QUEUE_SIZE = 8   # sentences waiting for TTS
+TOOL_TIMEOUT = 15.0       # per tool call; subprocesses time out at 10 s inside
 
 _VISION_RE = re.compile(
     r"\b(see|seeing|look|looking|watch|watching|visual|camera|showing)\b", re.IGNORECASE
@@ -44,6 +47,7 @@ class TurnObserver:
     def status(self, state: str) -> None: ...   # idle | thinking | speaking
     def delta(self, turn_id: str, text: str) -> None: ...
     def assistant(self, turn_id: str, text: str, outcome: str, latency_ms: float | None) -> None: ...
+    def tool(self, turn_id: str, name: str, args: dict, ok: bool, result: str) -> None: ...
 
 
 def is_vision_request(text: str) -> bool:
@@ -78,6 +82,7 @@ class _TurnState:
     source: str = "voice"                             # voice | text
     image_b64: str | None = None                      # uploaded photo
     use_camera: bool = False
+    tool_calls: list = field(default_factory=list)    # calls the model asked for this pass
 
 
 class TurnManager:
@@ -99,6 +104,8 @@ class TurnManager:
         observer: TurnObserver | None = None,
         session_id: str = "",
         visual_context_ring=None,    # deque[(timestamp, description)] fallback for fusion
+        tools=None,                  # ToolRegistry: Mac automation (router + model tool calls)
+        scene=None,                  # SceneWatcher: one-line detector summary per turn
     ) -> None:
         self._cfg = cfg
         self._bus = bus
@@ -115,6 +122,8 @@ class TurnManager:
         self.observer = observer or TurnObserver()
         self._session_id = session_id
         self._ring = visual_context_ring
+        self._tools = tools
+        self._scene = scene
         self._speech = (
             tts is not None and player is not None and cfg.tts.enabled and cfg.playback.enabled
         )
@@ -319,6 +328,8 @@ class TurnManager:
             )
         elif self._ring:
             vis_ctx = [d for _, d in self._ring]
+        if self._scene is not None and (line := self._scene.summary()):
+            multimodal_ctx = (multimodal_ctx or []) + [f"[detector] {line}"]
 
         ctx = self._context_builder.build(
             event, self._attention.working_memory,
@@ -384,15 +395,53 @@ class TurnManager:
         try:
             try:
                 more = True
-                if isinstance(self._model, StreamingReasoningModel):
-                    async with contextlib.aclosing(self._stream_deltas(turn, messages)) as deltas:
+
+                async def speak_text(t: str) -> bool:
+                    turn.mark("llm_first_token")
+                    st.text += t
+                    self._notify("delta", turn.turn_id, t)
+                    return await emit(splitter.feed(t))
+
+                async def pump(msgs, tools) -> bool:
+                    async with contextlib.aclosing(self._stream_deltas(st, msgs, tools)) as deltas:
                         async for delta in deltas:
-                            turn.mark("llm_first_token")
-                            st.text += delta
-                            self._notify("delta", turn.turn_id, delta)
-                            if not await emit(splitter.feed(delta)):
-                                more = False
-                                break
+                            if not await speak_text(delta):
+                                return False
+                    return True
+
+                hit = None
+                if self._tools is not None and cfg.tools.router and st.image_b64 is None:
+                    hit = route(st.event.transcript)
+                if hit:  # deterministic command: no LLM call, templated confirmation
+                    if res := await self._run_tool(st, *hit):
+                        if res.ok and res.info and isinstance(self._model, StreamingReasoningModel):
+                            # info results (e.g. a screen outline) are data: let the model summarize them
+                            call = {"function": {"name": res.name, "arguments": res.args}}
+                            more = await pump(messages + [
+                                {"role": "assistant", "content": "", "tool_calls": [call]},
+                                {"role": "tool", "tool_name": res.name, "content": res.result}], None)
+                        else:
+                            more = await speak_text(res.result + " ")
+                elif isinstance(self._model, StreamingReasoningModel):
+                    more = await pump(messages, self._tools.schemas() if self._tools is not None else None)
+                    calls = st.tool_calls[:cfg.tools.max_calls]
+                    if len(st.tool_calls) > len(calls):
+                        logger.warning("Turn %s: dropped %d extra tool calls", turn.turn_id[:12],
+                                       len(st.tool_calls) - len(calls))
+                    results = []
+                    for call in calls:
+                        fn = call.get("function") or {}
+                        if r := await self._run_tool(st, fn.get("name", ""), fn.get("arguments") or {}):
+                            results.append(r)
+                    if results and more and not st.text.strip():
+                        if any(r.ok and r.info for r in results):  # one follow-up pass, tools omitted
+                            follow = messages + [{"role": "assistant", "content": "", "tool_calls": calls}] + [
+                                {"role": "tool", "tool_name": r.name, "content": r.result} for r in results]
+                            more = await pump(follow, None)
+                        else:
+                            for r in results:
+                                if not (more := await speak_text(r.result + " ")):
+                                    break
                 else:
                     result = await asyncio.to_thread(
                         self._model.generate, messages,
@@ -469,8 +518,21 @@ class TurnManager:
             return "failed"
         return "completed" if text else "no_response"
 
-    async def _stream_deltas(self, turn: Turn, messages) -> AsyncIterator[str]:
+    async def _run_tool(self, st: _TurnState, name: str, args: dict):
+        """Execute one registry tool off the loop and tell the observer. None if the turn was cancelled."""
+        if st.turn.cancelled:
+            return None
+        try:
+            res = await asyncio.wait_for(asyncio.to_thread(self._tools.execute, name, args), TOOL_TIMEOUT)
+        except TimeoutError:
+            res = ToolResult(name, args, False, "That took too long.")
+        self._notify("tool", st.turn.turn_id, res.name, res.args, res.ok, res.result)
+        return res
+
+    async def _stream_deltas(self, st: _TurnState, messages, tools=None) -> AsyncIterator[str]:
         """Drive model.stream() on a worker thread; deltas cross a bounded queue."""
+        turn = st.turn
+        st.tool_calls = []
         loop = asyncio.get_running_loop()
         q: asyncio.Queue[tuple[str, object]] = asyncio.Queue(maxsize=DELTA_QUEUE_SIZE)
         stop = threading.Event()  # consumer went away (closed early)
@@ -495,11 +557,13 @@ class TurnManager:
         def work() -> None:
             gen = None
             try:
+                extra = {"tools": tools, "on_tool_calls": lambda c: put(("tools", c))} if tools else {}
                 gen = self._model.stream(
                     messages,
                     max_tokens=self._cfg.reasoning.max_output_tokens,
                     temperature=self._cfg.reasoning.temperature,
                     cancel=turn.cancel,
+                    **extra,
                 )
                 for delta in gen:
                     if delta and not put(("delta", delta)):
@@ -519,6 +583,9 @@ class TurnManager:
                     return
                 if kind == "error":
                     raise value  # type: ignore[misc]
+                if kind == "tools":
+                    st.tool_calls.extend(value)  # type: ignore[arg-type]
+                    continue
                 yield value  # type: ignore[misc]
         finally:
             stop.set()

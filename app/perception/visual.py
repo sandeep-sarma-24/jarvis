@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 
 @runtime_checkable
 class VisualAnalyzer(Protocol):
-    async def analyze(self, frame: Frame) -> VisualAnalysis | None: ...
+    async def analyze(self, frame: Frame, hint: str = "") -> VisualAnalysis | None: ...
 
 
 class MockVisualAnalyzer:
@@ -39,7 +39,7 @@ class MockVisualAnalyzer:
     def __init__(self) -> None:
         self.analyses_performed = 0
 
-    async def analyze(self, frame: Frame) -> VisualAnalysis | None:
+    async def analyze(self, frame: Frame, hint: str = "") -> VisualAnalysis | None:
         self.analyses_performed += 1
 
         if not frame.data:

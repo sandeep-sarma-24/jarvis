@@ -9,24 +9,70 @@ import asyncio
 import contextlib
 import json
 import logging
+import re
 import time
 from pathlib import Path
 from urllib.parse import urlsplit
 
 from aiohttp import WSMsgType, web
 
+from app import screen
 from app.config import is_loopback
 from app.events.types import Event, VisualEvent
 from app.orchestration.turns import TurnObserver
 from app.perception.jpeg import frame_to_jpeg
+from app.tools.registry import ToolError
 
 logger = logging.getLogger("jarvis.ui")
+screen_log = logging.getLogger("app.tools.screen")  # maps to the "tool" log channel
+SCREEN_TIMEOUT = 8.0
+SCREEN_ACTIONS = ("press", "focus", "set_value", "show_menu")
+_ELEMENT_ID = re.compile(r"e\d+")
+MAX_VALUE = 2000
 
 STATIC_DIR = Path(__file__).parent / "static"
 PREVIEW_INTERVAL = 0.1     # ~10 fps
 CLIENT_QUEUE_SIZE = 256    # per-websocket backlog before a stalled client is dropped
 HISTORY_LIMIT = 20
+ENTITIES_INTERVAL = 0.19   # entities broadcast cap, ~5 Hz
 MAX_WS_MESSAGE = 16 * 1024 * 1024  # an uploaded photo travels as base64 text
+
+
+_CHANNELS = (("app.audio", "stt"), ("app.reasoning", "llm"), ("app.tts", "tts"),
+             ("app.perception", "vision"), ("app.tools", "tool"))
+_LOG_SKIP = ("jarvis.ui", "aiohttp")  # the UI's own and transport logs would feed back into the stream
+LOG_RATE = 200                        # max log messages forwarded per second; the rest are dropped
+
+
+def log_channel(name: str) -> str:
+    return next((ch for prefix, ch in _CHANNELS if name == prefix or name.startswith(prefix + ".")), "system")
+
+
+class _LogForwarder(logging.Handler):
+    """Forwards log records to WS clients. emit() runs on any thread; delivery hops to the loop."""
+
+    def __init__(self, loop: asyncio.AbstractEventLoop, sink) -> None:
+        super().__init__()
+        self._loop, self._sink = loop, sink
+        self._window, self._count = 0, 0
+
+    def emit(self, record: logging.LogRecord) -> None:
+        if record.name.startswith(_LOG_SKIP):
+            return
+        msg = {"type": "log", "ts": record.created, "level": record.levelname, "channel": log_channel(record.name),
+               "logger": record.name, "msg": record.getMessage()}
+        try:
+            self._loop.call_soon_threadsafe(self._deliver, msg)
+        except RuntimeError:  # loop closed: drop
+            pass
+
+    def _deliver(self, msg: dict) -> None:
+        now = int(time.monotonic())
+        if now != self._window:
+            self._window, self._count = now, 0
+        self._count += 1
+        if self._count <= LOG_RATE:
+            self._sink(msg)
 
 
 @web.middleware
@@ -55,6 +101,9 @@ class UiServer(TurnObserver):
         self._frame = asyncio.Condition()
         self._preview: asyncio.Task | None = None
         self._runner: web.AppRunner | None = None
+        self._log_handler: _LogForwarder | None = None
+        self._unsub = None
+        self._ents_at = 0.0
 
     # ── Lifecycle ──────────────────────────────────────────────────────
 
@@ -68,9 +117,27 @@ class UiServer(TurnObserver):
         self._runner = web.AppRunner(app, access_log=None)
         await self._runner.setup()
         await web.TCPSite(self._runner, self._host, self._port).start()
+        self._log_handler = _LogForwarder(asyncio.get_running_loop(), self._broadcast)
+        for name in ("app", "jarvis"):
+            logging.getLogger(name).addHandler(self._log_handler)
+        self._wire_screen(asyncio.get_running_loop())
         logger.info("Web UI at http://%s:%d", self._host, self._port)
 
+    def _wire_screen(self, loop: asyncio.AbstractEventLoop) -> None:
+        def push(snap: dict) -> None:  # may run on a tool worker thread
+            try:
+                loop.call_soon_threadsafe(self._broadcast, {"type": "screen", **snap})
+            except RuntimeError:  # loop closed
+                pass
+        self._unsub = screen.subscribe(push)
+
     async def stop(self) -> None:
+        if self._unsub is not None:
+            self._unsub()
+            self._unsub = None
+        if self._log_handler is not None:
+            for name in ("app", "jarvis"):
+                logging.getLogger(name).removeHandler(self._log_handler)
         if self._preview is not None:
             self._preview.cancel()
         for q in list(self._clients):
@@ -95,9 +162,21 @@ class UiServer(TurnObserver):
         self._broadcast({"type": "assistant", "turn_id": turn_id, "text": text, "ts": time.time(),
                          "latency_ms": latency_ms, "outcome": outcome})
 
+    def tool(self, turn_id, name, args, ok, result) -> None:
+        self._broadcast({"type": "tool", "turn_id": turn_id, "name": name, "args": args, "ok": ok,
+                         "result": result, "ts": time.time()})
+
     async def on_visual(self, event: Event) -> None:
         if isinstance(event, VisualEvent):
             self._broadcast({"type": "vision", "text": event.description, "ts": event.timestamp})
+
+    def entities(self, payload: dict) -> None:
+        """Detector update from SceneWatcher; capped at 5 Hz unless it carries enter/leave events."""
+        now = time.monotonic()
+        if not payload["events"] and now - self._ents_at < ENTITIES_INTERVAL:
+            return
+        self._ents_at = now
+        self._broadcast({"type": "entities", "ts": time.time(), **payload})
 
     def _broadcast(self, msg: dict) -> None:
         for q in list(self._clients):
@@ -184,6 +263,8 @@ class UiServer(TurnObserver):
                       "camera": self._camera is not None, "vision": self._vision,
                       "history": await self._history()})
         q.put_nowait({"type": "status", "state": self._state})
+        if (snap := screen.last()) is not None:
+            q.put_nowait({"type": "screen", **snap})
         self._clients.add(q)
 
         async def writer() -> None:
@@ -210,6 +291,18 @@ class UiServer(TurnObserver):
 
     async def _on_client(self, msg: dict) -> None:
         kind = msg.get("type")
+        if kind == "screen_snapshot":
+            app = msg.get("app")
+            if app is not None and not isinstance(app, str):
+                raise ValueError("app must be a string or null")
+            try:
+                await asyncio.wait_for(asyncio.to_thread(screen.snapshot, (app or "").strip() or None), SCREEN_TIMEOUT)
+            except TimeoutError:
+                raise ValueError("That took too long.") from None
+            return
+        if kind == "screen_action":
+            await self._screen_action(msg)
+            return
         if self.turns is None:
             raise RuntimeError("JARVIS is still starting")
         if kind == "stop":
@@ -223,3 +316,30 @@ class UiServer(TurnObserver):
             await self.turns.handle_text(text.strip(), image_b64=image, use_camera=bool(msg.get("use_camera")))
         else:
             raise ValueError(f"unknown message type: {kind!r}")
+
+    async def _screen_action(self, msg: dict) -> None:
+        eid, action, value = msg.get("id"), msg.get("action"), msg.get("value")
+        if not isinstance(eid, str) or not _ELEMENT_ID.fullmatch(eid):
+            raise ValueError("id must look like e12")
+        if action not in SCREEN_ACTIONS:
+            raise ValueError(f"action must be one of {', '.join(SCREEN_ACTIONS)}")
+        if action == "set_value":
+            if not isinstance(value, str) or len(value) > MAX_VALUE:
+                raise ValueError(f"value must be a string of at most {MAX_VALUE} characters")
+        elif value is not None:
+            raise ValueError("value is only valid for set_value")
+        screen_log.info("UI %s %s", action, eid)  # never the value
+        last = screen.last()
+        try:
+            result = await asyncio.wait_for(asyncio.to_thread(screen.act, eid, action, value), SCREEN_TIMEOUT)
+            ok = True
+        except ToolError as exc:
+            ok, result = False, str(exc)
+        except TimeoutError:
+            ok, result = False, "That took too long."
+        self._broadcast({"type": "screen_result", "id": eid, "action": action, "ok": ok, "result": result,
+                         "ts": time.time()})
+        if ok:  # ids are only valid until the next snapshot, so refresh the tree
+            with contextlib.suppress(ToolError, TimeoutError):
+                await asyncio.wait_for(asyncio.to_thread(screen.snapshot, last["app"] if last else None),
+                                       SCREEN_TIMEOUT)

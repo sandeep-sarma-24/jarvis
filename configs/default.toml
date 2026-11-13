@@ -122,8 +122,26 @@ max_image_size = 512
 temperature = 0.1
 prompt = ""  # empty = use default prompt
 
+[detector]
+# YOLOE open-vocabulary detection + tracking at a few fps; gates the VLM above (AGPL-3.0, `pip install .[vision]`).
+# Missing ultralytics or weights disables it and the old timed VLM cadence returns.
+enabled = true
+model = "yoloe-11s-seg.pt"  # looked up as a path, then in ~/.cache/jarvis-models/w/
+classes = ["person", "cup", "mug", "bottle", "phone", "laptop", "keyboard", "mouse", "book", "pen",
+           "chair", "monitor", "headphones", "bag", "glasses", "plant", "dog", "cat"]
+fps = 5.0
+conf = 0.25
+device = "mps"  # cpu fallback is automatic
+imgsz = 640
+
 [ui]
 # Browser UI on loopback only; a non-loopback host is a startup error while runtime.local_only is true.
 enabled = true
 host = "127.0.0.1"
 port = 8765
+
+[tools]
+# Mac automation by voice (open apps/URLs/folders/Settings, volume, media, find files). macOS only.
+enabled = true
+router = true    # regex fast path: common commands run with no LLM call
+max_calls = 3

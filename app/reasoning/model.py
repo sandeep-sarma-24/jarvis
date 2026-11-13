@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import threading
 from dataclasses import dataclass
-from typing import Iterator, Protocol, runtime_checkable
+from typing import Callable, Iterator, Protocol, runtime_checkable
 
 
 @dataclass(frozen=True)
@@ -53,6 +53,8 @@ class StreamingReasoningModel(ReasoningModel, Protocol):
     - raises ReasoningError on failure, before or mid-stream;
     - returns promptly once `cancel` is set, aborting the underlying request;
     - closing the generator also aborts the request.
+    - `tools` (Ollama schemas) is honoured only by backends that support tool calling; their calls
+      arrive via on_tool_calls (called from the worker thread) and never as text.
     After the stream ends, last_stats holds what the backend reported
     (keys when known: ttft_ms, output_tokens, tokens_per_second, load_ms).
     """
@@ -67,6 +69,8 @@ class StreamingReasoningModel(ReasoningModel, Protocol):
         max_tokens: int = 256,
         temperature: float = 0.2,
         cancel: threading.Event | None = None,
+        tools: list[dict] | None = None,
+        on_tool_calls: Callable[[list[dict]], None] | None = None,
     ) -> Iterator[str]: ...
 
     def warm_up(self) -> None:

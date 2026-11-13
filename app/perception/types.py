@@ -52,3 +52,13 @@ class VisualAnalysis:
     detections: tuple[Detection, ...] = ()
     confidence: float = 0.0
     metadata: dict[str, object] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class Entity:
+    """A tracked object from the local detector; box is normalized xyxy."""
+
+    track_id: int
+    label: str
+    conf: float
+    box: tuple[float, float, float, float]

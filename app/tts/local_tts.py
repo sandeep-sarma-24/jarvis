@@ -178,9 +178,13 @@ class PhononTTS:
                         break
             finally:
                 gen.close()
+        synth_ms = (time.perf_counter() - t0) * 1000
+        logger.info("first chunk %s ms, synth %.0f ms, %.1fs audio%s: %r",
+                    f"{first_ms:.0f}" if first_ms is not None else "-", synth_ms, seconds,
+                    " (stopped)" if stopped else "", text[:80])
         return TTSStreamStats(
             first_chunk_ms=first_ms,
-            synth_ms=(time.perf_counter() - t0) * 1000,
+            synth_ms=synth_ms,
             audio_seconds=seconds,
             chunks=chunks,
             cancelled=stopped or (cancel is not None and cancel.is_set()) or self._closed.is_set(),

@@ -9,6 +9,7 @@ import asyncio
 import inspect
 import logging
 import signal
+import sys
 import threading
 import time
 import uuid
@@ -220,7 +221,7 @@ async def run(cfg: JarvisConfig | None = None) -> None:
             logger.info("TTS active — model=%s voice=%s", cfg.tts.model, cfg.tts.voice)
 
         # 4. Visual perception components (Phase 6)
-        camera = analyzer = None
+        camera = analyzer = detector = scene = None
         if cfg.perception.enabled and cfg.perception.camera.enabled and attention is not None:
             from app.perception.camera import OpenCVCamera
             from app.perception.visual import MockVisualAnalyzer
@@ -259,6 +260,11 @@ async def run(cfg: JarvisConfig | None = None) -> None:
                 analyzer = MockVisualAnalyzer()
                 logger.info("Vision analyzer: MockVisualAnalyzer")
 
+        if camera is not None and analyzer is not None and cfg.detector.enabled:
+            from app.perception.detector import Detector
+
+            detector = Detector(cfg.detector)  # loads with the other models; a failed load disables it
+
         # 5. Audio frontend and turn manager
         mic = MicrophoneCapture(cfg.audio)
         vad = VoiceActivityDetector(threshold=cfg.vad.threshold)
@@ -288,6 +294,24 @@ async def run(cfg: JarvisConfig | None = None) -> None:
                 host=cfg.ui.host, port=cfg.ui.port, camera=camera, memory=memory_manager,
                 model_name=cfg.reasoning.model, vision=camera is not None, session_id=session_id,
             )
+        tools = None
+        if cfg.tools.enabled and sys.platform == "darwin":
+            from app.tools.mac import build_registry
+
+            from app.screen.tools import screen_tools
+
+            tools = build_registry(extra=screen_tools())
+        elif cfg.tools.enabled:
+            logger.info("tools disabled: macOS only")
+        if detector is not None:
+            from app.perception.scene import SceneWatcher
+            from app.perception.visual import ChangeDetector
+
+            scene = SceneWatcher(
+                detector=detector, camera=camera, fps=cfg.detector.fps,
+                change=ChangeDetector(change_threshold=0.15),  # big camera/lighting changes only
+                on_update=ui.entities if ui is not None else None,
+            )
         turns = TurnManager(
             cfg=cfg, bus=bus, attention=attention,
             context_builder=ContextBuilder(
@@ -298,9 +322,11 @@ async def run(cfg: JarvisConfig | None = None) -> None:
                 max_visual_context_characters=cfg.perception.max_visual_context_characters,
             ),
             model=model, tts=tts, player=player, memory=memory_manager, fusion=fusion,
-            frontend=frontend, recorder=recorder, camera=camera, observer=ui,
-            session_id=session_id, visual_context_ring=visual_context_ring,
+            frontend=frontend, recorder=recorder, camera=camera, observer=ui, scene=scene,
+            session_id=session_id, visual_context_ring=visual_context_ring, tools=tools,
         )
+        if scene is not None:
+            scene.idle = turns.idle  # no VLM calls while a turn runs, regardless of pause_during_turn
         # Shut down before the player, TTS and model it drives are closed.
         cleanup.append(("turns", turns.shutdown))
         if ui is not None:
@@ -330,6 +356,7 @@ async def run(cfg: JarvisConfig | None = None) -> None:
                 capture_interval_ms=1000.0 / cam_cfg.capture_fps,
                 analysis_interval_ms=1000.0 / cam_cfg.analysis_fps,
                 idle=turns.idle if cfg.perception.pause_during_turn else None,
+                scene=scene,
             )
             bus.subscribe(VisualEvent, _build_visual_attention_handler(
                 attention, visual_context_ring, cfg.perception.max_visual_event_age_seconds, fusion,
@@ -351,6 +378,8 @@ async def run(cfg: JarvisConfig | None = None) -> None:
             player.start(tts.sample_rate)
 
         loads = [asyncio.to_thread(vad.load), asyncio.to_thread(asr.load)]
+        if detector is not None:
+            loads.append(asyncio.to_thread(detector.load))
         if tts is not None:
             loads.append(asyncio.to_thread(_open_tts))
         if not await _until_shutdown(shutdown, asyncio.gather(*loads)):

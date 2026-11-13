@@ -135,6 +135,15 @@ preview, chat, voice status). It binds `ui.host` = "127.0.0.1" and `ui.port` = 8
 non-loopback host is refused while `runtime.local_only` is true. Protocol:
 `docs/architecture/08-ui-protocol.md`.
 
+## Mac automation
+
+With `[tools] enabled = true` (macOS only) JARVIS can act on the Mac by voice: open apps, links, folders and
+Settings panes, set volume, control Music/Spotify, list running apps and find files. Common phrasings ("open
+chrome", "volume to 30", "mute", "open wifi settings", "search google for ...", "pause music") are matched by a
+regex router and run with no LLM call; anything else is passed to the model as Ollama tool calls (only if the
+model reports the `tools` capability). No destructive tools are registered. The first volume/media/app-list
+command may trigger a macOS Automation prompt for your terminal. Code: `app/tools/`.
+
 ## Running
 
 ```bash

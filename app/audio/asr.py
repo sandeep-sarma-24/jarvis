@@ -64,6 +64,7 @@ class SpeechRecognizer:
             raise ValueError(f"ASR expects 16 kHz audio, got {sample_rate}")
         result = self._session.generate(audio)
         latency = (time.perf_counter() - t0) * 1000
+        logger.info("final %.0f ms: %r", latency, result.text.strip())
 
         return ASRResult(
             text=result.text.strip(),
