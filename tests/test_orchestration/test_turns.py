@@ -5,7 +5,6 @@ import asyncio
 import threading
 import time
 
-import pytest
 
 from app.config import JarvisConfig
 from app.contracts import STAGES
