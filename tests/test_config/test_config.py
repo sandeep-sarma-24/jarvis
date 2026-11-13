@@ -102,22 +102,7 @@ INTENTIONAL_DEFAULT_DIFFERENCES = {
 }
 
 
-@pytest.mark.parametrize(
-    "path",
-    [
-        pytest.param(
-            p,
-            marks=pytest.mark.xfail(
-                strict=True,
-                reason="defect in app/config.py: VADConfig.speech_end_silence_ms defaults to 300, "
-                "TOML and contract use 192; any config without the key gets slower endpointing",
-            ),
-        )
-        if p == "vad.speech_end_silence_ms"
-        else p
-        for p in sorted(set(DOCUMENTED) - INTENTIONAL_DEFAULT_DIFFERENCES)
-    ],
-)
+@pytest.mark.parametrize("path", sorted(set(DOCUMENTED) - INTENTIONAL_DEFAULT_DIFFERENCES))
 def test_new_key_dataclass_default_matches_toml(path: str) -> None:
     assert _value(JarvisConfig(), path) == _value(load_config(TOML_PATH), path)
 
