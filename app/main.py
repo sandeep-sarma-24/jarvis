@@ -221,7 +221,6 @@ async def run(cfg: JarvisConfig | None = None) -> None:
 
         # 4. Visual perception components (Phase 6)
         camera = analyzer = None
-        on_demand_vision = None
         if cfg.perception.enabled and cfg.perception.camera.enabled and attention is not None:
             from app.perception.camera import OpenCVCamera
             from app.perception.visual import MockVisualAnalyzer
@@ -250,7 +249,6 @@ async def run(cfg: JarvisConfig | None = None) -> None:
                     max_image_size=vis_cfg.max_image_size,
                 )
                 cleanup.append(("vision", analyzer.close))
-                on_demand_vision = (camera, analyzer)
                 logger.info("Vision analyzer: LocalVisionAnalyzer (model=%s)", vis_cfg.model)
                 if cfg.runtime.local_only and vis_cfg.model != cfg.reasoning.model:
                     logger.warning(
@@ -282,6 +280,14 @@ async def run(cfg: JarvisConfig | None = None) -> None:
             barge_in=cfg.barge_in,
             playback_tail_ms=cfg.playback.tail_ms,
         )
+        ui = None
+        if cfg.ui.enabled:
+            from app.ui.server import UiServer
+
+            ui = UiServer(
+                host=cfg.ui.host, port=cfg.ui.port, camera=camera, memory=memory_manager,
+                model_name=cfg.reasoning.model, vision=camera is not None, session_id=session_id,
+            )
         turns = TurnManager(
             cfg=cfg, bus=bus, attention=attention,
             context_builder=ContextBuilder(
@@ -292,11 +298,16 @@ async def run(cfg: JarvisConfig | None = None) -> None:
                 max_visual_context_characters=cfg.perception.max_visual_context_characters,
             ),
             model=model, tts=tts, player=player, memory=memory_manager, fusion=fusion,
-            frontend=frontend, recorder=recorder, on_demand_vision=on_demand_vision,
+            frontend=frontend, recorder=recorder, camera=camera, observer=ui,
             session_id=session_id, visual_context_ring=visual_context_ring,
         )
         # Shut down before the player, TTS and model it drives are closed.
         cleanup.append(("turns", turns.shutdown))
+        if ui is not None:
+            ui.turns = turns
+            bus.subscribe(VisualEvent, ui.on_visual)
+            await ui.start()
+            cleanup.append(("ui", ui.stop))
 
         if camera is not None:
             from app.perception.pipeline import PerceptionPipeline

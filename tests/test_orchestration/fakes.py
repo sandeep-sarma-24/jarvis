@@ -13,6 +13,7 @@ from app.config import JarvisConfig
 from app.context.builder import ContextBuilder
 from app.contracts import LatencyRecorder, Transcript
 from app.memory.working import WorkingMemory
+from app.perception.types import Frame
 from app.orchestration.turns import TurnManager
 from app.reasoning.model import ReasoningError, ReasoningResult
 from app.tts.model import AudioChunk, TTSStreamStats
@@ -276,28 +277,17 @@ class FakeMemory:
 
 
 class FakeCamera:
-    def __init__(self):
+    def __init__(self, delay=0.0):
         self.captures = 0
+        self.delay = delay
 
     async def capture(self):
         self.captures += 1
-        return object()
-
-
-class FakeAnalyzer:
-    def __init__(self, delay=0.0, description="a desk with a laptop"):
-        self.delay = delay
-        self.description = description
-
-    async def analyze(self, frame):
         await asyncio.sleep(self.delay)
-
-        class A:
-            description = self.description
-        return A()
+        return Frame(timestamp=time.time(), data=bytes(4 * 4 * 3), width=4, height=4, format="rgb24")
 
 
-def make_manager(*, model=None, tts=None, speech=True, memory=None, vision=None,
+def make_manager(*, model=None, tts=None, speech=True, memory=None, camera=None, observer=None,
                  frontend=None, cfg=None, done_delay=0.02):
     cfg = cfg or JarvisConfig()
     recorder = LatencyRecorder()
@@ -312,7 +302,7 @@ def make_manager(*, model=None, tts=None, speech=True, memory=None, vision=None,
         cfg=cfg, bus=FakeBus(), attention=FakeAttention(),
         context_builder=ContextBuilder(), model=model or StreamingModel(["Hi there, friend. ", "How are you today? "]),
         tts=(tts or FakeTTS()) if speech else None, player=player, memory=memory,
-        frontend=frontend, recorder=recorder, on_demand_vision=vision,
+        frontend=frontend, recorder=recorder, camera=camera, observer=observer,
         session_id="s",
     )
     holder["tm"] = tm

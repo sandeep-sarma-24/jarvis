@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import threading
 import time
 
@@ -14,7 +15,7 @@ from app.orchestration.turns import is_vision_request
 from app.tts.player import PlaybackOutcome
 
 from tests.test_orchestration.fakes import (
-    FakeAnalyzer, FakeCamera, FakeMemory, FakeTTS, PlainModel, StreamingModel,
+    FakeCamera, FakeMemory, FakeTTS, PlainModel, StreamingModel,
     make_manager, transcript, wait_for,
 )
 
@@ -208,14 +209,14 @@ async def test_bounded_queues_apply_backpressure_and_lose_nothing(monkeypatch):
 
 async def test_history_retrieval_and_vision_run_concurrently():
     memory = FakeMemory(delay=0.15)
-    vision = (FakeCamera(), FakeAnalyzer(delay=0.15))
-    tm, *_ , recorder = make_manager(memory=memory, vision=vision)
+    camera = FakeCamera(delay=0.15)
+    tm, *_ , recorder = make_manager(memory=memory, camera=camera)
     await tm.handle_transcript(transcript("jarvis what do you see"))
     await finish(tm)
     row = recorder.turns[0]
     gather_ms = row["context_ready"] - row["attention_done"]
     assert gather_ms < 280, gather_ms   # sum would be ~600ms
-    assert vision[0].captures == 1
+    assert camera.captures == 1
     assert memory.retrieved == ["jarvis what do you see"]
 
 
@@ -228,18 +229,17 @@ def test_vision_keyword_matches_whole_words_only():
 
 
 async def test_vision_not_run_for_seems():
-    vision = (FakeCamera(), FakeAnalyzer())
-    tm, *_ = make_manager(vision=vision)
+    camera = FakeCamera()
+    tm, *_ = make_manager(camera=camera)
     await tm.handle_transcript(transcript("jarvis it seems cold"))
     await finish(tm)
-    assert vision[0].captures == 0
+    assert camera.captures == 0
 
 
 async def test_on_demand_vision_is_bounded_by_timeout():
     cfg = JarvisConfig()
     cfg.perception.on_demand_timeout_seconds = 0.05
-    vision = (FakeCamera(), FakeAnalyzer(delay=5.0))
-    tm, *_, recorder = make_manager(vision=vision, cfg=cfg)
+    tm, *_, recorder = make_manager(camera=FakeCamera(delay=5.0), cfg=cfg)
     t0 = time.perf_counter()
     await tm.handle_transcript(transcript("jarvis look here"))
     await finish(tm)
@@ -412,3 +412,82 @@ async def test_vision_request_without_a_camera_image_tells_the_model_it_cannot_s
     await tm.handle_transcript(transcript("jarvis what do you see"))
     await finish(tm)
     assert "[visual — live] unavailable" in "\n".join(m["content"] for m in captured["messages"])
+
+
+# ── Direct image input and the UI observer ─────────────────────────────
+
+class Spy(StreamingModel):
+    def stream(self, messages, **kw):
+        self.messages = messages
+        return super().stream(messages, **kw)
+
+
+class Recorder:
+    def __init__(self):
+        self.calls = []
+
+    def __getattr__(self, name):
+        return lambda *a: self.calls.append((name, *a))
+
+
+async def test_camera_frame_is_attached_to_the_last_user_message_as_images():
+    model = Spy(["I see a desk. "])
+    tm, *_ = make_manager(model=model, camera=FakeCamera())
+    await tm.handle_transcript(transcript("jarvis what do you see"))
+    await finish(tm)
+    last = model.messages[-1]
+    assert last["role"] == "user" and len(last["images"]) == 1
+    assert base64.b64decode(last["images"][0])[:2] == b"\xff\xd8"  # JPEG
+    assert "live camera view" in model.messages[-2]["content"]
+
+
+async def test_uploaded_image_bypasses_attention_and_is_passed_through():
+    model, obs = Spy(["Nice photo here. "]), Recorder()
+    camera = FakeCamera()
+    tm, *_ = make_manager(model=model, camera=camera, observer=obs)
+    await tm.handle_text("what is this", image_b64="QUJD")   # no wake word
+    await finish(tm)
+    assert model.messages[-1]["images"] == ["QUJD"] and camera.captures == 0
+    names = [c[0] for c in obs.calls]
+    assert names[0] == "status" and "user" in names and names[-2:] == ["assistant", "status"]
+    user = next(c for c in obs.calls if c[0] == "user")
+    assert user[2:] == ("what is this", "text", "QUJD")
+    assert ("delta", user[1], "Nice photo here. ") in obs.calls
+    assert obs.calls[-2][3] == "completed" and obs.calls[-1] == ("status", "idle")
+
+
+async def test_use_camera_on_typed_text_and_failed_capture_falls_back():
+    model = Spy(["ok then, fine. "])
+    cam = FakeCamera()
+    tm, *_ = make_manager(model=model, camera=cam)
+    await tm.handle_text("describe", use_camera=True)
+    await finish(tm)
+    assert "images" in model.messages[-1]
+
+    model = Spy(["cannot see. "])
+
+    class Broken:
+        async def capture(self):
+            return None
+
+    tm, *_ = make_manager(model=model, camera=Broken())
+    await tm.handle_text("what do you see")
+    await finish(tm)
+    assert "images" not in model.messages[-1]
+    assert "unavailable" in "\n".join(m["content"] for m in model.messages)
+
+
+async def test_stop_cancels_and_observer_errors_do_not_break_the_turn():
+    class Bad:
+        def __getattr__(self, name):
+            def boom(*a):
+                raise RuntimeError("ui exploded")
+            return boom
+
+    tm, _, _, recorder = make_manager(model=StreamingModel(["One sentence here. "] * 30, delay=0.05),
+                                      observer=Bad())
+    await tm.handle_text("tell a story")
+    await wait_for(lambda: tm._active is not None and tm._active.text)
+    tm.stop()
+    await finish(tm)
+    assert outcomes(recorder) == ["cancelled"]

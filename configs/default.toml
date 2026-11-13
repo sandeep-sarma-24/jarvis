@@ -100,8 +100,8 @@ on_demand_timeout_seconds = 3.0
 pause_during_turn = true
 
 [perception.camera]
-# Off by default: with vision off the camera would only feed a mock analyzer. Vision needs both on.
-enabled = false
+# Vision needs both camera and vision on; otherwise the camera would only feed a mock analyzer.
+enabled = true
 device_index = 0
 width = 640
 height = 480
@@ -113,7 +113,7 @@ change_threshold = 0.05
 dedup_window_seconds = 15.0
 
 [perception.vision]
-enabled = false  # off for voice-pipeline validation; when on, reuses the reasoning model (no second model)
+enabled = true  # reuses the reasoning model (no second model)
 provider = "ollama"
 model = "gemma4:e2b-it-qat"
 ollama_url = "http://127.0.0.1:11434"
@@ -121,3 +121,9 @@ timeout_seconds = 60.0
 max_image_size = 512
 temperature = 0.1
 prompt = ""  # empty = use default prompt
+
+[ui]
+# Browser UI on loopback only; a non-loopback host is a startup error while runtime.local_only is true.
+enabled = true
+host = "127.0.0.1"
+port = 8765
