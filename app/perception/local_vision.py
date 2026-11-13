@@ -66,11 +66,16 @@ class OllamaVisionBackend:
         base_url: str = "http://localhost:11434",
         timeout_seconds: float = 30.0,
         temperature: float = 0.1,
+        num_ctx: int = 4096,
+        keep_alive: str = "30m",
     ) -> None:
         self._model = model
         self._base_url = base_url.rstrip("/")
         self._client = httpx.Client(timeout=timeout_seconds)
         self._temperature = temperature
+        # Must match reasoning: Ollama reloads a model when num_ctx changes between requests.
+        self._num_ctx = num_ctx
+        self._keep_alive = keep_alive
 
     def infer(self, image_b64: str, prompt: str) -> str:
         resp = self._client.post(
@@ -85,11 +90,12 @@ class OllamaVisionBackend:
                     }
                 ],
                 "stream": False,
-                "format": "json",
                 "think": False,
+                "keep_alive": self._keep_alive,
                 "options": {
                     "temperature": self._temperature,
                     "num_predict": 512,
+                    "num_ctx": self._num_ctx,
                 },
             },
         )

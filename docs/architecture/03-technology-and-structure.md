@@ -46,7 +46,9 @@ Sources: [kokoro-mlx PyPI](https://pypi.org/project/kokoro-mlx/), [Holler GitHub
 | Qwen3 14B | Text only | 8.5GB | 128K | ~20-25 | Apache 2.0 |
 | Phi-4 14B | Text+Image | 8.5GB | 16K | ~20-25 | MIT |
 
-**Current implementation: `gemma4:e2b-it-qat` on a remote Ollama host** (config `reasoning.model`, `reasoning.ollama_url`), streamed, with an optional local fallback to `gemma4:12b` on `http://127.0.0.1:11434` when the primary fails before its first token (`reasoning.fallback_model`, `reasoning.fallback_url`). The same e2b model serves vision. Gemma 4 12B, evaluated above, was the original choice; it was too slow for conversational latency on the M4 Air (warm responses of 5–9 s with the thinking phase) and is now only the fallback. Context management remains critical — keep prompts under 4K tokens.
+**Current implementation: `gemma4:e2b-it-qat` in a local Ollama on the Mac** (config `reasoning.model`, `reasoning.ollama_url` = `http://127.0.0.1:11434`), streamed, with `reasoning.num_ctx` = 4096. `runtime.local_only` = true makes any non-loopback model URL a startup `ConfigError`, so a remote host cannot be used by accident. The optional second target (`reasoning.fallback_model`, `reasoning.fallback_url`) is disabled by default (`fallback_model = ""`) to keep one model in memory on 16 GB. Vision is off by default; when enabled it uses the same local model with the same `num_ctx` and `keep_alive`, so Ollama does not load a second copy. Gemma 4 12B, evaluated above, was the original choice; it was too slow for conversational latency on the M4 Air (warm responses of 5–9 s with the thinking phase). Context management remains critical — keep prompts under 4K tokens.
+
+Setup: `brew install ollama`, `ollama serve`, `ollama pull gemma4:e2b-it-qat`. If Ollama is down, startup logs an ERROR with the URL and these commands; each turn then fails with a logged reasoning error, and no other host is tried.
 
 Sources: [Google AI Gemma 4 Model Card](https://ai.google.dev/gemma/docs/core/model_card_4), [AI on Mac benchmarks](https://ai-on-mac.com/articles/gemma-4-12b-mac-en/)
 
@@ -59,7 +61,7 @@ Sources: [Google AI Gemma 4 Model Card](https://ai.google.dev/gemma/docs/core/mo
 | MLX (mlx-lm) | ~30-38 | Limited | Python | Medium | Mac only |
 | LiteRT-LM | ~35-45 (unconfirmed on Air) | Yes | OpenAI-compat | Low (v0.13) | Mac/Linux/Win |
 
-**Current implementation: Ollama for LLM serving**, on a remote GPU host with a local Ollama as fallback. No MLX reasoning backend exists. Best balance of throughput, multi-model support, API stability, and developer experience. The ~10% throughput sacrifice vs raw MLX is worth the operational simplicity. LiteRT-LM is the upgrade candidate once confirmed on base M4.
+**Current implementation: Ollama for LLM serving**, local on the Mac only. No MLX reasoning backend exists. Best balance of throughput, multi-model support, API stability, and developer experience. The ~10% throughput sacrifice vs raw MLX is worth the operational simplicity. LiteRT-LM is the upgrade candidate once confirmed on base M4.
 
 Sources: [Contra Collective comparison](https://contracollective.com/blog/llama-cpp-vs-mlx-ollama-vllm-apple-silicon-2026), [Ollama docs](https://ollama.ai)
 
@@ -126,7 +128,7 @@ jarvis/
 │   ├── reasoning/
 │   │   ├── model.py               # ReasoningModel / StreamingReasoningModel protocols
 │   │   ├── local_model.py         # Streaming Ollama client
-│   │   └── fallback.py            # Primary → local fallback wrapper
+│   │   └── fallback.py            # Optional second-target wrapper (off by default)
 │   ├── response/decision.py       # Respond-or-not decision
 │   ├── tts/
 │   │   ├── model.py               # TextToSpeech / StreamingTextToSpeech / StreamingAudioPlayer protocols

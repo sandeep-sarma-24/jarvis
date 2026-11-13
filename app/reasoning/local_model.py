@@ -89,7 +89,21 @@ def _stats(frame: dict, ttft_ms: float | None) -> dict[str, float]:
             stats["tokens_per_second"] = round(eval_count / (frame["eval_duration"] / 1e9), 1)
     if frame.get("load_duration") is not None:
         stats["load_ms"] = round(frame["load_duration"] / 1e6, 1)
+    if frame.get("prompt_eval_count") is not None:
+        stats["prompt_tokens"] = frame["prompt_eval_count"]
+    if frame.get("prompt_eval_duration") is not None:
+        stats["prompt_eval_ms"] = round(frame["prompt_eval_duration"] / 1e6, 1)
     return stats
+
+
+def format_residency(r: dict | None) -> str:
+    """One line from residency(): name, size, VRAM share (Metal on Apple Silicon), context."""
+    if not r:
+        return "not loaded"
+    size, vram = r.get("size") or 0, r.get("size_vram") or 0
+    gpu = f"{100 * vram / size:.0f}%" if size else "?"
+    return (f"{r.get('name')} size {size / 2**30:.2f} GiB, size_vram {vram / 2**30:.2f} GiB "
+            f"({gpu} GPU), context {r.get('context_length', '?')}")
 
 
 class OllamaModel:
@@ -104,12 +118,14 @@ class OllamaModel:
         connect_timeout_seconds: float = 2.0,
         keep_alive: str = "30m",
         think: bool = False,
+        num_ctx: int | None = None,
         transport: httpx.BaseTransport | None = None,
     ) -> None:
         self._model = model
         self._base_url = base_url.rstrip("/")
         self._keep_alive = keep_alive
         self._think = think
+        self._num_ctx = num_ctx
         # timeout_seconds bounds each read (gap between stream lines), not the whole answer.
         self._client = httpx.Client(
             timeout=httpx.Timeout(timeout_seconds, connect=connect_timeout_seconds),
@@ -127,6 +143,12 @@ class OllamaModel:
     def last_stats(self) -> dict[str, float]:
         return self._last_stats
 
+    def _options(self, **options) -> dict:
+        # Every request, warm-up included, must send the same num_ctx or Ollama reloads the model.
+        if self._num_ctx is not None:
+            options["num_ctx"] = self._num_ctx
+        return options
+
     def _payload(self, messages: list[dict[str, str]], max_tokens: int, temperature: float, stream: bool) -> dict:
         return {
             "model": self._model,
@@ -134,8 +156,14 @@ class OllamaModel:
             "stream": stream,
             "keep_alive": self._keep_alive,
             "think": self._think,
-            "options": {"num_predict": max_tokens, "temperature": temperature},
+            "options": self._options(num_predict=max_tokens, temperature=temperature),
         }
+
+    def _unreachable(self, exc: Exception) -> ReasoningError:
+        return ReasoningError(
+            f"{self._model}: {type(exc).__name__}: cannot reach Ollama at {self._base_url} ({exc}). "
+            f"Start the local server with `ollama serve` and run `ollama pull {self._model}`."
+        )
 
     def stream(
         self,
@@ -168,7 +196,8 @@ class OllamaModel:
                         threading.Thread(target=_shutdown_on, args=(cancel, done, sock), daemon=True).start()
                 if resp.status_code >= 400:
                     resp.read()
-                    raise ReasoningError(f"{self._model}: HTTP {resp.status_code}: {resp.text[:200]}")
+                    hint = f" Run `ollama pull {self._model}`." if resp.status_code == 404 else ""
+                    raise ReasoningError(f"{self._model}: HTTP {resp.status_code}: {resp.text[:200]}{hint}")
                 for line in resp.iter_lines():
                     if cancel is not None and cancel.is_set():
                         return
@@ -201,6 +230,8 @@ class OllamaModel:
         except Exception as exc:  # httpx errors, or a socket shut by cancel / close()
             if cancel is not None and cancel.is_set():
                 return
+            if isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout)):
+                raise self._unreachable(exc) from exc
             raise ReasoningError(f"{self._model}: {type(exc).__name__}: {exc}") from exc
         finally:
             done.set()
@@ -253,16 +284,30 @@ class OllamaModel:
         try:
             resp = self._client.post(
                 f"{self._base_url}/api/chat",
-                json={"model": self._model, "messages": [], "keep_alive": self._keep_alive, "stream": False},
+                json={"model": self._model, "messages": [], "keep_alive": self._keep_alive, "stream": False,
+                      "options": self._options()},
                 # A cold load can outlast the per-read timeout; a dead host still fails at connect.
                 timeout=httpx.Timeout(120.0, connect=self._client.timeout.connect),
             )
             resp.raise_for_status()
-            logger.info("reasoning model %s warm at %s", self._model, self._base_url)
-            return True
         except Exception as exc:
             logger.warning("reasoning warm-up failed for %s at %s: %s", self._model, self._base_url, exc)
             return False
+        logger.info("reasoning model %s warm at %s: %s", self._model, self._base_url,
+                    format_residency(self.residency()))
+        return True
+
+    def residency(self) -> dict | None:
+        """This model's entry in GET /api/ps (name, size, size_vram, context_length), or None. Never raises."""
+        try:
+            resp = self._client.get(f"{self._base_url}/api/ps")
+            resp.raise_for_status()
+            for m in resp.json().get("models", []):
+                if self._model in (m.get("name"), m.get("model")) or m.get("name") == f"{self._model}:latest":
+                    return {k: m[k] for k in ("name", "size", "size_vram", "context_length") if k in m}
+        except Exception as exc:
+            logger.debug("residency check failed for %s: %s", self._model, exc)
+        return None
 
     def close(self) -> None:
         # Closing the client alone leaves a reader on another thread blocked until its read timeout.

@@ -15,7 +15,7 @@ import uuid
 from collections import Counter, deque
 from pathlib import Path
 
-from app.config import JarvisConfig, load_config
+from app.config import JarvisConfig, enforce_local_only, load_config
 from app.events.bus import EventBus
 from app.events.types import Event, SpeechEvent, VisualEvent
 from app.attention.engine import AttentionEngine
@@ -117,6 +117,7 @@ async def run(cfg: JarvisConfig | None = None) -> None:
     from app.orchestration.turns import TurnManager
 
     cfg = cfg or load_config()
+    enforce_local_only(cfg)  # a programmatic JarvisConfig skips load_config's check
 
     logging.basicConfig(
         level=getattr(logging, cfg.logging.level, logging.INFO),
@@ -133,6 +134,11 @@ async def run(cfg: JarvisConfig | None = None) -> None:
     session_id = uuid.uuid4().hex
     logger.info("JARVIS session %s starting", session_id[:12])
     logger.info("Microphone capture will be active — audio is processed locally, never stored.")
+    r = cfg.reasoning
+    logger.info(
+        "Runtime policy: local_only=%s; reasoning backend=ollama model=%s url=%s num_ctx=%d keep_alive=%s",
+        cfg.runtime.local_only, r.model, r.ollama_url, r.num_ctx, r.keep_alive,
+    )
 
     cleanup: list[tuple[str, object]] = []  # (name, callable), run in reverse in finally
     recorder = LatencyRecorder()
@@ -236,6 +242,8 @@ async def run(cfg: JarvisConfig | None = None) -> None:
                         base_url=vis_cfg.ollama_url,
                         timeout_seconds=vis_cfg.timeout_seconds,
                         temperature=vis_cfg.temperature,
+                        num_ctx=cfg.reasoning.num_ctx,
+                        keep_alive=cfg.reasoning.keep_alive,
                     ),
                     prompt=vis_cfg.prompt,
                     timeout_seconds=vis_cfg.timeout_seconds,
@@ -244,6 +252,11 @@ async def run(cfg: JarvisConfig | None = None) -> None:
                 cleanup.append(("vision", analyzer.close))
                 on_demand_vision = (camera, analyzer)
                 logger.info("Vision analyzer: LocalVisionAnalyzer (model=%s)", vis_cfg.model)
+                if cfg.runtime.local_only and vis_cfg.model != cfg.reasoning.model:
+                    logger.warning(
+                        "Vision model %s differs from reasoning model %s: two models will be resident in Ollama",
+                        vis_cfg.model, cfg.reasoning.model,
+                    )
             else:
                 analyzer = MockVisualAnalyzer()
                 logger.info("Vision analyzer: MockVisualAnalyzer")
@@ -334,7 +347,7 @@ async def run(cfg: JarvisConfig | None = None) -> None:
 
         if model is not None:
             # Daemon thread: warm-up must never delay startup or block exit.
-            threading.Thread(target=model.warm_up, name="warm-up", daemon=True).start()
+            threading.Thread(target=_warm_up, args=(model, cfg), name="warm-up", daemon=True).start()
 
         if perception_pipeline is not None:
             await perception_pipeline.start()
@@ -366,6 +379,17 @@ async def run(cfg: JarvisConfig | None = None) -> None:
                 logger.exception("Shutdown step %s failed", name)
         _log_session_summary(session_id, frontend, attention, recorder, player,
                              perception_pipeline, fusion, bus)
+
+
+def _warm_up(model, cfg: JarvisConfig) -> None:
+    # Only OllamaModel.warm_up reports reachability (False); there is no other host to try.
+    if model.warm_up() is False:
+        r = cfg.reasoning
+        logger.error(
+            "Reasoning host %s is unavailable; every reply will fail until it is up. "
+            "Start it with `ollama serve` and pull the model with `ollama pull %s`.",
+            r.ollama_url, r.model,
+        )
 
 
 def _log_session_summary(session_id, frontend, attention, recorder, player,

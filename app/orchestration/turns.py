@@ -265,6 +265,10 @@ class TurnManager:
         vis_ctx: list[str] | None = None
         if results.get("vision"):
             multimodal_ctx = [f"[visual — live] {results['vision']}"]
+        elif is_vision_request(text):
+            # Without this the system prompt's "you have a camera" makes the model invent a view.
+            multimodal_ctx = ["[visual — live] unavailable: no camera image right now. "
+                              "If asked what you can see, say you cannot see at the moment."]
         if self._fusion is not None and self._fusion.enabled:
             snap = self._fusion.snapshot(exclude_event_ids={event.id})
             fusion_ctx = format_multimodal_context(snap)

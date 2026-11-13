@@ -13,6 +13,7 @@ def build_reasoning_model(cfg: ReasoningConfig) -> StreamingReasoningModel:
         "connect_timeout_seconds": cfg.connect_timeout_seconds,
         "keep_alive": cfg.keep_alive,
         "think": cfg.think,
+        "num_ctx": cfg.num_ctx,
     }
     primary = OllamaModel(model=cfg.model, base_url=cfg.ollama_url, **common)
     if not cfg.fallback_model:

@@ -726,7 +726,7 @@ def test_vision_config_defaults():
     vc = VisionConfig()
     assert vc.enabled is False
     assert vc.provider == "ollama"
-    assert vc.model == "gemma4:12b"
+    assert vc.model == "gemma4:e2b-it-qat"
     assert vc.timeout_seconds == 120.0
     assert vc.max_image_size == 1024
     assert vc.prompt == ""
@@ -782,7 +782,7 @@ enabled = false
 
     cfg = load_config(config_file)
     assert cfg.perception.vision.enabled is False
-    assert cfg.perception.vision.model == "gemma4:12b"
+    assert cfg.perception.vision.model == "gemma4:e2b-it-qat"
 
 
 # ── Disabled vision / Ollama unavailable ─────────────────────────────────
@@ -802,3 +802,20 @@ async def test_ollama_unavailable_returns_none():
     result = await analyzer.analyze(_frame())
     assert result is None
     assert analyzer.backend_failure == 1
+
+
+def test_ollama_backend_sends_reasoning_num_ctx_and_keep_alive():
+    """Same num_ctx/keep_alive as reasoning, so Ollama does not reload the shared model."""
+    import httpx
+
+    sent = {}
+
+    def handler(request):
+        sent.update(json.loads(request.content))
+        return httpx.Response(200, json={"message": {"content": "{}"}})
+
+    backend = OllamaVisionBackend(model="m", base_url="http://127.0.0.1:11434", num_ctx=2048, keep_alive="5m")
+    backend._client = httpx.Client(transport=httpx.MockTransport(handler))
+    backend.infer("aW1n", "describe")
+    assert sent["options"]["num_ctx"] == 2048
+    assert sent["keep_alive"] == "5m"

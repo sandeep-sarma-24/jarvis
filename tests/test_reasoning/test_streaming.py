@@ -11,7 +11,7 @@ import pytest
 from app.config import ReasoningConfig
 from app.reasoning import build_reasoning_model
 from app.reasoning.fallback import FallbackModel
-from app.reasoning.local_model import OllamaModel, _ThinkFilter
+from app.reasoning.local_model import OllamaModel, _ThinkFilter, format_residency
 from app.reasoning.model import ReasoningError, StreamingReasoningModel
 
 MSGS = [{"role": "user", "content": "hi"}]
@@ -326,3 +326,70 @@ class TestBuild:
         assert m._secondary._base_url == "http://b:2" and m._cooldown == 5
         assert m._secondary._client.timeout.connect == 1.5 and m._secondary._client.timeout.read == 20
         m.close()
+
+
+class TestLocalRuntime:
+    def test_num_ctx_in_chat_and_warm_up_payloads(self):
+        reqs: list = []
+
+        def handler(request):
+            if request.url.path == "/api/ps":
+                return httpx.Response(200, json={"models": []})
+            reqs.append(json.loads(request.content))
+            if reqs[-1]["stream"]:
+                return httpx.Response(200, stream=Lines([DONE]))
+            return httpx.Response(200, json={"done": True})
+        m = model_with(handler=handler, num_ctx=4096)
+        assert m.warm_up() is True
+        list(m.stream(MSGS, max_tokens=8))
+        assert reqs[0]["options"] == {"num_ctx": 4096}
+        assert reqs[1]["options"] == {"num_predict": 8, "temperature": 0.2, "num_ctx": 4096}
+
+    def test_build_passes_num_ctx(self):
+        m = build_reasoning_model(ReasoningConfig(model="x", fallback_model="y", num_ctx=8192))
+        assert m._primary._num_ctx == 8192 and m._secondary._num_ctx == 8192
+        m.close()
+
+    def test_prompt_stats(self):
+        done = {**DONE, "prompt_eval_count": 512, "prompt_eval_duration": 250_000_000}
+        m = model_with(Lines([frame("a"), done]))
+        list(m.stream(MSGS))
+        assert m.last_stats["prompt_tokens"] == 512 and m.last_stats["prompt_eval_ms"] == 250.0
+        assert m.last_stats["output_tokens"] == 20  # existing keys kept
+
+    def test_connection_refused_names_url_and_fix(self):
+        def refuse(request):
+            raise httpx.ConnectError("Connection refused", request=request)
+        with pytest.raises(ReasoningError) as exc:
+            list(model_with(handler=refuse).stream(MSGS))
+        msg = str(exc.value)
+        assert "http://test" in msg and "ollama serve" in msg and "ollama pull m" in msg
+
+    def test_404_names_pull_command(self):
+        with pytest.raises(ReasoningError, match="ollama pull m"):
+            list(model_with(Lines([{"error": "model 'm' not found"}]), status=404).stream(MSGS))
+
+    def test_residency(self):
+        ps = {"models": [{"name": "other:1", "size": 1}, {"name": "m", "model": "m", "size": 4 * 2**30,
+                          "size_vram": 3 * 2**30, "context_length": 4096, "digest": "x"}]}
+        m = model_with(handler=lambda r: httpx.Response(200, json=ps))
+        r = m.residency()
+        assert r == {"name": "m", "size": 4 * 2**30, "size_vram": 3 * 2**30, "context_length": 4096}
+        assert format_residency(r) == "m size 4.00 GiB, size_vram 3.00 GiB (75% GPU), context 4096"
+
+    def test_residency_none_when_not_loaded_or_down(self):
+        assert model_with(handler=lambda r: httpx.Response(200, json={"models": []})).residency() is None
+
+        def refuse(request):
+            raise httpx.ConnectError("refused", request=request)
+        assert model_with(handler=refuse).residency() is None
+        assert format_residency(None) == "not loaded"
+
+    def test_warm_up_logs_residency(self, caplog):
+        def handler(request):
+            if request.url.path == "/api/ps":
+                return httpx.Response(200, json={"models": [{"name": "m", "size": 100, "size_vram": 100}]})
+            return httpx.Response(200, json={"done": True})
+        with caplog.at_level("INFO", logger="app.reasoning.local_model"):
+            assert model_with(handler=handler).warm_up() is True
+        assert any("100% GPU" in r.getMessage() for r in caplog.records)

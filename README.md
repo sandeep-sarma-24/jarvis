@@ -3,8 +3,8 @@
 A local-first, low-latency voice assistant for macOS. It listens continuously,
 decides which utterances are meant for it, reasons about them with an LLM, and
 answers by voice while the answer is still being generated. Speech recognition,
-speech synthesis, attention and memory run on the Mac; the LLM runs in Ollama,
-by default on a second machine on the local network.
+speech synthesis, attention, memory and the LLM (Gemma 4 E2B in a local Ollama)
+all run on the Mac. Remote model hosts are refused at startup.
 
 ## Architecture
 
@@ -22,13 +22,13 @@ Microphone → capture → VAD + endpointing → Granite ASR        (app/audio, 
   decide whether a transcript deserves reasoning. Most speech stops here.
 - **Context** (`app/context/`, `app/memory/`): recent conversation, memories and
   earlier sessions' messages retrieved with SQLite FTS5, and optional visual context.
-- **Reasoning** (`app/reasoning/`): streaming Ollama client with an optional
-  local fallback.
+- **Reasoning** (`app/reasoning/`): streaming client for the local Ollama, with an
+  optional second Ollama target (disabled by default).
 - **Speech output** (`app/tts/`): Phonon TTS (`hf://gradium/phonon-31m-en`, voice
   Easton, via the `ptts` runtime) streams audio into one persistent output stream
   fed by a bounded, turn-tagged queue.
-- **Vision** (`app/perception/`, optional): camera frames described by a
-  vision-capable Ollama model.
+- **Vision** (`app/perception/`, optional, off by default): camera frames described
+  by the same local Ollama model that does reasoning.
 
 One `Turn` exists per request. A newer request, a barge-in or shutdown cancels it,
 and reasoning, synthesis and playback stop together. Audio from a cancelled turn is
@@ -42,11 +42,7 @@ the full design is in [docs/architecture/](docs/architecture/00-table-of-content
 ## Hardware
 
 - MacBook Air M4, 16 GB, macOS (Apple Silicon is required for MLX ASR).
-- Optional remote GPU host running Ollama. The shipped config points
-  `reasoning.ollama_url` and `perception.vision.ollama_url` at
-  `http://100.97.67.75:11434` (an HP Omen with a GTX 1650 Ti, reached over
-  Tailscale) running `gemma4:e2b-it-qat`. Change both URLs to your own host, or to
-  `http://127.0.0.1:11434` to run everything on the Mac.
+- Ollama on the same Mac, at `http://127.0.0.1:11434`. No second machine.
 
 ## Installation
 
@@ -57,11 +53,17 @@ pip install -e ".[dev]"
 ```
 
 Granite ASR and Phonon TTS weights download from Hugging Face on first use.
-On the Ollama host:
+The LLM runs in a local Ollama:
 
 ```bash
+brew install ollama
+ollama serve              # or: brew services start ollama
 ollama pull gemma4:e2b-it-qat
 ```
+
+If Ollama is not running, JARVIS still starts, logs an ERROR naming the URL and
+these commands, and every reply fails with a logged reasoning error until Ollama is
+up. It never tries another host.
 
 List the Phonon voices with `.venv/bin/ptts --list-voices`.
 
@@ -77,25 +79,22 @@ an utterance), `vad.pre_roll_ms` = 96 (audio kept from before speech onset),
 instead, so the pause after a wake word ("Jarvis, ...") does not split the request.
 A pause longer than 192 ms later in a sentence can still split it.
 
-**Reasoning.** `reasoning.model` = `gemma4:e2b-it-qat` at `reasoning.ollama_url`.
-Responses are streamed; `reasoning.connect_timeout_seconds` = 2.0 bounds the
+**Local only.** `runtime.local_only` = true: every model URL
+(`reasoning.ollama_url`, `perception.vision.ollama_url`, and `reasoning.fallback_url`
+when a fallback model is set) must be loopback (`127.0.0.1`, `localhost`, `::1`), or
+startup fails with a `ConfigError`. Set it to false only to use a remote host on purpose.
+
+**Reasoning.** `reasoning.model` = `gemma4:e2b-it-qat` at `reasoning.ollama_url`
+(`http://127.0.0.1:11434`). `reasoning.num_ctx` = 4096 sets the context window
+(the KV cache grows with it). Responses are streamed; `reasoning.connect_timeout_seconds` = 2.0 bounds the
 connect and `reasoning.timeout_seconds` = 30.0 bounds each read.
 `reasoning.keep_alive` = `30m` keeps the model loaded and `reasoning.think` = false
-disables thinking output. `reasoning.max_output_tokens` = 512.
+disables thinking output. `reasoning.max_output_tokens` = 256.
 
-**Local fallback.** If the primary host fails before its first token, the request is
-retried on `reasoning.fallback_url` (`http://127.0.0.1:11434`) with
-`reasoning.fallback_model` (`gemma4:12b`), and the primary is skipped for
-`reasoning.fallback_cooldown_seconds` = 300.0. The fallback only works with Ollama
-running on the Mac and the model pulled:
-
-```bash
-brew install ollama
-ollama serve              # or: brew services start ollama
-ollama pull gemma4:12b
-```
-
-Set `reasoning.fallback_model` to `""` to disable the fallback.
+**Fallback.** `reasoning.fallback_model` = `""` disables it (the default: one model
+in memory on a 16 GB machine). When set, a request that fails before its first token
+is retried on `reasoning.fallback_url` with that model, and the primary is skipped for
+`reasoning.fallback_cooldown_seconds` = 300.0.
 
 **Playback.** `playback.max_queue_seconds` = 2.0 bounds synthesized-but-unplayed
 audio; `playback.tail_ms` = 200 keeps the microphone suppressed briefly after
@@ -116,10 +115,13 @@ in place on first open. Retrieval is FTS5/BM25 blended with recency, up to
 searches messages from earlier sessions. Saying "remember that ..." stores an
 explicit memory. Semantic (embedding) retrieval was evaluated and not implemented.
 
-**Vision.** `perception.enabled`, `perception.camera.enabled` and
-`perception.vision.enabled` are all true in the shipped file, so the camera is on.
-To turn it off, set `perception.enabled` to false. Frames go to
-`perception.vision.model` (`gemma4:e2b-it-qat`) at `perception.vision.ollama_url`;
+**Vision.** Off by default: `perception.camera.enabled` = false and
+`perception.vision.enabled` = false, so the camera is never opened. To use it, set
+both to true (`perception.enabled` = true already). Frames go to
+`perception.vision.model` (`gemma4:e2b-it-qat`, the reasoning model, so no second model is
+loaded) at `perception.vision.ollama_url`, with the reasoning `num_ctx` and
+`keep_alive` so Ollama does not reload the model; a different vision model logs a
+warning that two models will be resident.
 `perception.camera.analysis_fps` = 0.2 analyses one frame every 5 s.
 `perception.on_demand_timeout_seconds` = 3.0 bounds a live look for a vision
 question and `perception.pause_during_turn` = true pauses ambient analysis while a
@@ -152,9 +154,13 @@ In a fresh clone `tests/test_attention/test_evaluation.py` fails because
 | Command | Measures | Needs |
 |---|---|---|
 | `python -m scripts.benchmark_e2e` | End of speech to first audio through `TurnManager` with fake models (labelled SIMULATED: orchestration overhead and ordering, not model speed). Per-stage P50/P95/P99, failure rate, queue depth, peak RSS. `--barge-in` adds cancel-to-silence time and stale chunks played (must be 0). `--json PATH` writes results. | `app/orchestration/turns.py` |
-| `python -m scripts.benchmark_e2e --real` | The same with Granite ASR, the configured reasoning backend and Phonon TTS; input speech is synthesized by the TTS, output goes to a null sink. Cold and warm turns reported separately. | Models, Ollama host |
+| `python -m scripts.benchmark_e2e --real` | The same with Granite ASR, the configured reasoning backend and Phonon TTS; input speech is synthesized by the TTS, output goes to a null sink. Cold and warm turns reported separately. | Models, local Ollama |
 | `python -m scripts.benchmark_audio --skip-models` | Endpointing delay only. Without `--skip-models`: VAD per-chunk cost and ASR latency / real-time factor (`--wav speech.wav` for real speech). | ASR model without `--skip-models` |
-| `python -m scripts.benchmark_reasoning` | Cold request, warm time to first token, total latency, tokens/s and failure rate for the primary and fallback targets (`--target url=...,model=...`, `--runs N`). | Ollama |
+| `python -m scripts.benchmark_reasoning` | Cold request, then warm time to first token, prompt-processing time, tokens/s and failure rate at three prompt sizes, per context size (`--num-ctx N`, repeatable), with Ollama memory, memory pressure and swap (`--target url=...,model=...`, `--runs N`, `--json PATH`). | Ollama |
+| `python -m scripts.benchmark_local_stack` | Real ASR + Gemma + TTS together, scenarios A–F (`--scenario`), sequential and simultaneous, with process and Ollama memory, memory pressure, swap, CPU and thermal state; `--sustain-seconds N` for a sustained run. | Models, local Ollama |
+| `python -m scripts.test_local_e2e` | Pass/fail run of the whole local pipeline on a WAV (`--make-fixture` writes the TTS-synthesized ones): transcript, attention, memory, streamed reasoning, TTS delivery, cancellation, and that every connection was loopback. `--speaker` and `--mic` use real hardware. | Models, local Ollama |
+| `python -m scripts.verify_local_gemma` | One streamed prompt against the configured loopback Ollama; prints model, latency and residency. | Local Ollama |
+| `scripts/check_local_environment.sh`, `scripts/setup_local_models.sh` | Check hardware, versions, disk, memory and loopback URLs; pull `reasoning.model` only if absent. | Ollama for the second |
 | `python -m scripts.benchmark_tts` | Phonon streaming synthesis with no audio output (`--runs N`). | TTS model |
 | `python -m scripts.benchmark_memory` | `retrieve_context` and message-write latency on synthetic 1k/10k/50k-row databases in a temp directory. | Nothing |
 | `python -m scripts.benchmark_attention` | Attention rule and scorer latency. | Nothing |
@@ -168,9 +174,12 @@ Scripts that need code not yet in the tree print `NOT RUN` and exit with code 2.
 
 Targets and how each is measured: [docs/architecture/07-performance.md](docs/architecture/07-performance.md).
 Measurements are on the MacBook Air M4 (16 GB), 2026-11-13, with synthesized speech
-as input and no microphone or speaker; NOT RUN means not measured. The
+as input; NOT RUN means not measured. The
 endpointing and memory targets come from the config and the engineering contract;
-the others are proposed targets for the streaming pipeline.
+the others are proposed targets for the streaming pipeline. The LLM, first-audio and
+memory rows are for the local `gemma4:e2b-it-qat` default; the full comparison,
+memory profile and startup procedure are in the "Local M4 Deployment" section of that
+document.
 
 | Metric | Target | Measured |
 |---|---|---|
@@ -180,24 +189,23 @@ the others are proposed targets for the streaming pipeline.
 | Memory retrieval, 50k rows (warm) | < 50 ms | P50 3.35 ms, P95 6.69 ms, P99 6.78 ms |
 | Message write | — | P50 0.07 ms |
 | TTS first chunk | < 150 ms | P50 7.7 ms, P95 10.2 ms, P99 10.5 ms warm; 20 ms cold |
-| LLM first token, primary remote host | < 1.0 s | NOT RUN (host unreachable) |
-| LLM first token, local fallback `gemma4:12b`, model only | < 1.0 s | P50 725 ms on a short prompt; about 3.1 s with the real system prompt |
-| First audio, real models, local fallback (warm, excludes endpointing) | < 1.5 s | P50 5.7 s, P95 7.8 s (n=11) |
-| First audio, real models, local fallback (cold, first turn) | — | 8.2 s |
+| LLM first token, local `gemma4:e2b-it-qat`, model only | < 1.0 s | P50 48 ms short prompt, 415 ms at about 670 prompt tokens, 1990 ms at about 3120; 55 tokens/s |
+| First audio, real models through `TurnManager` (warm, excludes endpointing) | < 1.5 s | P50 535 ms, P95 625 ms (n=10) |
+| Model cold load | — | Gemma 3.6 s, ASR 2.4–2.8 s, TTS 0.15 s |
 | Barge-in: cancel to silence (simulated player) | < 50 ms | P50 6.3 ms, P99 10.0 ms |
 | Stale audio chunks played after cancel | 0 | 0 (30 simulated barge-ins) |
 | Orchestration overhead before reasoning (simulated) | < 20 ms | P99 0.5 ms |
-| Peak process RSS (JARVIS only; Ollama holds the LLM separately, 8.1 GB for `gemma4:12b`) | < 2 GB | 525 MB |
+| Peak memory, ASR + Gemma + TTS running | within 16 GB | JARVIS 1.40 GB RSS, Ollama runner 4.82 GB RSS; system memory free 48% at the lowest |
 
 ## Known limitations
 
 - `TurnManager` is not integrated yet; the running app uses the earlier
   non-streaming path and the end-to-end numbers above are not measured.
 - No echo cancellation, so barge-in is off by default (see Configuration).
-- The default config depends on a remote Ollama host; without it, replies need the
-  local fallback (`ollama serve` plus a pulled model) and are slower on the Mac.
+- Replies need the local Ollama running with `gemma4:e2b-it-qat` pulled; without it every
+  turn fails with a logged reasoning error.
 - Memory retrieval is lexical (FTS5); paraphrases with no shared words are missed.
-- The shipped config enables the camera. Frames are sent to the vision host over
-  the network and are not stored; only text descriptions enter the pipeline.
+- With vision enabled, frames go only to the local Ollama and are not stored; only
+  text descriptions enter the pipeline.
 - Conversation and memories persist in `~/.jarvis/jarvis.db`.
 - macOS on Apple Silicon only (MLX).

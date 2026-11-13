@@ -153,3 +153,26 @@ async def test_failed_load_still_releases_mic_and_closes_components():
         await _run(log, fail_load=True)
     assert "mic.stop" in log and "player.close" in log and "model.close" in log
     assert not any(e.startswith("frontend.run") for e in log)
+
+
+async def test_programmatic_remote_config_is_refused_before_anything_opens():
+    from app.config import ConfigError
+
+    cfg = _cfg()
+    cfg.reasoning.ollama_url = "http://192.168.1.5:11434"
+    log = Log()
+    with patch("app.audio.capture.MicrophoneCapture", lambda c: log.mark("mic")):
+        with pytest.raises(ConfigError):
+            await app_main.run(cfg)
+    assert log == []
+
+
+def test_unreachable_reasoning_host_logs_error_with_remedy(caplog):
+    class Down:
+        def warm_up(self):
+            return False
+
+    with caplog.at_level("ERROR", logger="jarvis"):
+        app_main._warm_up(Down(), JarvisConfig())
+    msg = caplog.records[-1].getMessage()
+    assert "http://127.0.0.1:11434" in msg and "ollama serve" in msg and "ollama pull gemma4:e2b-it-qat" in msg

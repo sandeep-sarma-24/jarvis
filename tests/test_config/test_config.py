@@ -68,15 +68,20 @@ def test_load_config_default_file_matches_toml_values() -> None:
         assert _value(cfg, path) == expected, path
 
 
-# Keys added for the streaming pipeline (docs/architecture/06-engineering-contracts.md).
+# Keys added for the streaming pipeline (docs/architecture/06-engineering-contracts.md)
+# and for the local-only runtime.
 DOCUMENTED = {
+    "runtime.local_only": True,
+    "reasoning.model": "gemma4:e2b-it-qat",
+    "reasoning.ollama_url": "http://127.0.0.1:11434",
+    "reasoning.num_ctx": 4096,
     "vad.speech_end_silence_ms": 192,
     "vad.pre_roll_ms": 96,
     "reasoning.connect_timeout_seconds": 2.0,
     "reasoning.keep_alive": "30m",
     "reasoning.think": False,
     "reasoning.fallback_url": "http://127.0.0.1:11434",
-    "reasoning.fallback_model": "gemma4:12b",
+    "reasoning.fallback_model": "",
     "reasoning.fallback_cooldown_seconds": 300.0,
     "playback.max_queue_seconds": 2.0,
     "playback.tail_ms": 200,
@@ -95,10 +100,7 @@ def test_load_config_yields_documented_values(path: str, expected: object) -> No
 
 
 # Where the dataclass default differs from the shipped file on purpose.
-INTENTIONAL_DEFAULT_DIFFERENCES = {
-    # no fallback unless the config names a local model
-    "reasoning.fallback_model",
-}
+INTENTIONAL_DEFAULT_DIFFERENCES: set[str] = set()
 
 
 @pytest.mark.parametrize("path", sorted(set(DOCUMENTED) - INTENTIONAL_DEFAULT_DIFFERENCES))

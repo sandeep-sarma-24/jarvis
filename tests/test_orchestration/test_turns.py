@@ -398,3 +398,17 @@ async def test_no_response_outcome_for_empty_answer():
     await finish(tm)
     assert outcomes(recorder) == ["no_response"]
     assert not player.log
+
+
+async def test_vision_request_without_a_camera_image_tells_the_model_it_cannot_see():
+    captured = {}
+
+    class Spy(StreamingModel):
+        def stream(self, messages, **kw):
+            captured["messages"] = messages
+            return super().stream(messages, **kw)
+
+    tm, *_ = make_manager(model=Spy(["I cannot see right now. "]))  # no on-demand vision wired
+    await tm.handle_transcript(transcript("jarvis what do you see"))
+    await finish(tm)
+    assert "[visual — live] unavailable" in "\n".join(m["content"] for m in captured["messages"])

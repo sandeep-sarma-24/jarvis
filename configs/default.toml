@@ -1,3 +1,7 @@
+[runtime]
+# Every model endpoint must be loopback. A remote URL below is a startup error, not a fallback.
+local_only = true
+
 [audio]
 sample_rate = 16000
 channels = 1
@@ -31,19 +35,20 @@ working_memory_size = 20
 [reasoning]
 enabled = true
 model = "gemma4:e2b-it-qat"
-ollama_url = "http://100.97.67.75:11434"  # HP Omen GPU via Tailscale
-max_context_messages = 8
-max_context_characters = 6000
-max_output_tokens = 512
+ollama_url = "http://127.0.0.1:11434"  # local Ollama on this Mac
+num_ctx = 4096  # tokens; KV cache grows with it
+max_context_messages = 6
+max_context_characters = 4000
+max_output_tokens = 256
 temperature = 0.2
 timeout_seconds = 30.0  # read timeout; connect has its own below
 connect_timeout_seconds = 2.0
 keep_alive = "30m"
 think = false
-# Used when the primary host is unreachable. Empty fallback_model disables it.
-# Needs `ollama serve` running locally with the model pulled.
+# Second Ollama target tried when the primary fails. Empty fallback_model disables it (the default:
+# one model in memory on a 16 GB machine).
 fallback_url = "http://127.0.0.1:11434"
-fallback_model = "gemma4:12b"
+fallback_model = ""
 # While the primary is down, one request per cooldown pays the connect timeout.
 fallback_cooldown_seconds = 300.0
 
@@ -95,22 +100,23 @@ on_demand_timeout_seconds = 3.0
 pause_during_turn = true
 
 [perception.camera]
-enabled = true
+# Off by default: with vision off the camera would only feed a mock analyzer. Vision needs both on.
+enabled = false
 device_index = 0
 width = 640
 height = 480
 capture_fps = 2.0
-analysis_fps = 0.2  # one frame every 5s — vision runs on HP, won't starve reasoning
+analysis_fps = 0.2  # one frame every 5s
 max_frame_age_seconds = 5.0
 max_queue_size = 1
 change_threshold = 0.05
 dedup_window_seconds = 15.0
 
 [perception.vision]
-enabled = true
+enabled = false  # off for voice-pipeline validation; when on, reuses the reasoning model (no second model)
 provider = "ollama"
-model = "gemma4:e2b-it-qat"  # 4.3GB total, fits GTX 1650 Ti 4GB VRAM; vision+text+audio
-ollama_url = "http://100.97.67.75:11434"  # HP Omen GPU via Tailscale
+model = "gemma4:e2b-it-qat"
+ollama_url = "http://127.0.0.1:11434"
 timeout_seconds = 60.0
 max_image_size = 512
 temperature = 0.1

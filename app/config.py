@@ -3,8 +3,19 @@ from __future__ import annotations
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
+from urllib.parse import urlsplit
 
 _DEFAULT_CONFIG = Path(__file__).resolve().parent.parent / "configs" / "default.toml"
+
+
+class ConfigError(ValueError):
+    """The configuration is unusable as written."""
+
+
+@dataclass
+class RuntimeConfig:
+    # When true, every model endpoint must be a loopback address; load_config refuses anything else.
+    local_only: bool = True
 
 
 @dataclass
@@ -48,8 +59,9 @@ class AttentionConfig:
 @dataclass
 class ReasoningConfig:
     enabled: bool = True
-    model: str = "gemma4:12b"
-    ollama_url: str = "http://localhost:11434"
+    model: str = "gemma4:e2b-it-qat"
+    ollama_url: str = "http://127.0.0.1:11434"
+    num_ctx: int = 4096  # context window in tokens; the KV cache grows with it
     max_context_messages: int = 8
     max_context_characters: int = 6000
     max_output_tokens: int = 256
@@ -124,8 +136,8 @@ class CameraConfig:
 class VisionConfig:
     enabled: bool = False  # disabled by default — no vision model requirement
     provider: str = "ollama"
-    model: str = "gemma4:12b"
-    ollama_url: str = "http://localhost:11434"
+    model: str = "gemma4:e2b-it-qat"
+    ollama_url: str = "http://127.0.0.1:11434"
     timeout_seconds: float = 120.0
     max_image_size: int = 1024
     temperature: float = 0.1
@@ -154,6 +166,7 @@ class FusionConfig:
 
 @dataclass
 class JarvisConfig:
+    runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
     audio: AudioConfig = field(default_factory=AudioConfig)
     vad: VADConfig = field(default_factory=VADConfig)
     asr: ASRConfig = field(default_factory=ASRConfig)
@@ -170,6 +183,28 @@ class JarvisConfig:
     fusion: FusionConfig = field(default_factory=FusionConfig)
 
 
+def is_loopback(url: str) -> bool:
+    return (urlsplit(url).hostname or "") in {"127.0.0.1", "localhost", "::1"}
+
+
+def enforce_local_only(cfg: JarvisConfig) -> None:
+    """Raise ConfigError if runtime.local_only is set and any model endpoint leaves this machine."""
+    if not cfg.runtime.local_only:
+        return
+    urls = {
+        "reasoning.ollama_url": cfg.reasoning.ollama_url,
+        "perception.vision.ollama_url": cfg.perception.vision.ollama_url,
+    }
+    if cfg.reasoning.fallback_model:
+        urls["reasoning.fallback_url"] = cfg.reasoning.fallback_url
+    bad = {k: v for k, v in urls.items() if not is_loopback(v)}
+    if bad:
+        raise ConfigError(
+            f"runtime.local_only is true but these endpoints are not loopback: {bad}. "
+            "Point them at http://127.0.0.1:11434 or set runtime.local_only = false."
+        )
+
+
 def load_config(path: Path | None = None) -> JarvisConfig:
     path = path or _DEFAULT_CONFIG
     if not path.exists():
@@ -179,6 +214,8 @@ def load_config(path: Path | None = None) -> JarvisConfig:
         raw = tomllib.load(f)
 
     cfg = JarvisConfig()
+    if "runtime" in raw:
+        cfg.runtime = RuntimeConfig(**{k: v for k, v in raw["runtime"].items() if k in RuntimeConfig.__dataclass_fields__})
     if "audio" in raw:
         cfg.audio = AudioConfig(**{k: v for k, v in raw["audio"].items() if k in AudioConfig.__dataclass_fields__})
     if "vad" in raw:
@@ -216,4 +253,5 @@ def load_config(path: Path | None = None) -> JarvisConfig:
         cfg.perception = PerceptionConfig(camera=cam, vision=vis, **top)
     if "fusion" in raw:
         cfg.fusion = FusionConfig(**{k: v for k, v in raw["fusion"].items() if k in FusionConfig.__dataclass_fields__})
+    enforce_local_only(cfg)
     return cfg
