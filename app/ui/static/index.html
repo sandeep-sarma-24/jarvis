@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>JARVIS</title>
+<link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+<div class="app">
+  <header class="top">
+    <div class="brand">J.A.R.V.I.S.</div>
+    <div class="telemetry" aria-label="System status">
+      <span id="conn" class="chip off">OFFLINE</span>
+      <span id="model" class="chip">model —</span>
+      <span id="camflag" class="chip">cam —</span>
+      <span id="visflag" class="chip">vision —</span>
+    </div>
+  </header>
+
+  <section class="left" aria-label="Camera and status">
+    <div class="cam" id="cam">
+      <img id="video" alt="Live camera feed" src="/video.mjpg">
+      <div class="offline" id="camoff" hidden>CAMERA OFFLINE<small>retrying…</small></div>
+      <i class="br tl"></i><i class="br tr"></i><i class="br bl"></i><i class="br brr"></i>
+      <div class="live" id="live"><span class="dot"></span>LIVE</div>
+      <div class="caption" id="caption" hidden></div>
+    </div>
+
+    <div class="orbwrap">
+      <div class="orb" id="orb" data-state="idle" role="img" aria-label="Assistant state: idle">
+        <span class="ring r1"></span><span class="ring r2"></span><span class="ring r3"></span>
+        <span class="core"></span>
+        <span class="wave"><b></b><b></b><b></b><b></b><b></b></span>
+      </div>
+      <div class="state" id="statelabel">IDLE</div>
+    </div>
+
+    <details class="vlog" id="vlog">
+      <summary>Vision feed <span id="vcount">0</span></summary>
+      <ul id="vlist"></ul>
+    </details>
+  </section>
+
+  <main class="right">
+    <div class="chat" id="chat" role="log" aria-live="polite" aria-label="Conversation"></div>
+    <div class="chip-row" id="attachrow" hidden>
+      <span class="attach"><img id="attachimg" alt="Attached photo"><button type="button" id="attachrm" aria-label="Remove attached photo">&times;</button></span>
+    </div>
+    <form class="composer" id="form" autocomplete="off">
+      <button type="button" id="attachbtn" class="icon" aria-label="Attach photo" title="Attach photo">&#128206;</button>
+      <input type="file" id="file" accept="image/*" hidden>
+      <button type="button" id="cambtn" class="icon" aria-pressed="false" aria-label="Use camera frame" title="Send current camera frame">&#128247;</button>
+      <input id="input" type="text" placeholder="Message JARVIS…" aria-label="Message" maxlength="4000">
+      <button type="submit" id="send" class="primary" aria-label="Send">Send</button>
+      <button type="button" id="stop" class="stop" aria-label="Stop">Stop</button>
+    </form>
+  </main>
+</div>
+<div class="toasts" id="toasts" role="alert"></div>
+<div class="dropmask" id="drop" hidden>Drop image to attach</div>
+<script src="/static/app.js"></script>
+</body>
+</html>
