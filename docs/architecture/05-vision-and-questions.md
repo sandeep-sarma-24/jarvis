@@ -23,6 +23,8 @@ No questions are BLOCKING for Phase 1. One question (T5) must be resolved before
 
 **Recommendation:** D — ship fast with the best available Kokoro voice, then invest in voice matching once the core system works.
 
+**Resolved:** Kokoro was replaced by Phonon TTS (`hf://gradium/phonon-31m-en`) with the voice Easton (`tts.voice`); list voices with `.venv/bin/ptts --list-voices`.
+
 **Classification: DEFERRED -> Phase 4**
 
 ## T2. Ollama vs LiteRT-LM for Gemma 4 12B Inference
@@ -35,6 +37,8 @@ No questions are BLOCKING for Phase 1. One question (T5) must be resolved before
 - C: Abstract the interface and test both before Phase 3 begins.
 
 **Recommendation:** A. Ollama gives us a working system faster. The `ReasoningModel` interface means swapping runtime is a config change.
+
+**Resolved:** Ollama. The primary model is now `gemma4:e2b-it-qat` on a remote GPU host; `gemma4:12b` on local Ollama is the fallback. LiteRT-LM was not evaluated.
 
 **Classification: DEFERRED -> benchmark during Phase 3**
 
@@ -236,6 +240,6 @@ All 15 principles reviewed against the full document:
 | 21 | Performance budgets are measured targets, not guarantees | ✓ | Validated empirically, not architectural blockers |
 
 **Tradeoffs explicitly made:**
-- **Principle 8 (local) vs. reasoning quality:** Accepted. Gemma 4 12B Q4 is not GPT-4-class. Cloud fallback is the documented upgrade path.
+- **Principle 8 (local) vs. reasoning quality:** Accepted. Gemma 4 E2B (and the 12B fallback) are not GPT-4-class. Reasoning now runs on a second machine on the local network, still not a cloud service. Cloud fallback is the documented upgrade path.
 - **Principle 9 (no infra) vs. author's NATS/Redis familiarity:** In-process solutions win for single-user/single-machine. The familiarity argument doesn't outweigh the "no failure modes" argument for a personal tool. Redis/NATS are the documented upgrade path if multi-process becomes necessary.
 - **Principle 13 (don't over-engineer) vs. Principle 5 (models replaceable):** Both honored. Interfaces add no runtime cost and minimal code — they're just abstract base classes. The implementations behind them are as simple as possible.

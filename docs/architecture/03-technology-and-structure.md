@@ -16,12 +16,12 @@ Sources: [Silero VAD GitHub](https://github.com/snakers4/silero-vad), [FireRedVA
 
 | Technology | WER (LibriSpeech clean) | Latency (M4) | Memory | Languages | License | MLX Native |
 |-----------|------------------------|--------------|--------|-----------|---------|-----------|
-| **Qwen3-ASR 0.6B** | 2.29% (fp16) | ~460ms (short clip) | 1.2GB | 30+ | Apache 2.0 | Yes (mlx-qwen3-asr) |
+| Qwen3-ASR 0.6B (original choice) | 2.29% (fp16) | ~460ms (short clip) | 1.2GB | 30+ | Apache 2.0 | Yes (mlx-qwen3-asr) |
 | Qwen3-ASR 1.7B | 1.99% | ~4s | 3.4GB | 30+ | Apache 2.0 | Yes |
 | Whisper Large v3 | 2.11% | ~2-3s | 3GB | 100+ | MIT | Via whisper.cpp |
 | Parakeet TDT | ~2.1% | <500ms | 634MB (CoreML) | 25 | Apache 2.0 | CoreML (Neural Engine) |
 
-**Current implementation: Qwen3-ASR 0.6B via mlx-qwen3-asr.** Best quality-to-latency ratio. 460ms for a short clip on M4 is well within our 800ms budget. 1.2GB memory is manageable. Native MLX implementation means no PyTorch dependency for inference. Falls back to 1.7B if accuracy is insufficient for the user's accent/environment.
+**Current implementation: Granite Speech 5 (`ibm-granite/granite-speech-5.0-470m-turboctc`) via mlx-audio** (`app/audio/asr.py`, config `asr.model`). It replaced Qwen3-ASR 0.6B, the original V1 choice evaluated in the table above. Its latency on the M4 Air has not been measured yet; see [07-performance.md](07-performance.md).
 
 Sources: [mlx-qwen3-asr benchmarks](https://github.com/moona3k/mlx-qwen3-asr/blob/main/docs/BENCHMARKS.md), [Qwen3-ASR HuggingFace](https://huggingface.co/collections/Qwen/qwen3-asr)
 
@@ -29,13 +29,11 @@ Sources: [mlx-qwen3-asr benchmarks](https://github.com/moona3k/mlx-qwen3-asr/blo
 
 | Technology | Quality | Latency | Memory | Voices | License | MLX Native | Voice Character |
 |-----------|---------|---------|--------|--------|---------|-----------|----------------|
-| **Kokoro-82M** | 9.2/10 | 3-5x RT (CPU), ~45ms (CoreML) | ~500MB | 54 | Apache 2.0 | Yes (kokoro-mlx) | Fixed presets (BF_Emma = British female) |
+| Kokoro-82M (original choice) | 9.2/10 | 3-5x RT (CPU), ~45ms (CoreML) | ~500MB | 54 | Apache 2.0 | Yes (kokoro-mlx) | Fixed presets (BF_Emma = British female) |
 | Qwen3-TTS 0.6B | High | ~120ms TTFA | ~2.3GB (bf16) | Voice cloning | Apache 2.0 | Yes (Holler) | Customizable |
 | Holler (Qwen3-TTS fine-tune) | High | 120ms TTFA, 2.5x RTF | 1.7GB (6-bit) | 6 American | Apache 2.0 | Yes | American English, streaming |
 
-**Current implementation: Kokoro-82M via kokoro-mlx for V1.** Smallest, fastest, most mature MLX integration. BF_Emma voice provides British inflection appropriate for JARVIS personality. Upgrade path: Qwen3-TTS/Holler for voice cloning and richer prosody once the base system works.
-
-**JARVIS voice note:** Kokoro's `bf_emma` voice is the closest match to the MCU JARVIS tone (British, composed). For a male British voice, Kokoro's selection is more limited. If no satisfactory male British voice exists in Kokoro's 54-voice library, Qwen3-TTS with voice cloning becomes the V2 upgrade path.
+**Current implementation: Phonon TTS (`hf://gradium/phonon-31m-en`, voice Easton, q8_0) via the `ptts` runtime** (`app/tts/local_tts.py`, config `[tts]`). It streams audio into a bounded, turn-tagged player (`app/tts/player.py`, `StreamingPlayer`). It replaced Kokoro-82M via kokoro-mlx, the original V1 choice evaluated in the table above. Its latency on the M4 Air has not been measured yet; see [07-performance.md](07-performance.md).
 
 Sources: [kokoro-mlx PyPI](https://pypi.org/project/kokoro-mlx/), [Holler GitHub](https://github.com/sentiuminc/holler)
 
@@ -43,12 +41,12 @@ Sources: [kokoro-mlx PyPI](https://pypi.org/project/kokoro-mlx/), [Holler GitHub
 
 | Technology | Multimodal | Size (Q4) | Context | tok/s (M4 Air est.) | License |
 |-----------|-----------|-----------|---------|---------------------|---------|
-| **Gemma 4 12B Unified** | Text+Image+Audio | 7.6GB | 256K | ~25-35 | Apache 2.0 |
+| Gemma 4 12B Unified (original choice, now fallback) | Text+Image+Audio | 7.6GB | 256K | ~25-35 | Apache 2.0 |
 | Llama 3.1 8B | Text only | 4.5GB | 128K | ~45-55 | Llama |
 | Qwen3 14B | Text only | 8.5GB | 128K | ~20-25 | Apache 2.0 |
 | Phi-4 14B | Text+Image | 8.5GB | 16K | ~20-25 | MIT |
 
-**Current implementation: Gemma 4 12B Unified.** Only option with native text+image+audio in a single model at this size class. This eliminates separate vision/audio models for the reasoning tier. The encoder-free architecture means lower multimodal latency. Context management is critical at 16GB — keep prompts under 4K tokens.
+**Current implementation: `gemma4:e2b-it-qat` on a remote Ollama host** (config `reasoning.model`, `reasoning.ollama_url`), streamed, with an optional local fallback to `gemma4:12b` on `http://127.0.0.1:11434` when the primary fails before its first token (`reasoning.fallback_model`, `reasoning.fallback_url`). The same e2b model serves vision. Gemma 4 12B, evaluated above, was the original choice; it was too slow for conversational latency on the M4 Air (warm responses of 5–9 s with the thinking phase) and is now only the fallback. Context management remains critical — keep prompts under 4K tokens.
 
 Sources: [Google AI Gemma 4 Model Card](https://ai.google.dev/gemma/docs/core/model_card_4), [AI on Mac benchmarks](https://ai-on-mac.com/articles/gemma-4-12b-mac-en/)
 
@@ -61,7 +59,7 @@ Sources: [Google AI Gemma 4 Model Card](https://ai.google.dev/gemma/docs/core/mo
 | MLX (mlx-lm) | ~30-38 | Limited | Python | Medium | Mac only |
 | LiteRT-LM | ~35-45 (unconfirmed on Air) | Yes | OpenAI-compat | Low (v0.13) | Mac/Linux/Win |
 
-**Current implementation: Ollama for LLM serving.** Best balance of throughput, multi-model support, API stability, and developer experience. The ~10% throughput sacrifice vs raw MLX is worth the operational simplicity. LiteRT-LM is the upgrade candidate once confirmed on base M4.
+**Current implementation: Ollama for LLM serving**, on a remote GPU host with a local Ollama as fallback. No MLX reasoning backend exists. Best balance of throughput, multi-model support, API stability, and developer experience. The ~10% throughput sacrifice vs raw MLX is worth the operational simplicity. LiteRT-LM is the upgrade candidate once confirmed on base M4.
 
 Sources: [Contra Collective comparison](https://contracollective.com/blog/llama-cpp-vs-mlx-ollama-vllm-apple-silicon-2026), [Ollama docs](https://ollama.ai)
 
@@ -69,11 +67,11 @@ Sources: [Contra Collective comparison](https://contracollective.com/blog/llama-
 
 | Model | Dimensions | Size | Latency | Quality (MTEB) |
 |-------|-----------|------|---------|----------------|
-| **nomic-embed-text** | 768 | ~500MB | <10ms | High |
+| nomic-embed-text (evaluated, not used) | 768 | ~500MB | <10ms | High |
 | all-MiniLM-L6-v2 | 384 | ~80MB | <5ms | Medium |
 | mxbai-embed-large | 1024 | ~1.2GB | ~15ms | Very High |
 
-**Current implementation: nomic-embed-text via Ollama.** Good quality, reasonable size, available through the same Ollama interface as the LLM. The 768-dim embeddings provide good retrieval quality for memory search.
+**Not implemented.** Memory retrieval is lexical: SQLite FTS5/BM25 blended with recency (`app/memory/`). Semantic retrieval was evaluated and not built; `memory.semantic_enabled` and `memory.embedding_model` exist in the config but are unused. This table is kept as the evaluation for a future semantic layer.
 
 ## Event Bus / IPC
 
@@ -104,117 +102,49 @@ Sources: [Contra Collective comparison](https://contracollective.com/blog/llama-
 
 # §K — Repository Structure
 
+The repository as it is now. The original Phase 0 plan (with `vision/`, `screen/`,
+`state/`, `output/`, `tools/`, `privacy/` and `observability/` packages) is kept in
+`docs/superpowers/specs/2026-08-08-jarvis-architecture-design.md`; those packages
+were not built.
+
 ```
 jarvis/
 ├── app/
-│   ├── __init__.py
-│   ├── main.py                    # Entry point, lifecycle management
-│   ├── config.py                  # Configuration loading (env/file)
-│   │
+│   ├── main.py                    # Entry point, lifecycle, wiring
+│   ├── config.py                  # Dataclasses loaded from configs/default.toml
+│   ├── contracts.py               # Turn, Transcript, latency stages, LatencyRecorder
 │   ├── audio/
-│   │   ├── __init__.py
-│   │   ├── capture.py             # Microphone capture (sounddevice callback + bounded buffer)
-│   │   ├── vad.py                 # VAD wrapper (Silero)
-│   │   └── asr.py                 # ASR wrapper (Qwen3-ASR)
-│   │
-│   ├── vision/
-│   │   ├── __init__.py
-│   │   ├── capture.py             # Camera capture (OpenCV/AVFoundation)
-│   │   ├── diff.py                # Frame differencing
-│   │   └── describe.py            # Vision description (Gemma 4 multimodal)
-│   │
-│   ├── screen/
-│   │   ├── __init__.py
-│   │   ├── capture.py             # Screen capture (CGWindowList)
-│   │   ├── diff.py                # Screen change detection (pHash)
-│   │   ├── ocr.py                 # OCR (Apple Vision framework)
-│   │   └── app_id.py              # App identification (Accessibility API)
-│   │
-│   ├── events/
-│   │   ├── __init__.py
-│   │   ├── bus.py                 # Event bus (asyncio-based pub/sub)
-│   │   └── types.py               # Event dataclasses (Event, SpeechEvent, etc.)
-│   │
-│   ├── attention/
-│   │   ├── __init__.py
-│   │   ├── engine.py              # Tiered attention orchestrator
-│   │   ├── rules.py               # Tier 1: deterministic rules
-│   │   ├── classifier.py          # Tier 2: lightweight classifier
-│   │   └── llm_judge.py           # Tier 3: LLM judgment (rare)
-│   │
-│   ├── state/
-│   │   ├── __init__.py
-│   │   ├── world.py               # World state (current environment/activity)
-│   │   ├── task.py                # Task inference
-│   │   └── environment.py         # Environment state aggregation
-│   │
-│   ├── memory/
-│   │   ├── __init__.py
-│   │   ├── working.py             # Working memory (in-process state)
-│   │   ├── episodic.py            # Episodic memory (SQLite)
-│   │   ├── semantic.py            # Semantic memory (SQLite)
-│   │   ├── procedural.py          # Procedural memory (SQLite)
-│   │   ├── embeddings.py          # Embedding operations
-│   │   ├── retrieval.py           # Unified retrieval across layers
-│   │   └── lifecycle.py           # Decay, summarization, deduplication
-│   │
-│   ├── context/
-│   │   ├── __init__.py
-│   │   └── builder.py             # Context assembly for LLM
-│   │
+│   │   ├── capture.py             # Microphone capture (sounddevice callback + bounded ring buffer)
+│   │   ├── vad.py                 # Silero VAD wrapper
+│   │   ├── segmentation.py        # Endpointing / speech segmenter
+│   │   ├── asr.py                 # Granite Speech 5 via mlx-audio
+│   │   └── frontend.py            # AudioFrontend: capture → VAD → ASR → Transcript, barge-in
+│   ├── attention/                 # engine.py, rules.py (tier 1), classifier.py (tier 2 scorer)
+│   ├── events/                    # bus.py (asyncio pub/sub), types.py (event dataclasses)
+│   ├── context/builder.py         # Context assembly for the LLM
+│   ├── memory/                    # working.py, conversation.py, manager.py, sqlite_store.py (FTS5), store.py, types.py
 │   ├── reasoning/
-│   │   ├── __init__.py
-│   │   ├── model.py               # LLM interface + Ollama client
-│   │   └── decision.py            # Response decision (separate from attention)
-│   │
-│   ├── output/
-│   │   ├── __init__.py
-│   │   ├── tts.py                 # TTS wrapper (Kokoro)
-│   │   └── speaker.py             # Audio playback
-│   │
-│   ├── tools/
-│   │   ├── __init__.py
-│   │   ├── registry.py            # Tool registry
-│   │   └── base.py                # Tool base class
-│   │
-│   ├── privacy/
-│   │   ├── __init__.py
-│   │   ├── controller.py          # Privacy mode, permissions
-│   │   └── indicators.py          # Active perception indicators
-│   │
-│   └── observability/
-│       ├── __init__.py
-│       ├── logging.py             # Structured logging
-│       └── metrics.py             # Performance metrics collection
-│
-├── tests/
-│   ├── __init__.py
-│   ├── test_attention/
-│   ├── test_memory/
-│   ├── test_audio/
-│   ├── test_context/
-│   └── conftest.py                # Shared fixtures
-│
-├── scripts/
-│   ├── setup_models.py            # Download/configure required models
-│   └── benchmark.py               # Latency benchmarking
-│
+│   │   ├── model.py               # ReasoningModel / StreamingReasoningModel protocols
+│   │   ├── local_model.py         # Streaming Ollama client
+│   │   └── fallback.py            # Primary → local fallback wrapper
+│   ├── response/decision.py       # Respond-or-not decision
+│   ├── tts/
+│   │   ├── model.py               # TextToSpeech / StreamingTextToSpeech / StreamingAudioPlayer protocols
+│   │   ├── local_tts.py           # Phonon TTS via ptts
+│   │   └── player.py              # LocalAudioPlayer, StreamingPlayer (bounded, turn-tagged)
+│   ├── perception/                # camera.py, sampler.py, local_vision.py (Ollama vision), pipeline.py, visual.py, types.py
+│   ├── fusion/engine.py           # Multimodal context fusion
+│   └── orchestration/turns.py     # TurnManager (being integrated; not yet in the tree)
 ├── configs/
-│   ├── default.toml               # Default configuration
-│   └── models.toml                # Model configurations per hardware
-│
-├── data/
-│   └── jarvis.db                  # SQLite database (created at runtime)
-│
-├── docs/
-│   └── architecture/              # This document
-│
-├── pyproject.toml                  # Project config + dependencies
-├── README.md
-└── .gitignore
+│   ├── default.toml               # All configuration
+│   └── system_prompt.txt
+├── scripts/                       # benchmark_*.py, stability_test.py, e2e_fakes.py (see 07-performance.md)
+├── tests/                         # one test_<package>/ per app package, plus test_config/ and test_scripts/
+├── docs/architecture/             # This document
+└── pyproject.toml
 ```
 
-**Deviation from brief's suggested structure:** Merged `perception/` into `audio/`, `vision/`, `screen/` because each modality has its own capture + processing logic that doesn't share code. Added `state/` for world/task/environment state aggregation (separate from attention scoring and response decisions). Added `context/` as a first-class module (it's load-bearing enough to warrant it). Added `output/` to group TTS + playback. Removed `models/` directory (models are managed by Ollama, not checked into the repo). Removed `api/` (no external API in V1 — this is a local system).
+The SQLite database is created at runtime at `memory.database_path` (`~/.jarvis/jarvis.db`).
 
 ---
 
