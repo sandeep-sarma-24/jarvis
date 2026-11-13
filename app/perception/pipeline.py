@@ -50,6 +50,7 @@ class PerceptionPipeline:
         session_id: str,
         capture_interval_ms: float = 100.0,
         analysis_interval_ms: float = 1000.0,
+        idle: asyncio.Event | None = None,
     ) -> None:
         self._camera = camera
         self._sampler = sampler
@@ -60,6 +61,9 @@ class PerceptionPipeline:
         self._session_id = session_id
         self._capture_interval_s = capture_interval_ms / 1000.0
         self._analysis_interval_s = analysis_interval_ms / 1000.0
+        # When given, ambient analysis only starts while this is set (no voice
+        # turn in flight), so it never competes with reasoning for the GPU.
+        self._idle = idle
         self._capture_task: asyncio.Task | None = None
         self._analysis_task: asyncio.Task | None = None
 
@@ -155,6 +159,8 @@ class PerceptionPipeline:
 
         try:
             while True:
+                if self._idle is not None:
+                    await self._idle.wait()
                 candidate = self._sampler.next_frame()
                 if candidate is None:
                     await asyncio.sleep(poll_interval)

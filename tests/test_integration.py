@@ -73,7 +73,8 @@ async def test_full_pipeline():
         )
 
     # ASR
-    asr_result = asr.transcribe(segment.audio, segment.sample_rate)
+    # The model lives on the ASR executor thread (MLX stream affinity).
+    asr_result = await asr.transcribe_async(segment.audio, segment.sample_rate)
 
     import time
     total_ms = round((time.time() - segment.end_time) * 1000, 1)
