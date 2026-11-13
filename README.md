@@ -1,302 +1,198 @@
-# JARVIS — Multimodal Perception + Attention + Local LLM Reasoning + Voice Output
+# JARVIS
 
-Audio and visual perception → Attention → Context → Local LLM → ResponseDecision → TTS → Speaker.
+A local-first, low-latency voice assistant for macOS. It listens continuously,
+decides which utterances are meant for it, reasons about them with an LLM, and
+answers by voice while the answer is still being generated. Speech recognition,
+speech synthesis, attention and memory run on the Mac; the LLM runs in Ollama,
+by default on a second machine on the local network.
 
-**Target hardware:** MacBook Air M4, 16 GB RAM, macOS. Also tested on HP Omen (Ryzen 5 4600H, 8 GB RAM, GTX 1650 Ti).
-
-## Current Pipeline
-
-```
-Audio Pipeline:
-  Microphone (16kHz mono)
-   → PortAudio callback → bounded ring buffer
-   → asyncio consumer
-   → Silero VAD (512-sample chunks)
-   → speech segmentation (silence-based boundary detection)
-   → Qwen3-ASR 0.6B (MLX)
-   → SpeechEvent on EventBus
-
-Visual Pipeline (opt-in):
-  Camera (OpenCV)
-   → FrameSampler (bounded queue, latest-frame policy)
-   → ChangeDetector (pixel diff)
-   → LocalVisionAnalyzer (Gemma 4 12B via Ollama)
-     or MockVisualAnalyzer (when vision model disabled)
-   → VisualAnalysis → EventDeduplicator
-   → VisualEvent on EventBus
-
-Both pipelines feed into:
-  → Attention Engine
-    → Tier 1: deterministic rules (<0.01ms)
-    → Tier 2: weighted scorer (<0.03ms)
-  → AttentionDecision {should_reason, salience, reason, tier}
-  → if should_reason = false: STOP (no LLM call)
-  → if should_reason = true:
-      → Context Builder (working memory + conversation + visual context)
-      → Reasoning Model (Gemma 4 12B via Ollama)
-      → ReasoningResult
-      → Response Decision
-      → if respond = false: STOP
-      → if respond = true:
-          → ResponseEvent on EventBus
-          → Kokoro TTS (82M, MLX, 24kHz)
-          → Audio Playback (sounddevice)
-```
-
-**Phase 1** (audio perception) captures and transcribes speech.
-**Phase 2** (attention) gates which transcripts deserve reasoning.
-**Phase 3** (reasoning) sends attention-positive events through a local LLM and decides whether to respond.
-**Phase 4** (voice output) synthesizes and speaks the response via local TTS.
-**Phase 5** (working memory) maintains conversation context within a session.
-**Phase 6** (visual perception) captures camera frames, detects scene changes, and emits VisualEvents.
-**Phase 7** (local vision) sends frames to a local vision model for structured observation.
-
-## Vision Details
+## Architecture
 
 ```
-Vision model:  Gemma 4 12B (via Ollama, same model as reasoning)
-Backend:       OllamaVisionBackend (sync httpx + asyncio.to_thread)
-Preprocessing: PIL JPEG encode, LANCZOS resize to max 1024px
-Output:        Structured JSON → VisualAnalysis (event_type, description, detections)
-Privacy:       Frames sent only to localhost Ollama, never persisted
+Microphone → capture → VAD + endpointing → Granite ASR        (app/audio, AudioFrontend)
+   → Transcript → attention → [history ‖ memory ‖ on-demand vision] → context
+   → streaming reasoning → sentence splitter                     (app/orchestration, TurnManager)
+   → streaming Phonon TTS → bounded turn-tagged queue → output   (app/tts)
 ```
 
-Vision is disabled by default. Enable in `configs/default.toml`:
-```toml
-[perception]
-enabled = true
+- **Audio** (`app/audio/`): PortAudio capture into a bounded ring buffer, Silero
+  VAD on 32 ms chunks, silence-based endpointing, then
+  `ibm-granite/granite-speech-5.0-470m-turboctc` via mlx-audio.
+- **Attention** (`app/attention/`): deterministic rules plus a weighted scorer
+  decide whether a transcript deserves reasoning. Most speech stops here.
+- **Context** (`app/context/`, `app/memory/`): recent conversation, memories and
+  earlier sessions' messages retrieved with SQLite FTS5, and optional visual context.
+- **Reasoning** (`app/reasoning/`): streaming Ollama client with an optional
+  local fallback.
+- **Speech output** (`app/tts/`): Phonon TTS (`hf://gradium/phonon-31m-en`, voice
+  Easton, via the `ptts` runtime) streams audio into one persistent output stream
+  fed by a bounded, turn-tagged queue.
+- **Vision** (`app/perception/`, optional): camera frames described by a
+  vision-capable Ollama model.
 
-[perception.camera]
-enabled = true
+One `Turn` exists per request. A newer request, a barge-in or shutdown cancels it,
+and reasoning, synthesis and playback stop together. Audio from a cancelled turn is
+never played. The interfaces are frozen in
+[docs/architecture/06-engineering-contracts.md](docs/architecture/06-engineering-contracts.md);
+the full design is in [docs/architecture/](docs/architecture/00-table-of-contents.md).
 
-[perception.vision]
-enabled = true
-```
+The orchestration layer (`app/orchestration/turns.py`, `TurnManager`) is being
+integrated; until it lands, `app/main.py` still runs the earlier non-streaming path.
 
-Measured latency: run `python -m scripts.benchmark_vision` with Ollama running.
+## Hardware
 
-## TTS Details
+- MacBook Air M4, 16 GB, macOS (Apple Silicon is required for MLX ASR).
+- Optional remote GPU host running Ollama. The shipped config points
+  `reasoning.ollama_url` and `perception.vision.ollama_url` at
+  `http://100.97.67.75:11434` (an HP Omen with a GTX 1650 Ti, reached over
+  Tailscale) running `gemma4:e2b-it-qat`. Change both URLs to your own host, or to
+  `http://127.0.0.1:11434` to run everything on the Mac.
 
-```
-TTS model:     Kokoro-82M (bf_emma voice, British English)
-TTS runtime:   kokoro-mlx (MLX, Apple Silicon native)
-Model size:    ~327 MB (bf16 weights)
-Sample rate:   24 kHz native output
-Interruption:  AudioPlayer.stop() — immediate cancellation
-Playback:      sounddevice OutputStream, non-blocking background thread
-```
-
-Measured latency values: run `python -m scripts.benchmark_tts` after model download.
-
-## Quick Start
+## Installation
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -e ".[dev]"
-
-# Install and start Ollama, then pull the model (~7.6 GB)
-# gemma4:12b is used for both reasoning and vision
-brew install ollama
-brew services start ollama
-ollama pull gemma4:12b
-
-# Run JARVIS (live microphone, camera off by default)
-python -m app.main
-# Speak into the microphone. Ctrl+C to stop.
 ```
 
-On first run, the ASR model (~1.2 GB) and TTS model (~327 MB) download from HuggingFace.
+Granite ASR and Phonon TTS weights download from Hugging Face on first use.
+On the Ollama host:
 
-## Performance
+```bash
+ollama pull gemma4:e2b-it-qat
+```
 
-Measured on MacBook Air M4, 16 GB RAM, Ollama v0.32.6, gemma4:12b (7.6 GB Q4).
+List the Phonon voices with `.venv/bin/ptts --list-voices`.
 
-| Metric | Target | Measured |
-|--------|--------|----------|
-| VAD latency | <1 ms per 32ms chunk | — (see benchmark) |
-| ASR latency | <800 ms from speech-end | — (see benchmark) |
-| End-to-end perception | <1 s speech-end to event | — (see benchmark) |
-| Attention (Tier 1 rules) | <0.1 ms | <0.01 ms |
-| Attention (Tier 2 scorer) | <5 ms | <0.03 ms |
-| Total attention | <10 ms | <0.05 ms |
-| Context assembly | <50 ms | <0.003 ms |
-| Model cold start | — | 7,545 ms |
-| Model warm inference (mean) | <2 s | 8,144 ms |
-| Model warm inference (min) | — | 5,494 ms |
-| Model warm inference (max) | — | 8,820 ms |
-| Tokens/sec | — | 11.3 tok/s |
-| TTS model load | — | 1,126 ms |
-| TTS cold synthesis | — | 2,218 ms |
-| TTS warm P50 | — | 358 ms |
-| TTS warm P95 | — | 518 ms |
-| TTS real-time factor | <1.0x | 0.095x |
-| TTS model memory | — | ~370 MB |
-| Vision preprocessing | <10 ms | 2.8 ms avg |
-| Vision inference (mean) | — | 38,808 ms |
-| Vision inference (min) | — | 25,774 ms |
-| Vision inference (p95) | — | 48,625 ms |
-| Vision inference (max) | — | 50,339 ms |
-| Vision success rate | 100% | 10/10 |
+## Configuration
 
-Gemma 4 12B is a thinking model — inference includes an internal `<think>` phase before producing visible output. The 2s target is not met; typical warm responses take 5–9s. A smaller model or non-thinking variant would be needed to hit the target. Python RSS stays low (~29 MB); Ollama holds the model in its own process.
+Everything is in `configs/default.toml` (loaded by `app/config.py`); the system
+prompt is `configs/system_prompt.txt`. The keys that matter most:
 
-Kokoro-82M warm synthesis is ~10x faster than real-time on M4. Cold synthesis includes pipeline initialization and voice loading.
+**Endpointing.** `vad.speech_end_silence_ms` = 192 (six 32 ms chunks of silence end
+an utterance), `vad.pre_roll_ms` = 96 (audio kept from before speech onset),
+`vad.minimum_speech_ms` = 250.
 
-Vision inference is 26–50s per frame with gemma4:12b. This is acceptable for ambient perception (the analysis loop uses latest-frame policy, not queued inference), but a smaller model would improve responsiveness. Vision preprocessing (resize + JPEG encode) is negligible at <5ms.
+**Reasoning.** `reasoning.model` = `gemma4:e2b-it-qat` at `reasoning.ollama_url`.
+Responses are streamed; `reasoning.connect_timeout_seconds` = 2.0 bounds the
+connect and `reasoning.timeout_seconds` = 30.0 bounds each read.
+`reasoning.keep_alive` = `30m` keeps the model loaded and `reasoning.think` = false
+disables thinking output. `reasoning.max_output_tokens` = 512.
 
-Run `python -m scripts.benchmark_audio` for audio pipeline measurements.
-Run `python -m scripts.benchmark_attention` for attention latency measurements.
-Run `python -m scripts.benchmark_reasoning` for reasoning pipeline measurements.
-Run `python -m scripts.benchmark_vision` for vision pipeline measurements (requires Ollama + gemma4:12b).
+**Local fallback.** If the primary host fails before its first token, the request is
+retried on `reasoning.fallback_url` (`http://127.0.0.1:11434`) with
+`reasoning.fallback_model` (`gemma4:12b`), and the primary is skipped for
+`reasoning.fallback_cooldown_seconds` = 30.0. The fallback only works with Ollama
+running on the Mac and the model pulled:
+
+```bash
+brew install ollama
+ollama serve              # or: brew services start ollama
+ollama pull gemma4:12b
+```
+
+Set `reasoning.fallback_model` to `""` to disable the fallback.
+
+**Playback.** `playback.max_queue_seconds` = 2.0 bounds synthesized-but-unplayed
+audio; `playback.tail_ms` = 200 keeps the microphone suppressed briefly after
+playback ends.
+
+**Barge-in.** `barge_in.enabled` = false. With it on, speech during playback
+(`barge_in.vad_threshold` = 0.8, sustained for `barge_in.min_speech_ms` = 256)
+stops JARVIS mid-sentence. It is off by default because there is no echo
+cancellation: through laptop speakers the microphone hears JARVIS's own voice and
+would interrupt it. Enable it only with headphones. While it is off the microphone
+is suppressed during playback. Speaking while JARVIS is still thinking cancels the
+earlier request either way.
+
+**Memory.** `memory.enabled` = true stores conversation and memories in SQLite at
+`memory.database_path` (`~/.jarvis/jarvis.db`); an existing database is migrated
+in place on first open. Retrieval is FTS5/BM25 blended with recency, up to
+`memory.max_retrieved_memories` = 5 lines. `memory.cross_session` = true also
+searches messages from earlier sessions. Saying "remember that ..." stores an
+explicit memory. `memory.semantic_enabled` and `memory.embedding_model` are present
+but unused: semantic retrieval was evaluated and not implemented.
+
+**Vision.** `perception.enabled`, `perception.camera.enabled` and
+`perception.vision.enabled` are all true in the shipped file, so the camera is on.
+To turn it off, set `perception.enabled` to false. Frames go to
+`perception.vision.model` (`gemma4:e2b-it-qat`) at `perception.vision.ollama_url`;
+`perception.camera.analysis_fps` = 0.2 analyses one frame every 5 s.
+`perception.on_demand_timeout_seconds` = 3.0 bounds a live look for a vision
+question and `perception.pause_during_turn` = true pauses ambient analysis while a
+request is being answered.
+
+## Running
+
+```bash
+python -m app.main        # or: jarvis
+```
+
+This opens the microphone (and the camera if enabled). Ctrl+C stops it.
 
 ## Tests
 
 ```bash
-# Unit tests (no model download required, no Ollama required)
-python -m pytest tests/ -v
-
-# Perception tests only (camera, sampler, vision, lifecycle)
-python -m pytest tests/test_perception/ -v
-
-# Local vision tests only (47 tests, fake backend, no Ollama)
-python -m pytest tests/test_perception/test_local_vision.py -v
-
-# All tests including model integration
-python -m pytest tests/ -m "integration or not integration" -v
-
-# Reasoning model smoke test (requires Ollama + gemma4:12b)
-python -m pytest tests/test_reasoning/test_local_model.py -m model -v
-
-# TTS model smoke test (requires Kokoro model download)
-python -m pytest tests/test_tts/test_pipeline.py -m model -v
+python -m pytest                     # default: no models, no network, no devices
+python -m pytest -m integration      # loads Silero VAD and Granite ASR
+python -m pytest -m model            # real Ollama requests and Phonon TTS
+python -m pytest -m hardware         # real microphone/speaker
 ```
 
-Test categories:
-- **Unit tests** — no external dependencies, fast (502 tests)
-- **Integration tests** (`-m integration`) — require Silero VAD + Qwen3-ASR model downloads
-- **Model tests** (`-m model`) — require running Ollama instance or Kokoro TTS model
-- **Hardware tests** (`-m hardware`) — require real microphone/speaker access
+Every marker declared in `pyproject.toml` (`integration`, `hardware`, `model`) is
+skipped unless selected with `-m`; `tests/conftest.py` enforces this.
+In a fresh clone `tests/test_attention/test_evaluation.py` fails because
+`tests/data/` is gitignored and `tests/data/attention_cases.json` is not committed.
 
 ## Benchmarks
 
-```bash
-pip install psutil
-python -m scripts.benchmark_audio
-python -m scripts.benchmark_attention
-python -m scripts.benchmark_reasoning
-python -m scripts.benchmark_tts
-python -m scripts.benchmark_vision   # requires Ollama + gemma4:12b
-```
+| Command | Measures | Needs |
+|---|---|---|
+| `python -m scripts.benchmark_e2e` | End of speech to first audio through `TurnManager` with fake models (labelled SIMULATED: orchestration overhead and ordering, not model speed). Per-stage P50/P95/P99, failure rate, queue depth, peak RSS. `--barge-in` adds cancel-to-silence time and stale chunks played (must be 0). `--json PATH` writes results. | `app/orchestration/turns.py` |
+| `python -m scripts.benchmark_e2e --real` | The same with Granite ASR, the configured reasoning backend and Phonon TTS; input speech is synthesized by the TTS, output goes to a null sink. Cold and warm turns reported separately. | Models, Ollama host |
+| `python -m scripts.benchmark_audio --skip-models` | Endpointing delay only. Without `--skip-models`: VAD per-chunk cost and ASR latency / real-time factor (`--wav speech.wav` for real speech). | ASR model without `--skip-models` |
+| `python -m scripts.benchmark_reasoning` | Cold request, warm time to first token, total latency, tokens/s and failure rate for the primary and fallback targets (`--target url=...,model=...`, `--runs N`). | Ollama |
+| `python -m scripts.benchmark_tts` | Phonon streaming synthesis with no audio output (`--runs N`). | TTS model |
+| `python -m scripts.benchmark_memory` | `retrieve_context` and message-write latency on synthetic 1k/10k/50k-row databases in a temp directory. | Nothing |
+| `python -m scripts.benchmark_attention` | Attention rule and scorer latency. | Nothing |
+| `python -m scripts.benchmark_vision` | Vision preprocessing and inference with `perception.vision.model`; prints NOT RUN if the host is unreachable. | Ollama host |
+| `python -m scripts.stability_test --simulated --turns 300` | Many simulated turns, a third cancelled; fails on asyncio task, thread or RSS growth. | `app/orchestration/turns.py` |
+| `python -m scripts.stability_test --minutes 10` | VAD + segmenter + ASR + event bus on synthetic audio for memory drift. | VAD and ASR models |
 
-## Stability Test
+Scripts that need code not yet in the tree print `NOT RUN` and exit with code 2.
 
-```bash
-python -m scripts.stability_test --minutes 10
-```
+## Performance
 
-## Configuration
+Targets and how each is measured: [docs/architecture/07-performance.md](docs/architecture/07-performance.md).
+Measurements are on the MacBook Air M4; NOT RUN means not measured yet. The
+endpointing and memory targets come from the config and the engineering contract;
+the others are proposed targets for the streaming pipeline.
 
-Edit `configs/default.toml`. Key settings:
+| Metric | Target | Measured |
+|---|---|---|
+| Endpointing delay (`speech_end` to `segment_emitted`) | < 200 ms | NOT RUN (192 ms by configuration) |
+| ASR (`segment_emitted` to `asr_done`) | < 300 ms | NOT RUN |
+| Memory retrieval, 10k rows (warm) | < 50 ms | P50 1.12 ms, P95 1.26 ms, P99 1.27 ms |
+| Memory retrieval, 50k rows (warm) | < 50 ms | P50 3.35 ms, P95 6.69 ms, P99 6.78 ms |
+| Message write | — | P50 0.07 ms |
+| LLM first token (warm, from `speech_end`) | < 1.0 s | NOT RUN |
+| First audio (warm, from `speech_end`) | < 1.5 s | NOT RUN |
+| First audio (cold, first turn) | — | NOT RUN |
+| Barge-in: cancel to silence | < 50 ms | NOT RUN |
+| Stale audio chunks played after cancel | 0 | NOT RUN |
+| Orchestration overhead (simulated) | < 20 ms | NOT RUN |
+| Peak process RSS | < 2 GB | NOT RUN |
 
-```toml
-[attention]
-enabled = true
-reason_threshold = 0.4
-assistant_names = ["jarvis"]
-working_memory_size = 20
+## Known limitations
 
-[reasoning]
-enabled = true
-model = "gemma4:12b"
-max_context_messages = 8
-max_context_characters = 6000
-max_output_tokens = 256
-temperature = 0.2
-max_concurrent_requests = 1
-
-[response]
-enabled = true
-
-[tts]
-enabled = true
-model = "mlx-community/Kokoro-82M-bf16"
-voice = "bf_emma"
-speed = 1.0
-sample_rate = 24000
-max_text_length = 2000
-
-[playback]
-enabled = true
-volume = 1.0
-
-[perception]
-enabled = false          # camera requires explicit opt-in
-max_visual_events = 5
-
-[perception.camera]
-enabled = false
-device_index = 0
-capture_fps = 10.0
-analysis_fps = 1.0
-
-[perception.vision]
-enabled = false          # enable to use local vision model
-provider = "ollama"      # only "ollama" is supported
-model = "gemma4:12b"
-timeout_seconds = 120.0
-max_image_size = 1024
-prompt = ""              # empty = use default structured prompt
-```
-
-System prompt: `configs/system_prompt.txt` (versioned, editable).
-
-## Architecture
-
-See `docs/architecture/` for the full system design.
-
-### Subsystem boundaries
-
-```
-Audio Perception (Phase 1) → never calls the LLM
-Visual Perception (Phase 6) → Camera → FrameSampler → ChangeDetector → VisualAnalyzer
-Local Vision (Phase 7)      → LocalVisionAnalyzer → OllamaVisionBackend → structured observation
-Attention (Phase 2)         → gates LLM access for both speech and visual events
-Context Builder             → controls what the LLM sees (speech + conversation + visual context)
-ReasoningModel              → replaceable behind protocol
-Response Decision           → separate from reasoning
-TTS (Phase 4)               → downstream of ResponseDecision, replaceable behind protocol
-AudioPlayer                 → stop() for interruption, does not own VAD
-```
-
-Reasoning does not block audio capture. LLM inference runs in a thread via `asyncio.to_thread`.
-TTS synthesis runs in a thread via `asyncio.to_thread`. Playback runs in a background thread.
-Vision inference runs in a thread via `asyncio.to_thread`. Camera capture runs independently.
-
-Phase 3 concurrency policy: at most one local LLM inference is active. If another attention-positive event arrives while inference is active, the event is dropped rather than creating unbounded inference tasks.
-
-Phase 7 vision model: `LocalVisionAnalyzer` sits behind the `VisualAnalyzer` protocol. The `VisionBackend` protocol decouples from Ollama. At most one visual inference runs at a time (single analysis loop + latest-frame policy). Vision uses the same Ollama model as reasoning but through a separate endpoint (`/api/chat` with `images` field).
-
-### Key protocols
-
-```
-VisualAnalyzer  → MockVisualAnalyzer (testing) or LocalVisionAnalyzer (production)
-VisionBackend   → OllamaVisionBackend (production) or FakeVisionBackend (testing)
-ReasoningModel  → OllamaModel (production)
-Camera          → OpenCVCamera (production) or FakeCamera (testing)
-```
-
-## Privacy
-
-- All processing is local. No cloud API calls.
-- Raw audio exists only in a bounded in-memory ring buffer.
-- No audio, transcripts, prompts, or responses are persisted to disk.
-- TTS audio exists only in memory during playback; no temp files.
-- Working memory is in-process only, cleared on restart.
-- Model prompts are not logged at INFO level.
-- Microphone capture is logged on startup.
-- Camera is disabled by default (explicit opt-in via config).
-- Raw camera frames are never persisted to disk, logs, or SQLite.
-- Frames are sent only to localhost Ollama as base64, discarded after inference.
-- Only structured descriptions (text) enter the reasoning pipeline — never raw image data.
-- VisualEvents contain text descriptions and metadata, never pixel data.
+- `TurnManager` is not integrated yet; the running app uses the earlier
+  non-streaming path and the end-to-end numbers above are not measured.
+- No echo cancellation, so barge-in is off by default (see Configuration).
+- The default config depends on a remote Ollama host; without it, replies need the
+  local fallback (`ollama serve` plus a pulled model) and are slower on the Mac.
+- Memory retrieval is lexical (FTS5); paraphrases with no shared words are missed.
+- The shipped config enables the camera. Frames are sent to the vision host over
+  the network and are not stored; only text descriptions enter the pipeline.
+- Conversation and memories persist in `~/.jarvis/jarvis.db`.
+- macOS on Apple Silicon only (MLX).
