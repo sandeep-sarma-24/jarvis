@@ -71,7 +71,7 @@ Sources: [Contra Collective comparison](https://contracollective.com/blog/llama-
 | all-MiniLM-L6-v2 | 384 | ~80MB | <5ms | Medium |
 | mxbai-embed-large | 1024 | ~1.2GB | ~15ms | Very High |
 
-**Not implemented.** Memory retrieval is lexical: SQLite FTS5/BM25 blended with recency (`app/memory/`). Semantic retrieval was evaluated and not built; `memory.semantic_enabled` and `memory.embedding_model` exist in the config but are unused. This table is kept as the evaluation for a future semantic layer.
+**Not implemented.** Memory retrieval is lexical: SQLite FTS5/BM25 blended with recency (`app/memory/`). Semantic retrieval was evaluated and not built. This table is kept as the evaluation for a future semantic layer.
 
 ## Event Bus / IPC
 

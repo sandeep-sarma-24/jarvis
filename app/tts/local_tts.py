@@ -27,7 +27,7 @@ class PhononTTS:
         *,
         model_id: str = "hf://gradium/phonon-31m-en",
         voice: str = "Easton",
-        quant: str = "q8",
+        quant: str = "q8_0",
     ) -> None:
         self._model_id = model_id
         self._voice = voice

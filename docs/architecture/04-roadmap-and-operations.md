@@ -233,7 +233,7 @@ SpeechEvent (from Phase 1)
 - Model: Gemma 4 12B Q4 via Ollama (configurable). Behind `ReasoningModel` protocol — swappable.
 - Context builder: bounded by `max_context_messages` (8) and `max_context_characters` (6000). Current event always preserved. Prefers `should_reason=True` entries from working memory. Current event excluded from historical candidates to prevent duplication.
 - Response decision: deterministic Phase 3 policy — attention-positive + successful reasoning = respond. No second LLM call.
-- Concurrency: bounded by `asyncio.Semaphore(max_concurrent_requests=1)`. Extra events dropped with warning.
+- Concurrency: one turn at a time, latest wins. A newer attention-positive utterance cancels the turn in flight (`TurnManager`).
 - LLM inference: runs in thread via `asyncio.to_thread` — does not block audio capture.
 - System prompt: versioned in `configs/system_prompt.txt`, not hardcoded.
 - No TTS, no tools, no persistent memory, no cloud inference.

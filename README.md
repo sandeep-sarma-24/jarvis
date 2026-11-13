@@ -36,8 +36,8 @@ never played. The interfaces are frozen in
 [docs/architecture/06-engineering-contracts.md](docs/architecture/06-engineering-contracts.md);
 the full design is in [docs/architecture/](docs/architecture/00-table-of-contents.md).
 
-The orchestration layer (`app/orchestration/turns.py`, `TurnManager`) is being
-integrated; until it lands, `app/main.py` still runs the earlier non-streaming path.
+`app/main.py` is thin wiring: `AudioFrontend` feeds `TurnManager`
+(`app/orchestration/turns.py`), which drives the streaming model, TTS and player.
 
 ## Hardware
 
@@ -72,7 +72,10 @@ prompt is `configs/system_prompt.txt`. The keys that matter most:
 
 **Endpointing.** `vad.speech_end_silence_ms` = 192 (six 32 ms chunks of silence end
 an utterance), `vad.pre_roll_ms` = 96 (audio kept from before speech onset),
-`vad.minimum_speech_ms` = 250.
+`vad.minimum_speech_ms` = 250. Utterances with less than
+`vad.short_utterance_ms` = 1000 of speech wait `vad.short_utterance_silence_ms` = 480
+instead, so the pause after a wake word ("Jarvis, ...") does not split the request.
+A pause longer than 192 ms later in a sentence can still split it.
 
 **Reasoning.** `reasoning.model` = `gemma4:e2b-it-qat` at `reasoning.ollama_url`.
 Responses are streamed; `reasoning.connect_timeout_seconds` = 2.0 bounds the
@@ -83,7 +86,7 @@ disables thinking output. `reasoning.max_output_tokens` = 512.
 **Local fallback.** If the primary host fails before its first token, the request is
 retried on `reasoning.fallback_url` (`http://127.0.0.1:11434`) with
 `reasoning.fallback_model` (`gemma4:12b`), and the primary is skipped for
-`reasoning.fallback_cooldown_seconds` = 30.0. The fallback only works with Ollama
+`reasoning.fallback_cooldown_seconds` = 300.0. The fallback only works with Ollama
 running on the Mac and the model pulled:
 
 ```bash
@@ -111,8 +114,7 @@ earlier request either way.
 in place on first open. Retrieval is FTS5/BM25 blended with recency, up to
 `memory.max_retrieved_memories` = 5 lines. `memory.cross_session` = true also
 searches messages from earlier sessions. Saying "remember that ..." stores an
-explicit memory. `memory.semantic_enabled` and `memory.embedding_model` are present
-but unused: semantic retrieval was evaluated and not implemented.
+explicit memory. Semantic (embedding) retrieval was evaluated and not implemented.
 
 **Vision.** `perception.enabled`, `perception.camera.enabled` and
 `perception.vision.enabled` are all true in the shipped file, so the camera is on.
@@ -165,24 +167,27 @@ Scripts that need code not yet in the tree print `NOT RUN` and exit with code 2.
 ## Performance
 
 Targets and how each is measured: [docs/architecture/07-performance.md](docs/architecture/07-performance.md).
-Measurements are on the MacBook Air M4; NOT RUN means not measured yet. The
+Measurements are on the MacBook Air M4 (16 GB), 2026-11-13, with synthesized speech
+as input and no microphone or speaker; NOT RUN means not measured. The
 endpointing and memory targets come from the config and the engineering contract;
 the others are proposed targets for the streaming pipeline.
 
 | Metric | Target | Measured |
 |---|---|---|
-| Endpointing delay (`speech_end` to `segment_emitted`) | < 200 ms | NOT RUN (192 ms by configuration) |
-| ASR (`segment_emitted` to `asr_done`) | < 300 ms | NOT RUN |
+| Endpointing delay (`speech_end` to `segment_emitted`) | < 200 ms | 192 ms (480 ms for utterances with under 1 s of speech) |
+| ASR (`segment_emitted` to `asr_done`) | < 300 ms | P50 40 ms, P95 46 ms, P99 48 ms warm |
 | Memory retrieval, 10k rows (warm) | < 50 ms | P50 1.12 ms, P95 1.26 ms, P99 1.27 ms |
 | Memory retrieval, 50k rows (warm) | < 50 ms | P50 3.35 ms, P95 6.69 ms, P99 6.78 ms |
 | Message write | — | P50 0.07 ms |
-| LLM first token (warm, from `speech_end`) | < 1.0 s | NOT RUN |
-| First audio (warm, from `speech_end`) | < 1.5 s | NOT RUN |
-| First audio (cold, first turn) | — | NOT RUN |
-| Barge-in: cancel to silence | < 50 ms | NOT RUN |
-| Stale audio chunks played after cancel | 0 | NOT RUN |
-| Orchestration overhead (simulated) | < 20 ms | NOT RUN |
-| Peak process RSS | < 2 GB | NOT RUN |
+| TTS first chunk | < 150 ms | P50 7.7 ms, P95 10.2 ms, P99 10.5 ms warm; 20 ms cold |
+| LLM first token, primary remote host | < 1.0 s | NOT RUN (host unreachable) |
+| LLM first token, local fallback `gemma4:12b`, model only | < 1.0 s | P50 725 ms on a short prompt; about 3.1 s with the real system prompt |
+| First audio, real models, local fallback (warm, excludes endpointing) | < 1.5 s | P50 5.7 s, P95 7.8 s (n=11) |
+| First audio, real models, local fallback (cold, first turn) | — | 8.2 s |
+| Barge-in: cancel to silence (simulated player) | < 50 ms | P50 6.3 ms, P99 10.0 ms |
+| Stale audio chunks played after cancel | 0 | 0 (30 simulated barge-ins) |
+| Orchestration overhead before reasoning (simulated) | < 20 ms | P99 0.5 ms |
+| Peak process RSS (JARVIS only; Ollama holds the LLM separately, 8.1 GB for `gemma4:12b`) | < 2 GB | 525 MB |
 
 ## Known limitations
 

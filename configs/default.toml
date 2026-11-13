@@ -37,7 +37,6 @@ max_context_characters = 6000
 max_output_tokens = 512
 temperature = 0.2
 timeout_seconds = 30.0  # read timeout; connect has its own below
-max_concurrent_requests = 1
 connect_timeout_seconds = 2.0
 keep_alive = "30m"
 think = false
@@ -45,7 +44,8 @@ think = false
 # Needs `ollama serve` running locally with the model pulled.
 fallback_url = "http://127.0.0.1:11434"
 fallback_model = "gemma4:12b"
-fallback_cooldown_seconds = 30.0
+# While the primary is down, one request per cooldown pays the connect timeout.
+fallback_cooldown_seconds = 300.0
 
 [response]
 enabled = true
@@ -79,8 +79,6 @@ database_path = "~/.jarvis/jarvis.db"
 max_retrieved_memories = 5
 max_recent_messages = 8
 cross_session = true
-semantic_enabled = false
-embedding_model = "BAAI/bge-small-en-v1.5"
 
 [fusion]
 enabled = true

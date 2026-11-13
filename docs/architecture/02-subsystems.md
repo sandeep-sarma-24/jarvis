@@ -117,7 +117,7 @@ ponytail: ceiling is ~100K memories before in-process numpy search becomes notic
 
 **Architectural requirement:** An embedding model capable of producing dense vector representations for semantic search.
 
-**Not implemented yet.** Retrieval is SQLite FTS5/BM25 blended with recency; `memory.semantic_enabled` and `memory.embedding_model` are unused. Evaluated for a future semantic layer: `nomic-embed-text` via Ollama (137M params, 768-dim). Alternatives: `all-MiniLM-L6-v2` (faster, less capable), `mxbai-embed-large` (better quality, larger). Swappable behind the `EmbeddingModel` interface.
+**Not implemented yet.** Retrieval is SQLite FTS5/BM25 blended with recency. Evaluated for a future semantic layer: `nomic-embed-text` via Ollama (137M params, 768-dim). Alternatives: `all-MiniLM-L6-v2` (faster, less capable), `mxbai-embed-large` (better quality, larger). Swappable behind the `EmbeddingModel` interface.
 
 ## Memory Flow Diagram
 

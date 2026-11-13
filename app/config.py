@@ -55,13 +55,12 @@ class ReasoningConfig:
     max_output_tokens: int = 256
     temperature: float = 0.2
     timeout_seconds: float = 30.0
-    max_concurrent_requests: int = 1
     connect_timeout_seconds: float = 2.0
     keep_alive: str = "30m"
     think: bool = False
     fallback_url: str = "http://127.0.0.1:11434"
     fallback_model: str = ""  # empty = no fallback backend
-    fallback_cooldown_seconds: float = 30.0
+    fallback_cooldown_seconds: float = 300.0
 
 
 @dataclass
@@ -105,8 +104,6 @@ class MemoryConfig:
     max_retrieved_memories: int = 5
     max_recent_messages: int = 8
     cross_session: bool = True
-    semantic_enabled: bool = False
-    embedding_model: str = "BAAI/bge-small-en-v1.5"
 
 
 @dataclass

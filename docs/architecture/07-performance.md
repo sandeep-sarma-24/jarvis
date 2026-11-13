@@ -67,28 +67,51 @@ an unreachable host, print `NOT RUN` and exit with code 2.
 
 ## Results
 
-MacBook Air M4, 16 GB. NOT RUN means not measured yet. Fill in with the command
-used, the date and the commit.
+MacBook Air M4, 16 GB, 2026-11-13, integration branch `feature/jarvis-low-latency-multi-agent`.
+Input is speech synthesized by Phonon; no microphone or speaker was used. NOT RUN means not measured.
+The primary remote Ollama host was unreachable, so real-model rows use the local fallback `gemma4:12b`.
 
 | Metric | P50 | P95 | P99 | Source |
 |---|---|---|---|---|
-| Endpointing (`segment_emitted`) | NOT RUN | NOT RUN | NOT RUN | `benchmark_audio --skip-models` |
-| ASR (`asr_done` − `segment_emitted`) | NOT RUN | NOT RUN | NOT RUN | `benchmark_audio` |
+| Endpointing (`segment_emitted`), 1 s or more of speech | 192 ms | 192 ms | 192 ms | real VAD + segmenter on synthesized speech |
+| Endpointing, under 1 s of speech | 480 ms | 480 ms | 480 ms | by configuration (`vad.short_utterance_silence_ms`) |
+| ASR (`asr_done` − `segment_emitted`), warm | 40 ms | 46 ms | 48 ms | `benchmark_audio --wav`; cold first call 47–339 ms |
+| VAD per 32 ms chunk | 0.08 ms | 0.08 ms | 0.10 ms | `benchmark_audio` |
 | `retrieve_context`, 10k rows, warm | 1.12 ms | 1.26 ms | 1.27 ms | `benchmark_memory` |
 | `retrieve_context`, 50k rows, warm | 3.35 ms | 6.69 ms | 6.78 ms | `benchmark_memory` |
 | Message write | 0.07 ms | NOT RUN | NOT RUN | `benchmark_memory` (P95/P99 not reported to the docs) |
-| LLM first token, primary, warm | NOT RUN | NOT RUN | NOT RUN | `benchmark_reasoning` |
-| LLM first token, local fallback, warm | NOT RUN | NOT RUN | NOT RUN | `benchmark_reasoning` |
-| TTS first chunk | NOT RUN | NOT RUN | NOT RUN | `benchmark_tts` |
-| `first_audio`, simulated | NOT RUN | NOT RUN | NOT RUN | `benchmark_e2e` |
-| `first_audio`, real, warm | NOT RUN | NOT RUN | NOT RUN | `benchmark_e2e --real` |
-| `first_audio`, real, cold (first turn) | NOT RUN | — | — | `benchmark_e2e --real` |
-| Cancel → silence, simulated | NOT RUN | NOT RUN | NOT RUN | `benchmark_e2e --barge-in` |
+| LLM first token, primary, warm | NOT RUN | NOT RUN | NOT RUN | `benchmark_reasoning` (host unreachable) |
+| LLM first token, local fallback, warm, short prompt | 725 ms | 748 ms | 748 ms | `benchmark_reasoning`, n=10; 13.3 tokens/s; cold load 12.5 s |
+| LLM first token, local fallback, real system prompt | about 3.1 s | — | — | prompt re-evaluated every turn, see below |
+| TTS first chunk, warm | 7.7 ms | 10.2 ms | 10.5 ms | `benchmark_tts --runs 10`; cold 20 ms; real-time factor 0.03 |
+| `first_audio`, simulated | 240 ms | 250 ms | 251 ms | `benchmark_e2e --turns 30` (fake model 150 ms to first token, fake TTS 80 ms) |
+| `first_audio`, real, warm, local fallback | 5.7 s | 7.8 s | 7.8 s | `benchmark_e2e --real --turns 12`, n=11; excludes endpointing |
+| `first_audio`, real, cold (first turn) | 8.2 s | — | — | `benchmark_e2e --real` |
+| Cancel → silence, simulated | 6.3 ms | 10.0 ms | 10.0 ms | `benchmark_e2e --turns 30 --barge-in` |
 
 | Check | Result | Source |
 |---|---|---|
-| Stale chunks played after cancel | NOT RUN | `benchmark_e2e --barge-in` |
-| Failure rate (real) | NOT RUN | `benchmark_e2e --real` |
-| Max player queue depth | NOT RUN | `benchmark_e2e` |
-| Peak RSS (real) | NOT RUN | `benchmark_e2e --real` |
-| Task / thread growth, RSS drift over 300 turns | NOT RUN | `stability_test --simulated` |
+| Stale chunks played after cancel | 0 in 30 barge-ins | `benchmark_e2e --barge-in` |
+| Failure rate (real) | 0 of 12 turns | `benchmark_e2e --real` |
+| Max player queue depth | 2.00 s (the configured bound) | `benchmark_e2e` |
+| Peak RSS (real) | 525 MB (JARVIS process; Ollama separate) | `benchmark_e2e --real` |
+| Task / thread growth, RSS drift | pass over 40 simulated turns; 300 turns NOT RUN | `stability_test --simulated` |
+
+### Where the time goes on the local fallback
+
+With `gemma4:12b` on local Ollama the dominant cost is prompt evaluation, not
+generation: about 3 to 4 s for the roughly 300-token prompt on every turn. Ollama
+reused its prompt cache only when a request extended the previous request
+verbatim (about 1 s in that case). The context builder puts per-turn context
+before the conversation history, so the prefix changes every turn and the cache
+never applies. Measured on four-turn conversations:
+
+| Prompt layout | Prompt evaluation per turn |
+|---|---|
+| Current: per-turn context before history | 3.3 to 4.4 s |
+| Per-turn context after history | 3.6 to 4.7 s |
+| Per-turn context inside the user message, replayed verbatim in history | 4.0 s first turn, then 0.9 to 1.1 s |
+
+Not implemented: the verbatim-replay layout changes what is sent to the model and
+has not been validated against the primary model. `think = false` matters: with
+thinking left on, time to first token roughly doubled (6.0 s against 3.1 s).
