@@ -9,6 +9,7 @@ Priority: current request > recent conversation > relevant memory.
 from __future__ import annotations
 
 import time
+from collections.abc import Set as AbstractSet
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -86,15 +87,15 @@ class ContextBuilder:
         budget -= len(self._system_prompt)
         budget -= len(event.transcript)
 
-        # Phase 5: include persistent conversation messages within budget
+        # Persistent conversation: keep the newest turns that fit, in order.
         conv_msgs: list[dict[str, str]] = []
-        if conversation_messages:
-            for msg in conversation_messages:
-                cost = len(msg.get("content", ""))
-                if budget - cost < 0:
-                    break
-                conv_msgs.append(msg)
-                budget -= cost
+        for msg in reversed(conversation_messages or []):
+            cost = len(msg.get("content", ""))
+            if budget - cost < 0:
+                break
+            conv_msgs.append(msg)
+            budget -= cost
+        conv_msgs.reverse()
 
         # Phase 5: include relevant memories within budget
         mem_ctx: list[str] = []
@@ -134,8 +135,15 @@ class ContextBuilder:
             budget -= vis_used
 
         # Phase 1-4 working memory selection with remaining budget
+        # Working-memory turns already in the conversation history would be
+        # emitted twice (and after their own reply), so they are skipped.
+        in_history = {
+            m.get("content", "").strip().casefold()
+            for m in conv_msgs if m.get("role") == "user"
+        }
         recent = self._select_recent(
             working_memory, budget, exclude_event_id=event.id,
+            exclude_texts=in_history,
         )
         total_chars = (
             len(self._system_prompt)
@@ -214,10 +222,12 @@ class ContextBuilder:
         char_budget: int,
         *,
         exclude_event_id: str | None = None,
+        exclude_texts: AbstractSet[str] = frozenset(),
     ) -> list[WorkingMemoryEntry]:
         entries = [
             e for e in memory.entries
             if e.event_id != exclude_event_id
+            and e.transcript.strip().casefold() not in exclude_texts
         ]
         # Prefer meaningful interactions, most recent first
         candidates = [e for e in reversed(entries) if e.should_reason]

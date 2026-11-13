@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import sqlite3
 import threading
 import time
@@ -60,17 +61,110 @@ CREATE TABLE IF NOT EXISTS memories (
     metadata_json TEXT NOT NULL DEFAULT '{}'
 );
 
-CREATE INDEX IF NOT EXISTS idx_messages_session_id ON conversation_messages(session_id);
 CREATE INDEX IF NOT EXISTS idx_messages_timestamp ON conversation_messages(timestamp);
 CREATE INDEX IF NOT EXISTS idx_memories_type ON memories(type);
 CREATE INDEX IF NOT EXISTS idx_memories_created ON memories(created_at);
 """
+
+# Schema migrations, applied in order inside one IMMEDIATE transaction keyed on
+# PRAGMA user_version, so an existing database is upgraded in place exactly once.
+# shortcut: the FTS tables are external-content keyed on the implicit rowid, which
+# a VACUUM may renumber; after any VACUUM run INSERT INTO x_fts(x_fts) VALUES('rebuild').
+_MIGRATIONS = (
+    """
+    CREATE INDEX IF NOT EXISTS idx_messages_session_ts ON conversation_messages(session_id, timestamp);
+    DROP INDEX IF EXISTS idx_messages_session_id;
+    ALTER TABLE memories ADD COLUMN norm_content TEXT;
+    CREATE INDEX IF NOT EXISTS idx_memories_norm ON memories(norm_content);
+
+    CREATE VIRTUAL TABLE memories_fts USING fts5(
+        content, content='memories', content_rowid='rowid', tokenize='porter unicode61');
+    CREATE TRIGGER memories_fts_ai AFTER INSERT ON memories BEGIN
+        INSERT INTO memories_fts(rowid, content) VALUES (new.rowid, new.content);
+    END;
+    CREATE TRIGGER memories_fts_ad AFTER DELETE ON memories BEGIN
+        INSERT INTO memories_fts(memories_fts, rowid, content) VALUES ('delete', old.rowid, old.content);
+    END;
+    CREATE TRIGGER memories_fts_au AFTER UPDATE OF content ON memories BEGIN
+        INSERT INTO memories_fts(memories_fts, rowid, content) VALUES ('delete', old.rowid, old.content);
+        INSERT INTO memories_fts(rowid, content) VALUES (new.rowid, new.content);
+    END;
+    INSERT INTO memories_fts(memories_fts) VALUES ('rebuild');
+
+    CREATE VIRTUAL TABLE messages_fts USING fts5(
+        content, content='conversation_messages', content_rowid='rowid', tokenize='porter unicode61');
+    CREATE TRIGGER messages_fts_ai AFTER INSERT ON conversation_messages BEGIN
+        INSERT INTO messages_fts(rowid, content) VALUES (new.rowid, new.content);
+    END;
+    CREATE TRIGGER messages_fts_ad AFTER DELETE ON conversation_messages BEGIN
+        INSERT INTO messages_fts(messages_fts, rowid, content) VALUES ('delete', old.rowid, old.content);
+    END;
+    CREATE TRIGGER messages_fts_au AFTER UPDATE OF content ON conversation_messages BEGIN
+        INSERT INTO messages_fts(messages_fts, rowid, content) VALUES ('delete', old.rowid, old.content);
+        INSERT INTO messages_fts(rowid, content) VALUES (new.rowid, new.content);
+    END;
+    INSERT INTO messages_fts(messages_fts) VALUES ('rebuild');
+    """,
+)
+
+_WORD = re.compile(r"\w+")
+_STOPWORDS = frozenset("""
+a about above after again all am an and any are as at be been before being below between both but by
+can could did do does doing don down during each few for from further had has have having he her here
+hers him his how i if in into is it its just me more most my no nor not now of off on once only or other
+our ours out over own same she should so some such than that the their them then there these they this
+those through to too under until up very was we were what when where which while who whom why will with
+would you your yours yourself hey hi hello jarvis please tell know remember say said ok okay yeah yes
+""".split())
+_MAX_TERMS = 12
+# Recency: a match loses half its weight after this many seconds (30 days).
+_RECENCY_HALF_LIFE = 30 * 86400.0
+
+
+def normalize(text: str) -> str:
+    """Lower-cased words joined by single spaces; the key for dedup."""
+    return " ".join(_WORD.findall(text.lower()))
+
+
+def fts_query(text: str) -> str | None:
+    """Turn free user text into a safe FTS5 MATCH expression, or None.
+
+    Only \\w+ tokens survive and each is double-quoted, so operators, quotes
+    and keywords in the input can never become FTS syntax.
+    """
+    terms: list[str] = []
+    for w in _WORD.findall(text.lower()):
+        if len(w) > 1 and w not in _STOPWORDS and w not in terms:
+            terms.append(w)
+    if not terms:
+        return None
+    return " OR ".join(f'"{t}"' for t in terms[:_MAX_TERMS])
+
+
+def _split_sql(script: str) -> list[str]:
+    """Split a script into statements (trigger bodies included) for use inside
+    a transaction, where executescript() would commit first."""
+    stmts, buf = [], ""
+    for line in script.splitlines(keepends=True):
+        buf += line
+        if buf.strip() and sqlite3.complete_statement(buf):
+            stmts.append(buf.strip())
+            buf = ""
+    return stmts
+
+
+_MEMORY_COLS = "id, type, content, created_at, updated_at, importance, source_event_id, metadata_json"
+_INSERT_MEMORY = (
+    f"INSERT OR IGNORE INTO memories ({_MEMORY_COLS}, norm_content) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+)
 
 
 def _configure_connection(conn: sqlite3.Connection, is_file: bool) -> None:
     """Apply WAL (file only), foreign keys, and busy timeout to a connection."""
     if is_file:
         conn.execute("PRAGMA journal_mode=WAL")
+        # WAL + NORMAL stays consistent on power loss and skips an fsync per commit.
+        conn.execute("PRAGMA synchronous=NORMAL")
     conn.execute("PRAGMA foreign_keys=ON")
     conn.execute("PRAGMA busy_timeout=5000")
 
@@ -119,6 +213,31 @@ class SQLiteStore:
 
         conn = self._get_conn()
         conn.executescript(_SCHEMA)
+        self._migrate(conn)
+
+    @staticmethod
+    def _migrate(conn: sqlite3.Connection) -> None:
+        """Bring an existing database up to the current schema, idempotently."""
+        if conn.execute("PRAGMA user_version").fetchone()[0] >= len(_MIGRATIONS):
+            return
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            # Re-read under the write lock: another process may have migrated.
+            version = conn.execute("PRAGMA user_version").fetchone()[0]
+            for i in range(version, len(_MIGRATIONS)):
+                for stmt in _split_sql(_MIGRATIONS[i]):
+                    conn.execute(stmt)
+                if i == 0:
+                    rows = conn.execute("SELECT rowid, content FROM memories").fetchall()
+                    conn.executemany(
+                        "UPDATE memories SET norm_content = ? WHERE rowid = ?",
+                        [(normalize(c), r) for r, c in rows],
+                    )
+                conn.execute(f"PRAGMA user_version = {i + 1}")
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
 
     def _make_connection(self) -> sqlite3.Connection:
         """Create a new SQLite connection for the current configuration."""
@@ -197,19 +316,34 @@ class SQLiteStore:
         try:
             conn = self._get_conn()
             conn.execute(
-                "INSERT OR IGNORE INTO memories (id, type, content, created_at, updated_at, importance, source_event_id, metadata_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    memory.id,
-                    memory.type.value,
-                    memory.content,
-                    memory.created_at,
-                    memory.updated_at,
-                    memory.importance,
-                    memory.source_event_id,
-                    json.dumps(memory.metadata),
-                ),
+                _INSERT_MEMORY, self._memory_params(memory),
             )
             conn.commit()
+        finally:
+            self._end_op()
+
+    def add_unique(self, memory: Memory) -> tuple[Memory, bool]:
+        """Insert unless a memory with the same normalized content exists.
+
+        Returns (stored memory, created). Check and insert share one IMMEDIATE
+        transaction so concurrent callers cannot both insert.
+        """
+        self._begin_op()
+        try:
+            conn = self._get_conn()
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = conn.execute(
+                    f"SELECT {_MEMORY_COLS} FROM memories WHERE norm_content = ? LIMIT 1",
+                    (normalize(memory.content),),
+                ).fetchone()
+                if row is None:
+                    conn.execute(_INSERT_MEMORY, self._memory_params(memory))
+                conn.commit()
+            except BaseException:
+                conn.rollback()
+                raise
+            return (memory, True) if row is None else (self._row_to_memory(row), False)
         finally:
             self._end_op()
 
@@ -218,7 +352,7 @@ class SQLiteStore:
         try:
             conn = self._get_conn()
             row = conn.execute(
-                "SELECT id, type, content, created_at, updated_at, importance, source_event_id, metadata_json FROM memories WHERE id = ?",
+                f"SELECT {_MEMORY_COLS} FROM memories WHERE id = ?",
                 (memory_id,),
             ).fetchone()
             if row is None:
@@ -228,46 +362,50 @@ class SQLiteStore:
             self._end_op()
 
     def search(self, query: str, limit: int = 5) -> list[Memory]:
-        """Keyword + recency + importance scoring.
+        """Memories ranked by BM25 blended with recency and importance."""
+        return [self._row_to_memory(r[:8]) for r in self.search_memory_rows(query, limit)]
 
-        Score = lexical_match + recency_weight + importance_weight.
-        Lexical match: fraction of query words found in content (case-insensitive).
-        Recency: decays over 7 days.
-        Importance: direct weight.
-        """
-        words = [w.lower() for w in query.split() if len(w) > 1]
-        if not words:
+    def search_memory_rows(self, query: str, limit: int) -> list[tuple]:
+        """(memory columns..., score) rows, best first; lower score is better."""
+        match = fts_query(query)
+        if match is None or limit <= 0:
             return []
+        cols = ", ".join(f"m.{c.strip()}" for c in _MEMORY_COLS.split(","))
+        # bm25() is negative (more negative = better); scaling by importance and
+        # dividing by age keeps "lower is better" so the ranking stays in SQL.
+        return self._read(
+            f"""SELECT {cols},
+                   bm25(memories_fts) * (0.5 + m.importance)
+                   / (1.0 + max(0.0, ? - m.created_at) / {_RECENCY_HALF_LIFE}) AS score
+                FROM memories_fts JOIN memories m ON m.rowid = memories_fts.rowid
+                WHERE memories_fts MATCH ?
+                ORDER BY score LIMIT ?""",
+            (time.time(), match, limit),
+        )
 
+    def search_message_rows(
+        self, query: str, limit: int, *, exclude_session_id: str | None
+    ) -> list[tuple]:
+        """(content, timestamp, role, score) for messages outside one session."""
+        match = fts_query(query)
+        if match is None or limit <= 0:
+            return []
+        return self._read(
+            f"""SELECT c.content, c.timestamp, c.role,
+                   bm25(messages_fts)
+                   / (1.0 + max(0.0, ? - c.timestamp) / {_RECENCY_HALF_LIFE}) AS score
+                FROM messages_fts JOIN conversation_messages c ON c.rowid = messages_fts.rowid
+                WHERE messages_fts MATCH ? AND c.session_id IS NOT ?
+                ORDER BY score LIMIT ?""",
+            (time.time(), match, exclude_session_id, limit),
+        )
+
+    def _read(self, sql: str, params: tuple) -> list[tuple]:
         self._begin_op()
         try:
-            conn = self._get_conn()
-            rows = conn.execute(
-                "SELECT id, type, content, created_at, updated_at, importance, source_event_id, metadata_json FROM memories ORDER BY created_at DESC LIMIT 1000"
-            ).fetchall()
+            return self._get_conn().execute(sql, params).fetchall()
         finally:
             self._end_op()
-
-        now = time.time()
-        scored: list[tuple[float, Memory]] = []
-
-        for row in rows:
-            mem = self._row_to_memory(row)
-            content_lower = mem.content.lower()
-
-            match_count = sum(1 for w in words if w in content_lower)
-            lexical_score = match_count / len(words) if words else 0.0
-
-            age_days = (now - mem.created_at) / 86400
-            recency_score = max(0.0, 1.0 - (age_days / 7.0))
-
-            score = (lexical_score * 0.6) + (recency_score * 0.2) + (mem.importance * 0.2)
-
-            if lexical_score > 0:
-                scored.append((score, mem))
-
-        scored.sort(key=lambda x: x[0], reverse=True)
-        return [mem for _, mem in scored[:limit]]
 
     def delete(self, memory_id: str) -> None:
         self._begin_op()
@@ -283,7 +421,7 @@ class SQLiteStore:
         try:
             conn = self._get_conn()
             rows = conn.execute(
-                "SELECT id, type, content, created_at, updated_at, importance, source_event_id, metadata_json FROM memories ORDER BY created_at DESC LIMIT ?",
+                f"SELECT {_MEMORY_COLS} FROM memories ORDER BY created_at DESC LIMIT ?",
                 (limit,),
             ).fetchall()
             return [self._row_to_memory(r) for r in rows]
@@ -330,32 +468,16 @@ class SQLiteStore:
         finally:
             self._end_op()
 
-    def add_message(self, message: ConversationMessage) -> None:
+    def add_message(self, message: ConversationMessage) -> ConversationMessage:
+        """Insert a message and bump session activity in one transaction.
+
+        Idempotent on source_event_id: a duplicate returns the stored row.
+        """
         self._begin_op()
         try:
             conn = self._get_conn()
-            if message.source_event_id:
-                try:
-                    conn.execute(
-                        "INSERT INTO conversation_messages (id, session_id, role, content, timestamp, source_event_id) VALUES (?, ?, ?, ?, ?, ?)",
-                        (
-                            message.id,
-                            message.session_id,
-                            message.role,
-                            message.content,
-                            message.timestamp,
-                            message.source_event_id,
-                        ),
-                    )
-                except sqlite3.IntegrityError:
-                    return
-                except sqlite3.OperationalError:
-                    existing = self._get_message_by_source_inner(message.source_event_id)
-                    if existing is not None:
-                        return
-                    raise
-            else:
-                conn.execute(
+            try:
+                cur = conn.execute(
                     "INSERT OR IGNORE INTO conversation_messages (id, session_id, role, content, timestamp, source_event_id) VALUES (?, ?, ?, ?, ?, ?)",
                     (
                         message.id,
@@ -366,10 +488,22 @@ class SQLiteStore:
                         message.source_event_id,
                     ),
                 )
-            conn.commit()
+                if cur.rowcount:
+                    conn.execute(
+                        "UPDATE conversation_sessions SET last_activity_at = max(last_activity_at, ?) WHERE id = ?",
+                        (message.timestamp, message.session_id),
+                    )
+                conn.commit()
+            except BaseException:
+                conn.rollback()
+                raise
+            if cur.rowcount == 0 and message.source_event_id:
+                existing = self._get_message_by_source_inner(message.source_event_id)
+                if existing is not None:
+                    return existing
+            return message
         finally:
             self._end_op()
-        self.update_session_activity(message.session_id, message.timestamp)
 
     def get_messages(
         self, session_id: str, limit: int = 50
@@ -429,6 +563,20 @@ class SQLiteStore:
             self._end_op()
 
     # ── Helpers ──────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _memory_params(memory: Memory) -> tuple:
+        return (
+            memory.id,
+            memory.type.value,
+            memory.content,
+            memory.created_at,
+            memory.updated_at,
+            memory.importance,
+            memory.source_event_id,
+            json.dumps(memory.metadata),
+            normalize(memory.content),
+        )
 
     @staticmethod
     def _row_to_memory(row: tuple) -> Memory:

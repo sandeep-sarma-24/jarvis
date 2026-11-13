@@ -212,3 +212,38 @@ class TestContextGrowthBounded:
         ctx = builder.build(_speech("current query"), memory)
         assert ctx.total_characters <= 6000
         assert len(ctx.recent_events) <= 8
+
+
+class TestConversationHistory:
+
+    def test_keeps_newest_turns_over_budget(self, memory):
+        builder = ContextBuilder(max_messages=8, max_characters=10_000)
+        budget = 10_000 - len(builder.system_prompt) - len("current")
+        turns = [
+            {"role": "user" if i % 2 == 0 else "assistant", "content": f"{i:03d}" + "x" * 97}
+            for i in range(budget // 100 + 10)
+        ]
+        ctx = builder.build(_speech("current"), memory, conversation_messages=turns)
+        kept = list(ctx.conversation_messages)
+        assert kept and len(kept) < len(turns)
+        assert kept == turns[-len(kept):]  # newest suffix, chronological
+        assert ctx.total_characters <= 10_000
+
+    def test_history_utterance_not_repeated_from_working_memory(self, memory):
+        builder = ContextBuilder(max_messages=8, max_characters=6000)
+        memory.record("e1", "what is the capital of France?", should_reason=True)
+        memory.record("e2", "someone talking in the background", should_reason=False)
+        history = [
+            {"role": "user", "content": "what is the capital of France?"},
+            {"role": "assistant", "content": "Paris."},
+        ]
+        event = _speech("and of Spain?")
+        memory.record(event.id, event.transcript, should_reason=True)
+        msgs = builder.to_messages(builder.build(event, memory, conversation_messages=history))
+        contents = [m["content"] for m in msgs[1:]]
+        assert contents.count("what is the capital of France?") == 1
+        # Question, its answer, other overheard speech, then the current turn.
+        assert contents == [
+            "what is the capital of France?", "Paris.",
+            "someone talking in the background", "and of Spain?",
+        ]
