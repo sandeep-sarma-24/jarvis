@@ -27,7 +27,7 @@ Microphone → capture → VAD + endpointing → Granite ASR        (app/audio, 
 - **Speech output** (`app/tts/`): Phonon TTS (`hf://gradium/phonon-31m-en`, voice
   Easton, via the `ptts` runtime) streams audio into one persistent output stream
   fed by a bounded, turn-tagged queue.
-- **Vision** (`app/perception/`, optional, off by default): camera frames described
+- **Vision** (`app/perception/`, optional): camera frames described
   by the same local Ollama model that does reasoning.
 
 One `Turn` exists per request. A newer request, a barge-in or shutdown cancels it,
@@ -115,9 +115,12 @@ in place on first open. Retrieval is FTS5/BM25 blended with recency, up to
 searches messages from earlier sessions. Saying "remember that ..." stores an
 explicit memory. Semantic (embedding) retrieval was evaluated and not implemented.
 
-**Vision.** Off by default: `perception.camera.enabled` = false and
-`perception.vision.enabled` = false, so the camera is never opened. To use it, set
-both to true (`perception.enabled` = true already). Frames go to
+**Vision.** On: `perception.camera.enabled` = true and
+`perception.vision.enabled` = true (with `perception.enabled` = true). Set the two
+camera/vision keys to false to keep the camera closed. When a request is a vision
+request ("what do you see"), typed with "use camera", or carries an uploaded photo,
+the JPEG goes straight to the reasoning model as `images` on the user message.
+Ambient frames go to
 `perception.vision.model` (`gemma4:e2b-it-qat`, the reasoning model, so no second model is
 loaded) at `perception.vision.ollama_url`, with the reasoning `num_ctx` and
 `keep_alive` so Ollama does not reload the model; a different vision model logs a
@@ -126,6 +129,11 @@ warning that two models will be resident.
 `perception.on_demand_timeout_seconds` = 3.0 bounds a live look for a vision
 question and `perception.pause_during_turn` = true pauses ambient analysis while a
 request is being answered.
+
+**Web UI.** `ui.enabled` = true serves a browser UI at http://127.0.0.1:8765 (live camera
+preview, chat, voice status). It binds `ui.host` = "127.0.0.1" and `ui.port` = 8765; a
+non-loopback host is refused while `runtime.local_only` is true. Protocol:
+`docs/architecture/08-ui-protocol.md`.
 
 ## Running
 

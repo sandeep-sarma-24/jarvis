@@ -165,6 +165,13 @@ class FusionConfig:
 
 
 @dataclass
+class UIConfig:
+    enabled: bool = True
+    host: str = "127.0.0.1"
+    port: int = 8765
+
+
+@dataclass
 class JarvisConfig:
     runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
     audio: AudioConfig = field(default_factory=AudioConfig)
@@ -181,6 +188,7 @@ class JarvisConfig:
     memory: MemoryConfig = field(default_factory=MemoryConfig)
     perception: PerceptionConfig = field(default_factory=PerceptionConfig)
     fusion: FusionConfig = field(default_factory=FusionConfig)
+    ui: UIConfig = field(default_factory=UIConfig)
 
 
 def is_loopback(url: str) -> bool:
@@ -197,6 +205,8 @@ def enforce_local_only(cfg: JarvisConfig) -> None:
     }
     if cfg.reasoning.fallback_model:
         urls["reasoning.fallback_url"] = cfg.reasoning.fallback_url
+    if cfg.ui.enabled:
+        urls["ui.host"] = f"http://{cfg.ui.host}"
     bad = {k: v for k, v in urls.items() if not is_loopback(v)}
     if bad:
         raise ConfigError(
@@ -253,5 +263,7 @@ def load_config(path: Path | None = None) -> JarvisConfig:
         cfg.perception = PerceptionConfig(camera=cam, vision=vis, **top)
     if "fusion" in raw:
         cfg.fusion = FusionConfig(**{k: v for k, v in raw["fusion"].items() if k in FusionConfig.__dataclass_fields__})
+    if "ui" in raw:
+        cfg.ui = UIConfig(**{k: v for k, v in raw["ui"].items() if k in UIConfig.__dataclass_fields__})
     enforce_local_only(cfg)
     return cfg
