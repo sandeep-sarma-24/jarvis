@@ -25,6 +25,8 @@ def test_simulated_stability_with_stub_turn_manager(monkeypatch) -> None:
     assert r["ok"], r
 
 
+# Plays simulated audio in real time (about 4 s per turn), so it is opt-in.
+@pytest.mark.integration
 def test_simulated_stability_through_real_turn_manager() -> None:
     pytest.importorskip("app.orchestration.turns")
     r = asyncio.run(stability_test.run_simulated(turns=30, batch=10))
